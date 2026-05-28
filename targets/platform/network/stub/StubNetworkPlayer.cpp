@@ -2,6 +2,7 @@
 
 #include "StubPlatformNetwork.h"
 #include "java/System.h"
+#include <climits>
 #include "platform/PlatformTypes.h"
 #include "platform/network/NetTypes.h"
 
