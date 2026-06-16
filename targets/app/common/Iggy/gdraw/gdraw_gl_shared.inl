@@ -1841,7 +1841,7 @@ static void do_screen_quad(gswf_recti* s, F32* tc, const int* vvars,
                            GDrawStats* gstats, F32 depth) {
     F32 px0 = (F32)s->x0, py0 = (F32)s->y0, px1 = (F32)s->x1, py1 = (F32)s->y1;
     F32 s0 = tc[0], t0 = tc[1], s1 = tc[2], t1 = tc[3];
-    F32 vert[4][4];
+    F32 vert[128][4];;
     F32 world[2 * 4];
 
     OPENGL_CHECK_SITE("do_screen_quad:begin");
