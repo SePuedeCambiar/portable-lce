@@ -103,9 +103,9 @@ MultiPlayerChunkCache::MultiPlayerChunkCache(Level* level) {
 MultiPlayerChunkCache::~MultiPlayerChunkCache() {
     delete emptyChunk;
     delete waterChunk;
-    delete cache;
-    delete hasData;
-
+    delete[] cache;    // <--- AÑADIR []
+    delete[] hasData;   // <--- AÑADIR []
+  
     auto itEnd = loadedChunkList.end();
     for (auto it = loadedChunkList.begin(); it != itEnd; it++) delete *it;
 }
