@@ -1,5 +1,7 @@
 #pragma once
 #include <string>
+#include <vector>   // <--- AÑADIR ESTO
+#include <cstdint>  // <--- AÑADIR ESTO
 
 #include "AbstractTexturePack.h"
 #include "java/InputOutputStream/InputStream.h"
@@ -16,6 +18,10 @@ protected:
     void loadIcon();
     void loadName();
     void loadDescription();
+    
+    // --- AÑADIR ESTA LÍNEA ---
+    std::vector<uint8_t> m_iconDataVector; // Este es el "almacén" que evitará el crash
+    // -------------------------
 
 public:
     //@Override
@@ -28,8 +34,7 @@ public:
 
 protected:
     //@Override
-    InputStream* getResourceImplementation(
-        const std::string& name);  // throws FileNotFoundException
+    InputStream* getResourceImplementation(const std::string& name);  // throws FileNotFoundException
 
 public:
     virtual bool hasData() { return true; }

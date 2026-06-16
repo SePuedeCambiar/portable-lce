@@ -18,13 +18,14 @@ DefaultTexturePack::DefaultTexturePack()
 
 void DefaultTexturePack::loadIcon() {
     if (gameServices().hasArchiveFile("Graphics\\TexturePackIcon.png")) {
-        std::vector<uint8_t> ba =
-            gameServices().getArchiveFile("Graphics\\TexturePackIcon.png");
-        m_iconData = ba.data();
-        m_iconSize = static_cast<std::uint32_t>(ba.size());
+        // 1. Guardamos directamente en el almacén de la clase
+        m_iconDataVector = gameServices().getArchiveFile("Graphics\\TexturePackIcon.png");
+        
+        // 2. IMPORTANTE: Apuntamos a la memoria del ALMACÉN, no a una variable local
+        m_iconData = m_iconDataVector.data(); 
+        m_iconSize = static_cast<std::uint32_t>(m_iconDataVector.size());
     }
 }
-
 void DefaultTexturePack::loadDescription() {
     desc1 = "LOCALISE ME: The default look of Minecraft";
 }

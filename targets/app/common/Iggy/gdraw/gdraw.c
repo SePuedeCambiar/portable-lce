@@ -659,50 +659,62 @@ static void gdraw_TexSubImage2D(GLenum target, GLint level, GLint xoff,
 static void gdraw_ClientVertexAttribPointer(GLuint index, GLint size,
                                             GLenum type, GLboolean normalized,
                                             GLsizei stride,
-                                            const void* pointer) {
-    if (gdraw_glBindVertexArray && gdraw_vao) {
+const void* pointer) {
+if (gdraw_glBindVertexArray && gdraw_vao) {
         GLint current_vao = 0;
-        glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &current_vao);
-        if ((GLuint)current_vao != gdraw_vao)
-            gdraw_glBindVertexArray(gdraw_vao);
+glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &current_vao);
+if ((GLuint)current_vao != gdraw_vao)
+gdraw_glBindVertexArray(gdraw_vao);
     }
+  
 
     GLint current_vbo = 0;
-    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &current_vbo);
+glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &current_vbo);
+  
 
-    if (current_vbo != 0 && current_vbo != (GLint)gdraw_screenvbo) {
-        // no touchies
-        gdraw_real_vtxattrib(index, size, type, normalized, stride, pointer);
-        return;
+if (current_vbo != 0 && current_vbo != (GLint)gdraw_screenvbo) {
+gdraw_real_vtxattrib(index, size, type, normalized, stride, pointer);
+return;
     }
+  
 
-    if (pointer == NULL) {
-        gdraw_real_vtxattrib(index, size, type, normalized, stride, pointer);
-        return;
+if (pointer == NULL) {
+gdraw_real_vtxattrib(index, size, type, normalized, stride, pointer);
+return;
     }
+  
 
-    ptrdiff_t offset =
+ptrdiff_t offset =
         gdraw_screenvbo_base
-            ? ((const char*)pointer - (const char*)gdraw_screenvbo_base)
-            : -1;
+? ((const char*)pointer - (const char*)gdraw_screenvbo_base)
+: -1;
+  
 
-    if (gdraw_screenvbo_base == NULL || offset < 0 ||
+if (gdraw_screenvbo_base == NULL || offset < 0 ||
         offset >= (ptrdiff_t)gdraw_expected_vbo_size) {
-        if (!gdraw_screenvbo) glGenBuffers(1, &gdraw_screenvbo);
-        glBindBuffer(GL_ARRAY_BUFFER, gdraw_screenvbo);
+if (!gdraw_screenvbo) glGenBuffers(1, &gdraw_screenvbo);
+glBindBuffer(GL_ARRAY_BUFFER, gdraw_screenvbo);
+  
+    size_t upload_size = gdraw_expected_vbo_size > 0
+? gdraw_expected_vbo_size  // <--- Quitamos el + 256
+: 65536;
 
-        size_t upload_size = gdraw_expected_vbo_size > 0
-                                 ? (gdraw_expected_vbo_size + 256)
-                                 : 65536;
-        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)upload_size, pointer,
+    // --- NUEVOS PRINTS AQUÍ ---
+    fprintf(stderr, "[CRASH_DEBUG] Pointer: %p, ExpectedVboSize: %zu, UploadSize: %zu, Offset: %ld\n", 
+            pointer, (size_t)gdraw_expected_vbo_size, upload_size, (long)offset);
+    fflush(stderr);
+    // --------------------------
+
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)upload_size, pointer,
                      GL_STREAM_DRAW);
+  
 
         gdraw_screenvbo_base = pointer;
-        gdraw_real_vtxattrib(index, size, type, normalized, stride,
+gdraw_real_vtxattrib(index, size, type, normalized, stride,
                              (const void*)0);
     } else {
-        glBindBuffer(GL_ARRAY_BUFFER, gdraw_screenvbo);
-        gdraw_real_vtxattrib(index, size, type, normalized, stride,
+glBindBuffer(GL_ARRAY_BUFFER, gdraw_screenvbo);
+gdraw_real_vtxattrib(index, size, type, normalized, stride,
                              (const void*)offset);
     }
 }
@@ -820,15 +832,20 @@ static void RADLINK hooked_DrawIndexedTriangles(GDrawRenderState* r,
                                                 GDrawVertexBuffer* buf,
                                                 GDrawStats* stats) {
     if (buf == NULL && prim != NULL && prim->vertices != NULL) {
-        size_t stride = 8;
-        if (prim->vertex_format == GDRAW_vformat_v2aa)
+    size_t stride = 8;
+    if (prim->vertex_format == GDRAW_vformat_v2aa)
             stride = 16;
-        else if (prim->vertex_format == GDRAW_vformat_v2tc2)
+    else if (prim->vertex_format == GDRAW_vformat_v2tc2)
             stride = 16;
-        else if (prim->vertex_format == GDRAW_vformat_ihud1)
+    else if (prim->vertex_format == GDRAW_vformat_ihud1)
             stride = 20;
-        gdraw_expected_vbo_size = prim->num_vertices * stride;
-    } else {
+    gdraw_expected_vbo_size = prim->num_vertices * stride;
+
+    // CAMBIO AQUÍ: usamos fprintf con stderr para que sea instantáneo
+    fprintf(stderr, "[DEBUG] Vertices: %d, Stride: %zu, Expected Size: %zu\n", 
+            prim->num_vertices, stride, gdraw_expected_vbo_size);
+    fflush(stderr); // Forzamos la salida
+} else {
         gdraw_expected_vbo_size = 0;
     }
     gdraw_screenvbo_base = NULL;  // Force VBO re-upload for each primitive
