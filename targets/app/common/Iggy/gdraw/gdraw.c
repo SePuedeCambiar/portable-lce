@@ -700,9 +700,9 @@ glBindBuffer(GL_ARRAY_BUFFER, gdraw_screenvbo);
 : 65536;
 
     // --- NUEVOS PRINTS AQUÍ ---
-    fprintf(stderr, "[CRASH_DEBUG] Pointer: %p, ExpectedVboSize: %zu, UploadSize: %zu, Offset: %ld\n", 
-            pointer, (size_t)gdraw_expected_vbo_size, upload_size, (long)offset);
-    fflush(stderr);
+//    fprintf(stderr, "[CRASH_DEBUG] Pointer: %p, ExpectedVboSize: %zu, UploadSize: %zu, Offset: %ld\n", 
+//            pointer, (size_t)gdraw_expected_vbo_size, upload_size, (long)offset);
+//    fflush(stderr);
     // --------------------------
 
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)upload_size, pointer,
@@ -842,9 +842,9 @@ static void RADLINK hooked_DrawIndexedTriangles(GDrawRenderState* r,
     gdraw_expected_vbo_size = prim->num_vertices * stride;
 
     // CAMBIO AQUÍ: usamos fprintf con stderr para que sea instantáneo
-    fprintf(stderr, "[DEBUG] Vertices: %d, Stride: %zu, Expected Size: %zu\n", 
-            prim->num_vertices, stride, gdraw_expected_vbo_size);
-    fflush(stderr); // Forzamos la salida
+ //     fprintf(stderr, "[DEBUG] Vertices: %d, Stride: %zu, Expected Size: %zu\n", 
+ // C            prim->num_vertices, stride, gdraw_expected_vbo_size);
+//    fflush(stderr); // Forzamos la salida
 } else {
         gdraw_expected_vbo_size = 0;
     }
