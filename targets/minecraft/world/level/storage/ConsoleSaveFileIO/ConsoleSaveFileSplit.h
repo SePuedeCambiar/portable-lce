@@ -78,8 +78,7 @@ private:
     // behaviour the legacy VirtualAlloc reserve/commit pattern relied on,
     // without any OS-specific calls.
 #if defined(_LARGE_WORLDS)
-    static constexpr std::size_t MAX_SAVE_SIZE =
-        2u * 1024u * 1024u * 1024u;  // 2GB
+    static constexpr std::size_t MAX_SAVE_SIZE = 512u * 1024u * 1024u;
 #else
     static constexpr std::size_t MAX_SAVE_SIZE = 64u * 1024u * 1024u;  // 64MB
 #endif
