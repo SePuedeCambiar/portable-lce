@@ -60,10 +60,9 @@ static RADINLINE void break_on_err(GLint e) {
 #ifndef GDRAW_PLATFORM_REPORT_GL_SITE
 #define GDRAW_PLATFORM_REPORT_GL_SITE(site) ((void)0)
 #endif
-
 static void report_err(GLint e) {
     break_on_err(e);
-    IggyGDrawSendWarning(NULL, "OpenGL glGetError error");
+    // IggyGDrawSendWarning(NULL, "OpenGL glGetError error"); // <--- COMENTA ESTA LÍNEA
 }
 
 static void compilation_err(const char* msg) {
