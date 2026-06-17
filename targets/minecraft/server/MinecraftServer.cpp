@@ -401,10 +401,17 @@ bool MinecraftServer::loadLevel(LevelStorageSource* storageSource,
         // We are loading a file from disk with the data passed in
 
 #if defined(SPLIT_SAVES)
-        ConsoleSaveFileOriginal oldFormatSave(
-            initData->saveData->saveName, initData->saveData->data,
-            initData->saveData->fileSize, false, initData->savePlatform);
-        ConsoleSaveFile* pSave = new ConsoleSaveFileSplit(&oldFormatSave);
+    // Creamos el ayudante en el "Heap" (con new) para que no desaparezca inmediatamente
+    ConsoleSaveFileOriginal* oldFormatSave = new ConsoleSaveFileOriginal(
+        initData->saveData->saveName, initData->saveData->data,
+        initData->saveData->fileSize, false, initData->savePlatform);
+    
+    // Se lo pasamos al nuevo formato
+    ConsoleSaveFile* pSave = new ConsoleSaveFileSplit(oldFormatSave);
+    
+    // IMPORTANTE: El constructor de ConsoleSaveFileSplit ya copió los datos que necesitaba.
+    // Ahora podemos borrar el ayudante temporal para no dejar otra fuga de memoria.
+    delete oldFormatSave; 
 
         // ConsoleSaveFile* pSave = new ConsoleSaveFileSplit(
         // initData->saveData->saveName, initData->saveData->data,

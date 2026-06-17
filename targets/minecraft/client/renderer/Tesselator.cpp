@@ -65,17 +65,28 @@ Tesselator::Tesselator(int size) {
     useProjectedTexturePixelShader = false;  // 4J added
 
     this->size = size;
+    _array = new std::vector<int>(size); // <--- Aquí se crea la memoria
 
-    _array = new std::vector<int>(size);
-
-    vboMode =
-        USE_VBO;  // 4J removed - &&
-                  // GLContext.getCapabilities().GL_ARB_vertex_buffer_object;
+    vboMode = USE_VBO;
     if (vboMode) {
         vboIds = MemoryTracker::createIntBuffer(vboCounts);
         ARBVertexBufferObject::glGenBuffersARB(vboIds);
     }
 }
+
+// --- ESTO ES LO QUE DEBES AÑADIR ---
+Tesselator::~Tesselator() {
+    // Liberamos el vector que causaba la fuga de RAM
+    if (_array != nullptr) {
+        delete _array; 
+        _array = nullptr;
+    }
+    
+    // Si vboIds fue creado con new o un asignador similar, 
+    // también debería liberarse aquí.
+}
+// ----------------------------------
+
 
 Tesselator* Tesselator::getUniqueInstance(int size) {
     return new Tesselator(size);

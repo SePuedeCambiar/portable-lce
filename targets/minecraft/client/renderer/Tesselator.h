@@ -66,6 +66,7 @@ private:
     Tesselator(int size);
 
 public:
+    ~Tesselator(); // <--- AÑADE ESTA LÍNEA AQUÍ
     Tesselator* getUniqueInstance(int size);
     void end();
 

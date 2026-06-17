@@ -1,7 +1,5 @@
 #include "McRegionLevelStorage.h"
-
 #include <stdint.h>
-
 #include <format>
 #include <vector>
 
@@ -27,10 +25,11 @@ McRegionLevelStorage::McRegionLevelStorage(ConsoleSaveFile* saveFile, File dir,
 }
 
 McRegionLevelStorage::~McRegionLevelStorage() {
-    // Make sure cache is clear, as the DirectoryLevelStorage destructor is
-    // going to be deleting the underlying ConsoleSaveFile reference so we don't
-    // want the RegionFileCache to still be referencing it either
     RegionFileCache::clear();
+    if (m_saveFile != nullptr) {
+        delete m_saveFile;
+        m_saveFile = nullptr;
+    }
 }
 
 ChunkStorage* McRegionLevelStorage::createChunkStorage(Dimension* dimension) {
