@@ -55,10 +55,7 @@ ServerChunkCache::~ServerChunkCache() {
     delete source;
 
 #if defined(_LARGE_WORLDS)
-    for (unsigned int i = 0; i < XZSIZE * XZSIZE; ++i) {
-        delete m_unloadedCache[i];
-    }
-    delete[] m_unloadedCache;
+delete[] m_unloadedCache; // Solo borramos el array de punteros, ya no hay objetos dentro
 #endif
 
     auto itEnd = m_loadedChunkList.end();
@@ -271,7 +268,6 @@ LevelChunk* ServerChunkCache::create(
             // Something else must have updated the cache. Return that chunk and
             // discard this one
             chunk->unload(true);
-            delete chunk;
             return cache[idx];
         }
     }
@@ -763,43 +759,35 @@ bool ServerChunkCache::save(bool force, ProgressListener* progressListener) {
 
     return !maxSavesReached;
 }
-
 bool ServerChunkCache::tick() {
     if (!level->noSave) {
 #if defined(_LARGE_WORLDS)
-        for (int i = 0; i < 100; i++) {
+        for (int i = 0; i < 100; i++) { // Volvemos a 100 para estabilidad, puedes subirlo a 200 luego
             if (!m_toDrop.empty()) {
                 LevelChunk* chunk = m_toDrop.front();
                 if (!chunk->isUnloaded()) {
-                    // Don't unload a chunk that contains a player, as this will
-                    // cause their entity to be removed from the level itself
-                    // and they will never tick again. This can happen if a
-                    // player moves a long distance in one tick, for example
-                    // when the server thread has locked up doing something for
-                    // a while whilst a player kept moving. In this case, the
-                    // player is moved in the player chunk map (driven by the
-                    // network packets being processed for their new position)
-                    // before the player's tick is called to remove them from
-                    // the chunk they used to be in, and add them to their
-                    // current chunk. This will only be a temporary state and we
-                    // should be able to unload the chunk on the next call to
-                    // this tick.
                     if (!chunk->containsPlayer()) {
                         save(chunk);
                         saveEntities(chunk);
                         chunk->unload(true);
 
-                        // loadedChunks.remove(cp);
-                        // loadedChunkList.remove(chunk);
-                        auto it = find(m_loadedChunkList.begin(),
-                                       m_loadedChunkList.end(), chunk);
-                        if (it != m_loadedChunkList.end())
+                        auto it = find(m_loadedChunkList.begin(), m_loadedChunkList.end(), chunk);
+                        if (it != m_loadedChunkList.end()) {
                             m_loadedChunkList.erase(it);
+                        }
 
                         int ix = chunk->x + XZOFFSET;
                         int iz = chunk->z + XZOFFSET;
                         int idx = ix * XZSIZE + iz;
-                        m_unloadedCache[idx] = chunk;
+
+                        // --- EL PARCHE MAGICO ---
+                        // Si ya había un chunk en esta posición del cache, 
+                        // lo borramos PRIMERO para que no haya fuga.
+                        if (m_unloadedCache[idx] != nullptr) {
+                            delete m_unloadedCache[idx];
+                        }
+                        
+                        m_unloadedCache[idx] = chunk; // Ahora ponemos el nuevo
                         cache[idx] = nullptr;
                     }
                 }
@@ -809,7 +797,6 @@ bool ServerChunkCache::tick() {
 #endif
         if (storage != nullptr) storage->tick();
     }
-
     return source->tick();
 }
 
