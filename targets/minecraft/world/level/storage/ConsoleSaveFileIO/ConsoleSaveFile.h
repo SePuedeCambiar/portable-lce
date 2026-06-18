@@ -36,13 +36,14 @@ public:
     virtual void DebugFlushToFile(void* compressedData = nullptr,
                                   unsigned int compressedDataSize = 0) = 0;
 #endif
-    virtual unsigned int getSizeOnDisk() = 0;
+        virtual unsigned int getSizeOnDisk() = 0;
     virtual std::string getFilename() = 0;
-    virtual std::vector<FileEntry*>* getFilesWithPrefix(
-        const std::string& prefix) = 0;
-    virtual std::vector<FileEntry*>* getRegionFilesByDimension(
-        unsigned int dimensionIndex) = 0;
-
+    
+    // QUITA el asterisco (*) después de std::vector<FileEntry*>
+    virtual std::vector<FileEntry*> getFilesWithPrefix(const std::string& prefix) = 0;
+    
+    // QUITA el asterisco (*) después de std::vector<FileEntry*>
+    virtual std::vector<FileEntry*> getRegionFilesByDimension(unsigned int dimensionIndex) = 0;
     virtual int getSaveVersion() = 0;
     virtual int getOriginalSaveVersion() = 0;
 

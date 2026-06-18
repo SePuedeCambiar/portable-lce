@@ -43,4 +43,21 @@ public:
     std::vector<uint8_t> array();
     IntBuffer* asIntBuffer();
     FloatBuffer* asFloatBuffer();
+
+private:
+    // ============================================================
+    // SISTEMA DE RECICLAJE (Object Pool estilo Consola)
+    // ============================================================
+    
+    // Tamaño de la bandeja: 256 es un número seguro para la mayoría de juegos.
+    static const size_t POOL_SIZE = 256;
+
+    // Bandejas de reciclaje independientes por hilo (thread_local)
+    // para evitar crashes en la reconstrucción de chunks.
+    static thread_local std::vector<IntBuffer*> intBufferPool;
+    static thread_local size_t intBufferIndex;
+
+    static thread_local std::vector<FloatBuffer*> floatBufferPool;
+    static thread_local size_t floatBufferIndex;
+    // ============================================================
 };

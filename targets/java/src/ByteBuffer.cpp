@@ -11,6 +11,12 @@
 #include "java/FloatBuffer.h"
 #include "java/IntBuffer.h"
 
+// Inicialización de las bandejas de reciclaje por hilo
+thread_local std::vector<IntBuffer*> ByteBuffer::intBufferPool;
+thread_local size_t ByteBuffer::intBufferIndex = 0;
+thread_local std::vector<FloatBuffer*> ByteBuffer::floatBufferPool;
+thread_local size_t ByteBuffer::floatBufferIndex = 0;
+
 ByteBuffer::ByteBuffer(unsigned int capacity) : Buffer(capacity) {
     hasBackingArray = false;
     buffer = new uint8_t[capacity];
@@ -412,10 +418,28 @@ std::vector<uint8_t> ByteBuffer::array() {
 // Returns:
 // A new int buffer
 IntBuffer* ByteBuffer::asIntBuffer() {
-    // TODO 4J Stu - Is it safe to just cast our byte array pointer to another
-    // type?
-    return new IntBuffer((m_limit - m_position) / 4,
-                         (int*)(buffer + m_position));
+    // 1. Si la bandeja está vacía o no ha llegado al límite, la expandimos
+    if (intBufferPool.size() < POOL_SIZE) {
+        intBufferPool.push_back(nullptr);
+    }
+
+    // 2. Tomamos el buffer que toca según el índice circular
+    IntBuffer* recycledBuffer = intBufferPool[intBufferIndex];
+
+    if (recycledBuffer == nullptr) {
+        // Si es la primera vez que usamos este espacio, creamos el objeto
+        recycledBuffer = new IntBuffer((m_limit - m_position) / 4, (int*)(buffer + m_position));
+        intBufferPool[intBufferIndex] = recycledBuffer;
+    } else {
+        // SI YA EXISTÍA: En lugar de hacer 'new', reutilizamos el objeto
+        // y actualizamos sus datos con la nueva posición y capacidad.
+        recycledBuffer->reinitialize((m_limit - m_position) / 4, (int*)(buffer + m_position));
+    }
+
+    // 3. Avanzamos el índice para el siguiente pedido (vuelve a 0 al llegar a 256)
+    intBufferIndex = (intBufferIndex + 1) % POOL_SIZE;
+
+    return recycledBuffer;
 }
 
 // Creates a view of this byte buffer as a float buffer.
@@ -432,8 +456,21 @@ IntBuffer* ByteBuffer::asIntBuffer() {
 // Returns:
 // A new float buffer
 FloatBuffer* ByteBuffer::asFloatBuffer() {
-    // TODO 4J Stu - Is it safe to just cast our byte array pointer to another
-    // type?
-    return new FloatBuffer((m_limit - m_position) / 4,
-                           (float*)(buffer + m_position));
+    if (floatBufferPool.size() < POOL_SIZE) {
+        floatBufferPool.push_back(nullptr);
+    }
+
+    FloatBuffer* recycledBuffer = floatBufferPool[floatBufferIndex];
+
+    if (recycledBuffer == nullptr) {
+        recycledBuffer = new FloatBuffer((m_limit - m_position) / 4, (float*)(buffer + m_position));
+        floatBufferPool[floatBufferIndex] = recycledBuffer;
+    } else {
+        // Reutilizamos el objeto FloatBuffer existente
+        recycledBuffer->reinitialize((m_limit - m_position) / 4, (float*)(buffer + m_position));
+    }
+
+    floatBufferIndex = (floatBufferIndex + 1) % POOL_SIZE;
+
+    return recycledBuffer;
 }

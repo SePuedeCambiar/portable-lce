@@ -392,7 +392,7 @@ ConsoleSaveFileSplit::ConsoleSaveFileSplit(ConsoleSaveFile* sourceSave,
     header.setSaveVersion(sourceSave->getSaveVersion());
 
     if (alreadySmallRegions) {
-        std::vector<FileEntry*>* sourceFiles =
+        std::vector<FileEntry*> sourceFiles =
             sourceSave->getFilesWithPrefix("");
 
         unsigned int bytesWritten = 0;
@@ -1404,28 +1404,25 @@ unsigned int ConsoleSaveFileSplit::getSizeOnDisk() {
 
 std::string ConsoleSaveFileSplit::getFilename() { return m_fileName; }
 
-std::vector<FileEntry*>* ConsoleSaveFileSplit::getFilesWithPrefix(
-    const std::string& prefix) {
-    return header.getFilesWithPrefix(prefix);
+std::vector<FileEntry*> ConsoleSaveFileSplit::getFilesWithPrefix(const std::string& prefix) {
+    // Obtenemos el puntero del header, pero lo DESREFERENCIAMOS con el asterisco (*)
+    // para devolver el objeto real y no la dirección de memoria.
+    return *header.getFilesWithPrefix(prefix);
 }
 
-std::vector<FileEntry*>* ConsoleSaveFileSplit::getRegionFilesByDimension(
-    unsigned int dimensionIndex) {
-    std::vector<FileEntry*>* files = nullptr;
+// En el .h: Cambia std::vector<FileEntry*>* por std::vector<FileEntry*>
+std::vector<FileEntry*> getRegionFilesByDimension(unsigned int dimensionIndex);
 
+// En el .cpp:
+std::vector<FileEntry*> ConsoleSaveFileSplit::getRegionFilesByDimension(unsigned int dimensionIndex) {
+    std::vector<FileEntry*> files; // Vector local, no usa 'new'
     for (auto it = regionFiles.begin(); it != regionFiles.end(); ++it) {
         unsigned int entryDimension = ((it->first) >> 16) & 0xFF;
-
         if (entryDimension == dimensionIndex) {
-            if (files == nullptr) {
-                files = new std::vector<FileEntry*>();
-            }
-
-            files->push_back(it->second->fileEntry);
+            files.push_back(it->second->fileEntry);
         }
     }
-
-    return files;
+    return files; // Se devuelve una copia eficiente (move semantics)
 }
 
 int ConsoleSaveFileSplit::getSaveVersion() { return header.getSaveVersion(); }
@@ -1503,15 +1500,22 @@ void ConsoleSaveFileSplit::ConvertToLocalPlatform() {
         // already in the correct format
         return;
     }
-    // convert each of the region files to the local platform
-    std::vector<FileEntry*>* allFilesInSave =
-        getFilesWithPrefix(std::string(""));
-    for (auto it = allFilesInSave->begin(); it < allFilesInSave->end(); ++it) {
-        FileEntry* fe = *it;
+
+    // 1. Obtenemos la lista de archivos. 
+    // Ahora 'allFilesInSave' es un objeto, NO un puntero.
+    std::vector<FileEntry*> allFilesInSave = getFilesWithPrefix(std::string(""));
+
+    // 2. Usamos un loop moderno: "Para cada FileEntry* fe en la lista allFilesInSave"
+    for (FileEntry* fe : allFilesInSave) {
+        if (fe == nullptr) continue; // Seguridad extra
+
         std::string fName(fe->data.filename);
         std::string suffix(".mcr");
-        if (fName.compare(fName.length() - suffix.length(), suffix.length(),
-                          suffix) == 0) {
+
+        // Verificamos si el archivo termina en .mcr
+        if (fName.length() >= suffix.length() && 
+            fName.compare(fName.length() - suffix.length(), suffix.length(), suffix) == 0) {
+            
             Log::info("Processing a region file: %s\n", fName.c_str());
             ConvertRegionFile(File(fe->data.filename));
         } else {
@@ -1519,6 +1523,9 @@ void ConsoleSaveFileSplit::ConvertToLocalPlatform() {
         }
     }
 
-    setLocalPlatform();  // set the platform of this save to the local platform,
-                         // now that it's been coverted
+    // 3. Marcamos como convertido
+    setLocalPlatform(); 
+    
+    // ¡YA NO HACE FALTA HACER delete allFilesInSave! 
+    // Al ser un objeto local, C++ lo libera automáticamente al llegar a la llave final.
 }

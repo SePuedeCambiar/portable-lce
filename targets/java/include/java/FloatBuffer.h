@@ -12,6 +12,10 @@ public:
     FloatBuffer(unsigned int capacity, float* backingArray);
     virtual ~FloatBuffer();
 
+    // --- NUEVA FUNCIÓN PARA EL SISTEMA DE RECICLAJE ---
+    FloatBuffer* reinitialize(unsigned int capacity, float* backingArray);
+    // --------------------------------------------------
+
     FloatBuffer* flip();
     FloatBuffer* put(float f);
     void get(std::vector<float>* dst);

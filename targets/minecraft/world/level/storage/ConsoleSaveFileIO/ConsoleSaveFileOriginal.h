@@ -76,10 +76,10 @@ public:
 
     virtual std::string getFilename();
 
-    virtual std::vector<FileEntry*>* getFilesWithPrefix(
-        const std::string& prefix);
-    virtual std::vector<FileEntry*>* getRegionFilesByDimension(
-        unsigned int dimensionIndex);
+    // Antes: virtual std::vector<FileEntry*>* getFilesWithPrefix(...)
+    virtual std::vector<FileEntry*> getFilesWithPrefix(const std::string& prefix);
+    // Antes: virtual std::vector<FileEntry*>* getRegionFilesByDimension(...)
+    virtual std::vector<FileEntry*> getRegionFilesByDimension(unsigned int dimensionIndex);
 
     virtual int getSaveVersion();
     virtual int getOriginalSaveVersion();

@@ -101,7 +101,7 @@ void ConsoleSaveFileConverter::ConvertSave(ConsoleSaveFile* sourceSave,
     }
 
     // MGH added - find any player data files and copy them across
-    std::vector<FileEntry*>* playerFiles =
+    std::vector<FileEntry*> playerFiles =
         sourceSave->getFilesWithPrefix(DirectoryLevelStorage::getPlayerDir());
 
     if (playerFiles != nullptr) {

@@ -445,7 +445,7 @@ CompoundTag* DirectoryLevelStorage::loadPlayerDataTag(PlayerUID xuid) {
 void DirectoryLevelStorage::clearOldPlayerFiles() {
     if (PlatformStorage.GetSaveDisabled()) return;
 
-    std::vector<FileEntry*>* playerFiles =
+    std::vector<FileEntry*> playerFiles =
         m_saveFile->getFilesWithPrefix(playerDir.getName());
 
     if (playerFiles != nullptr) {

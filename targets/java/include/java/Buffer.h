@@ -15,7 +15,7 @@
 // A buffer's position is never negative and is never greater than its limit.
 class Buffer {
 protected:
-    const unsigned int m_capacity;
+    unsigned int m_capacity;
     unsigned int m_position;
     unsigned int m_limit;
     unsigned int m_mark;

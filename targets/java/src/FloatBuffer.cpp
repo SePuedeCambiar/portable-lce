@@ -27,6 +27,21 @@ FloatBuffer::~FloatBuffer() {
     if (!hasBackingArray) delete[] buffer;
 }
 
+// --- NUEVA FUNCIÓN PARA EL SISTEMA DE RECICLAJE ---
+FloatBuffer* FloatBuffer::reinitialize(unsigned int capacity, float* backingArray) {
+    // Actualizamos los datos de la clase base (Buffer)
+    this->m_capacity = capacity;
+    this->m_position = 0;
+    this->m_limit = capacity;
+
+    // Actualizamos el puntero al array de datos
+    this->buffer = backingArray;
+    this->hasBackingArray = true; 
+
+    return this;
+}
+// --------------------------------------------------
+
 // Flips this buffer. The limit is set to the current position and then the
 // position is set to zero. If the mark is defined then it is discarded.
 //
