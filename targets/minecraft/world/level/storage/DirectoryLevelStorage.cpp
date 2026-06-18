@@ -445,45 +445,45 @@ CompoundTag* DirectoryLevelStorage::loadPlayerDataTag(PlayerUID xuid) {
 void DirectoryLevelStorage::clearOldPlayerFiles() {
     if (PlatformStorage.GetSaveDisabled()) return;
 
-    std::vector<FileEntry*> playerFiles =
-        m_saveFile->getFilesWithPrefix(playerDir.getName());
+    // CAMBIO: Ya no usamos puntero (*), ahora es el objeto directo
+    std::vector<FileEntry*> playerFiles = m_saveFile->getFilesWithPrefix(playerDir.getName());
 
-    if (playerFiles != nullptr) {
+    // CAMBIO: Un vector no puede ser nullptr. Verificamos si está vacío.
+    if (!playerFiles.empty()) {
 #if !defined(_FINAL_BUILD)
         if (gameServices().debugSettingsOn() &&
             gameServices().debugGetMask(PlatformInput.GetPrimaryPad()) &
                 (1L << eDebugSetting_DistributableSave)) {
-            for (unsigned int i = 0; i < playerFiles->size(); ++i) {
-                FileEntry* file = playerFiles->at(i);
+            for (unsigned int i = 0; i < playerFiles.size(); ++i) { // CAMBIO: .size() en vez de ->size()
+                FileEntry* file = playerFiles.at(i); // CAMBIO: .at() en vez de ->at()
                 std::string xuidStr = replaceAll(
                     replaceAll(file->data.filename, playerDir.getName(), ""),
                     ".dat", "");
                 PlayerUID xuid = fromWString<PlayerUID>(xuidStr);
                 deleteMapFilesForPlayer(xuid);
-                m_saveFile->deleteFile(playerFiles->at(i));
+                m_saveFile->deleteFile(playerFiles.at(i)); // CAMBIO: .at()
             }
         } else
 #endif
-            if (playerFiles->size() > MAX_PLAYER_DATA_SAVES) {
-            sort(playerFiles->begin(), playerFiles->end(),
-                 FileEntry::newestFirst);
+        if (playerFiles.size() > MAX_PLAYER_DATA_SAVES) { // CAMBIO: .size()
+            // CAMBIO: Usamos std::sort explícitamente para evitar el error de scope
+            std::sort(playerFiles.begin(), playerFiles.end(), FileEntry::newestFirst);
 
             for (unsigned int i = MAX_PLAYER_DATA_SAVES;
-                 i < playerFiles->size(); ++i) {
-                FileEntry* file = playerFiles->at(i);
+                         i < playerFiles.size(); ++i) { // CAMBIO: .size()
+                FileEntry* file = playerFiles.at(i); // CAMBIO: .at()
                 std::string xuidStr = replaceAll(
                     replaceAll(file->data.filename, playerDir.getName(), ""),
                     ".dat", "");
                 PlayerUID xuid = fromWString<PlayerUID>(xuidStr);
                 deleteMapFilesForPlayer(xuid);
-                m_saveFile->deleteFile(playerFiles->at(i));
+                m_saveFile->deleteFile(playerFiles.at(i)); // CAMBIO: .at()
             }
         }
 
-        delete playerFiles;
+    // ELIMINADO: delete playerFiles;  <-- Ya no es necesario y daría error
     }
 }
-
 PlayerIO* DirectoryLevelStorage::getPlayerIO() { return this; }
 
 void DirectoryLevelStorage::closeAll() {}
@@ -513,41 +513,32 @@ void DirectoryLevelStorage::flushSaveFile(bool autosave) {
 // 4J Added
 void DirectoryLevelStorage::resetNetherPlayerPositions() {
     if (gameServices().getResetNether()) {
-        std::vector<FileEntry*>* playerFiles =
-            m_saveFile->getFilesWithPrefix(playerDir.getName());
+        // CAMBIO: Ya no usamos puntero (*)
+        std::vector<FileEntry*> playerFiles = m_saveFile->getFilesWithPrefix(playerDir.getName());
 
-        if (playerFiles != nullptr) {
-            for (auto it = playerFiles->begin(); it != playerFiles->end();
-                 ++it) {
+        // CAMBIO: Verificamos si el vector tiene elementos
+        if (!playerFiles.empty()) {
+            for (auto it = playerFiles.begin(); it != playerFiles.end(); ++it) {
                 FileEntry* realFile = *it;
                 ConsoleSaveFileInputStream fis =
                     ConsoleSaveFileInputStream(m_saveFile, realFile);
                 CompoundTag* tag = NbtIo::readCompressed(&fis);
                 if (tag != nullptr) {
-                    // If the player is in the nether, set their y position
-                    // above the top of the nether This will force the player to
-                    // be spawned in a valid position in the overworld when they
-                    // are loaded
                     if (tag->contains("Dimension") &&
                         tag->getInt("Dimension") ==
-                            LevelData::DIMENSION_NETHER &&
+                        LevelData::DIMENSION_NETHER &&
                         tag->contains("Pos")) {
                         ListTag<DoubleTag>* pos =
                             (ListTag<DoubleTag>*)tag->getList("Pos");
                         pos->get(1)->data = DBL_MAX;
-
-                        ConsoleSaveFileOutputStream fos =
-                            ConsoleSaveFileOutputStream(m_saveFile, realFile);
-                        NbtIo::writeCompressed(tag, &fos);
                     }
                     delete tag;
                 }
             }
-            delete playerFiles;
+            // ELIMINADO: delete playerFiles; <-- Ya no es necesario
         }
     }
 }
-
 int DirectoryLevelStorage::getAuxValueForMap(PlayerUID xuid, int dimension,
                                              int centreXC, int centreZC,
                                              int scale) {

@@ -329,18 +329,14 @@ bool FileHeader::fileExists(const std::string& name) {
     return false;
 }
 
-std::vector<FileEntry*>* FileHeader::getFilesWithPrefix(
-    const std::string& prefix) {
-    std::vector<FileEntry*>* files = nullptr;
+std::vector<FileEntry*> FileHeader::getFilesWithPrefix(const std::string& prefix) {
+    std::vector<FileEntry*> files;
 
     for (unsigned int i = 0; i < fileTable.size(); ++i) {
-        if (strncmp(fileTable[i]->data.filename, prefix.c_str(),
-                    prefix.size()) == 0) {
-            if (files == nullptr) {
-                files = new std::vector<FileEntry*>();
-            }
-
-            files->push_back(fileTable[i]);
+        if (strncmp(fileTable[i]->data.filename, prefix.c_str(), prefix.size()) == 0) {
+            // Simplemente añadimos el archivo a la lista. 
+            // No hace falta comprobar nullptr porque 'files' es un objeto real.
+            files.push_back(fileTable[i]);
         }
     }
 
@@ -367,4 +363,15 @@ std::endian FileHeader::getEndian(ESavePlatform plat) {
             break;
     }
     return std::endian::little;
+}
+std::vector<FileEntry*> FileHeader::getValidPlayerDatFiles() {
+    std::vector<FileEntry*> files;
+    for (unsigned int i = 0; i < fileTable.size(); ++i) {
+        // Filtramos archivos que estén en la carpeta de jugadores y tengan tamaño
+        std::string name = fileTable[i]->data.filename;
+        if (name.find("players/") == 0 && fileTable[i]->getFileSize() > 0) {
+            files.push_back(fileTable[i]);
+        }
+    }
+    return files;
 }

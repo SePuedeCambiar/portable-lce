@@ -392,12 +392,13 @@ ConsoleSaveFileSplit::ConsoleSaveFileSplit(ConsoleSaveFile* sourceSave,
     header.setSaveVersion(sourceSave->getSaveVersion());
 
     if (alreadySmallRegions) {
-        std::vector<FileEntry*> sourceFiles =
-            sourceSave->getFilesWithPrefix("");
+        // CORRECTO: Recibimos el objeto directamente
+        std::vector<FileEntry*> sourceFiles = sourceSave->getFilesWithPrefix("");
 
         unsigned int bytesWritten = 0;
-        for (auto it = sourceFiles->begin(); it != sourceFiles->end(); ++it) {
-            FileEntry* sourceEntry = *it;
+        
+        // CAMBIO: Usamos un loop moderno. Ya no necesitamos ->begin() o ->end()
+        for (FileEntry* sourceEntry : sourceFiles) {
             sourceSave->setFilePointer(sourceEntry, 0,
                                        SaveFileSeekOrigin::Begin);
 
@@ -408,12 +409,11 @@ ConsoleSaveFileSplit::ConsoleSaveFileSplit(ConsoleSaveFile* sourceSave,
                       sourceEntry->getFileSize(), &bytesWritten);
         }
 
-        delete sourceFiles;
+        // BORRADO: delete sourceFiles;  <-- ELIMINADO porque ya no es un puntero
     } else {
         ConsoleSaveFileConverter::ConvertSave(sourceSave, this, progress);
     }
 }
-
 void ConsoleSaveFileSplit::_init(const std::string& fileName, void* pvSaveData,
                                  unsigned int fileSize, ESavePlatform plat) {
     m_lastTickTime = 0;
@@ -1407,7 +1407,7 @@ std::string ConsoleSaveFileSplit::getFilename() { return m_fileName; }
 std::vector<FileEntry*> ConsoleSaveFileSplit::getFilesWithPrefix(const std::string& prefix) {
     // Obtenemos el puntero del header, pero lo DESREFERENCIAMOS con el asterisco (*)
     // para devolver el objeto real y no la dirección de memoria.
-    return *header.getFilesWithPrefix(prefix);
+    return header.getFilesWithPrefix(prefix);
 }
 
 // En el .h: Cambia std::vector<FileEntry*>* por std::vector<FileEntry*>

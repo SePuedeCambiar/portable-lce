@@ -192,9 +192,9 @@ protected:
 
     bool fileExists(const std::string& name);
 
-    std::vector<FileEntry*>* getFilesWithPrefix(const std::string& prefix);
+    std::vector<FileEntry*> getFilesWithPrefix(const std::string& prefix);
 
-    std::vector<FileEntry*>* getValidPlayerDatFiles();
+    std::vector<FileEntry*> getValidPlayerDatFiles();
 
     void setSaveVersion(int version) { m_saveVersion = version; }
     int getSaveVersion() { return m_saveVersion; }

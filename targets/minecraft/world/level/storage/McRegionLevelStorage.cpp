@@ -33,71 +33,50 @@ McRegionLevelStorage::~McRegionLevelStorage() {
 }
 
 ChunkStorage* McRegionLevelStorage::createChunkStorage(Dimension* dimension) {
-    // File folder = getFolder();
-
+    // --- CASO 1: NETHER ---
     if (dynamic_cast<HellDimension*>(dimension) != nullptr) {
         if (gameServices().getResetNether()) {
 #ifdef SPLIT_SAVES
-            std::vector<FileEntry*>* netherFiles =
-                m_saveFile->getRegionFilesByDimension(1);
-            if (netherFiles != nullptr) {
+            std::vector<FileEntry*> netherFiles = m_saveFile->getRegionFilesByDimension(1);
+            if (!netherFiles.empty()) {
                 uint32_t bytesWritten = 0;
-                for (auto it = netherFiles->begin(); it != netherFiles->end();
-                     ++it) {
-                    m_saveFile->zeroFile(*it, (*it)->getFileSize(),
-                                         &bytesWritten);
+                for (auto it = netherFiles.begin(); it != netherFiles.end(); ++it) {
+                    m_saveFile->zeroFile(*it, (*it)->getFileSize(), &bytesWritten);
                 }
-                delete netherFiles;
             }
 #else
-            std::vector<FileEntry*>* netherFiles =
-                m_saveFile->getFilesWithPrefix(LevelStorage::NETHER_FOLDER);
-            if (netherFiles != nullptr) {
-                for (auto it = netherFiles->begin(); it != netherFiles->end();
-                     ++it) {
+            std::vector<FileEntry*> netherFiles = m_saveFile->getFilesWithPrefix(LevelStorage::NETHER_FOLDER);
+            if (!netherFiles.empty()) {
+                for (auto it = netherFiles.begin(); it != netherFiles.end(); ++it) {
                     m_saveFile->deleteFile(*it);
                 }
-                delete netherFiles;
             }
 #endif
             resetNetherPlayerPositions();
         }
-
-        return new McRegionChunkStorage(m_saveFile,
-                                        LevelStorage::NETHER_FOLDER);
+        return new McRegionChunkStorage(m_saveFile, LevelStorage::NETHER_FOLDER);
     }
 
-    if (dynamic_cast<TheEndDimension*>(dimension)) {
-        // File dir2 = new File(folder, LevelStorage.ENDER_FOLDER);
-        // dir2.mkdirs();
-        // return new ThreadedMcRegionChunkStorage(dir2);
-
-        // 4J-PB - save version 0 at this point means it's a create new world
+    // --- CASO 2: THE END ---
+    if (dynamic_cast<TheEndDimension*>(dimension) != nullptr) {
         int iSaveVersion = m_saveFile->getSaveVersion();
 
         if ((iSaveVersion != 0) && (iSaveVersion < SAVE_FILE_VERSION_NEW_END)) {
-            // For versions before TU9 (TU7 and 8) we generate a part of The
-            // End, but we want to scrap it if it exists so that it is replaced
-            // with the TU9+ version
-            Log::info(
-                "Loaded save version number is: %d, required to keep The End "
-                "is: %d\n",
-                m_saveFile->getSaveVersion(), SAVE_FILE_VERSION_NEW_END);
+            Log::info("Loaded save version number is: %d, required to keep The End is: %d\n",
+                      m_saveFile->getSaveVersion(), SAVE_FILE_VERSION_NEW_END);
 
-            std::vector<FileEntry*>* endFiles =
-                m_saveFile->getFilesWithPrefix(LevelStorage::ENDER_FOLDER);
+            std::vector<FileEntry*> endFiles = m_saveFile->getFilesWithPrefix(LevelStorage::ENDER_FOLDER);
 
-            // 4J-PB - There will be no End in early saves
-            if (endFiles != nullptr) {
-                for (auto it = endFiles->begin(); it != endFiles->end(); ++it) {
+            if (!endFiles.empty()) {
+                for (auto it = endFiles.begin(); it != endFiles.end(); ++it) {
                     m_saveFile->deleteFile(*it);
                 }
-                delete endFiles;
             }
         }
         return new McRegionChunkStorage(m_saveFile, LevelStorage::ENDER_FOLDER);
     }
 
+    // --- CASO 3: OVERWORLD / DEFAULT ---
     return new McRegionChunkStorage(m_saveFile, "");
 }
 
@@ -107,4 +86,6 @@ void McRegionLevelStorage::saveLevelData(
     DirectoryLevelStorage::saveLevelData(levelData, players);
 }
 
-void McRegionLevelStorage::closeAll() { RegionFileCache::clear(); }
+void McRegionLevelStorage::closeAll() { 
+    RegionFileCache::clear(); 
+}

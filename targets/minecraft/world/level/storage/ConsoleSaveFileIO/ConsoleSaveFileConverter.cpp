@@ -18,6 +18,7 @@
 #include "minecraft/world/level/chunk/storage/RegionFileCache.h"
 #include "minecraft/world/level/storage/ConsoleSaveFileIO/ConsoleSaveFile.h"
 #include "minecraft/world/level/storage/ConsoleSaveFileIO/ConsoleSaveFileInputStream.h"
+#include "minecraft/world/level/storage/ConsoleSaveFileIO/ConsoleSaveFileOutputStream.h"
 #include "minecraft/world/level/storage/ConsoleSaveFileIO/ConsoleSavePath.h"
 #include "minecraft/world/level/storage/ConsoleSaveFileIO/FileHeader.h"
 #include "minecraft/world/level/storage/DirectoryLevelStorage.h"
@@ -101,29 +102,26 @@ void ConsoleSaveFileConverter::ConvertSave(ConsoleSaveFile* sourceSave,
     }
 
     // MGH added - find any player data files and copy them across
-    std::vector<FileEntry*> playerFiles =
-        sourceSave->getFilesWithPrefix(DirectoryLevelStorage::getPlayerDir());
+    std::vector<FileEntry*> playerFiles = sourceSave->getFilesWithPrefix(DirectoryLevelStorage::getPlayerDir());
 
-    if (playerFiles != nullptr) {
-        for (int fileIdx = 0; fileIdx < playerFiles->size(); fileIdx++) {
-            ConsoleSavePath sourcePlayerDatPath(
-                playerFiles->at(fileIdx)->data.filename);
-            ConsoleSavePath targetPlayerDatPath(
-                playerFiles->at(fileIdx)->data.filename);
+    if (!playerFiles.empty()) {
+        for (int fileIdx = 0; fileIdx < playerFiles.size(); fileIdx++) {
+            // CORRECCIÓN: Acceso correcto al vector usando punto (.)
+            std::string filename = playerFiles.at(fileIdx)->data.filename;
+            ConsoleSavePath sourcePlayerDatPath(filename);
+            ConsoleSavePath targetPlayerDatPath(filename);
+            
             {
-                FileEntry* sourceFe =
-                    sourceSave->createFile(sourcePlayerDatPath);
-                FileEntry* targetFe =
-                    targetSave->createFile(targetPlayerDatPath);
-                printf("Processing player dat file %s\n",
-                       playerFiles->at(fileIdx)->data.filename);
+                FileEntry* sourceFe = sourceSave->createFile(sourcePlayerDatPath);
+                FileEntry* targetFe = targetSave->createFile(targetPlayerDatPath);
+                
+                printf("Processing player dat file %s\n", filename.c_str());
+                
                 ProcessSimpleFile(sourceSave, sourceFe, targetSave, targetFe);
 
-                targetFe->data.lastModifiedTime =
-                    sourceFe->data.lastModifiedTime;
+                targetFe->data.lastModifiedTime = sourceFe->data.lastModifiedTime;
             }
         }
-        delete playerFiles;
     }
 
 #if defined(SPLIT_SAVES)
@@ -162,7 +160,6 @@ void ConsoleSaveFileConverter::ConvertSave(ConsoleSaveFile* sourceSave,
 
         for (int x = -halfXZSize; x < halfXZSize; ++x) {
             for (int z = -halfXZSize; z < halfXZSize; ++z) {
-                // printf("Processing overworld chunk %d,%d\n",x,z);
                 DataInputStream* dis =
                     sourceCache._getChunkDataInputStream(sourceSave, "", x, z);
 
@@ -207,7 +204,6 @@ void ConsoleSaveFileConverter::ConvertSave(ConsoleSaveFile* sourceSave,
 
         for (int x = -halfXZSize; x < halfXZSize; ++x) {
             for (int z = -halfXZSize; z < halfXZSize; ++z) {
-                // printf("Processing nether chunk %d,%d\n",x,z);
                 DataInputStream* dis = sourceCache._getChunkDataInputStream(
                     sourceSave, "DIM-1", x, z);
 
@@ -251,7 +247,6 @@ void ConsoleSaveFileConverter::ConvertSave(ConsoleSaveFile* sourceSave,
 
         for (int x = -halfXZSize; x < halfXZSize; ++x) {
             for (int z = -halfXZSize; z < halfXZSize; ++z) {
-                // printf("Processing end chunk %d,%d\n",x,z);
                 DataInputStream* dis = sourceCache._getChunkDataInputStream(
                     sourceSave, "DIM1/", x, z);
 
@@ -283,17 +278,14 @@ void ConsoleSaveFileConverter::ConvertSave(ConsoleSaveFile* sourceSave,
     }
 
 #else
-    // 4J Stu - Old version that just changes the compression of chunks, not
-    // usable for XboxOne style split saves or compressed tile formats Process
-    // region files
-    std::vector<FileEntry*>* allFilesInSave =
-        sourceSave->getFilesWithPrefix(std::string(""));
-    for (auto it = allFilesInSave->begin(); it < allFilesInSave->end(); ++it) {
+    std::vector<FileEntry*> allFilesInSave = sourceSave->getFilesWithPrefix(std::string(""));
+    for (auto it = allFilesInSave.begin(); it != allFilesInSave.end(); ++it) {
         FileEntry* fe = *it;
         if (fe != sourceLdatFe) {
             std::string fName(fe->data.filename);
             std::string suffix(".mcr");
-            if (fName.compare(fName.length() - suffix.length(), suffix.length(),
+            if (fName.length() >= suffix.length() && 
+                fName.compare(fName.length() - suffix.length(), suffix.length(),
                               suffix) == 0) {
 #if !defined(_CONTENT_PACKAGE)
                 printf("Processing a region file: %s\n", fe->data.filename);

@@ -680,14 +680,14 @@ unsigned int ConsoleSaveFileOriginal::getSizeOnDisk() {
 
 std::string ConsoleSaveFileOriginal::getFilename() { return m_fileName; }
 
-std::vector<FileEntry*>* ConsoleSaveFileOriginal::getFilesWithPrefix(
+std::vector<FileEntry*> ConsoleSaveFileOriginal::getFilesWithPrefix(
     const std::string& prefix) {
     return header.getFilesWithPrefix(prefix);
 }
 
-std::vector<FileEntry*>* ConsoleSaveFileOriginal::getRegionFilesByDimension(
+std::vector<FileEntry*> ConsoleSaveFileOriginal::getRegionFilesByDimension(
     unsigned int dimensionIndex) {
-    return nullptr;
+    return {};
 }
 
 int ConsoleSaveFileOriginal::getSaveVersion() {
@@ -773,9 +773,8 @@ void ConsoleSaveFileOriginal::ConvertToLocalPlatform() {
         return;
     }
     // convert each of the region files to the local platform
-    std::vector<FileEntry*>* allFilesInSave =
-        getFilesWithPrefix(std::string(""));
-    for (auto it = allFilesInSave->begin(); it < allFilesInSave->end(); ++it) {
+    std::vector<FileEntry*> allFilesInSave = getFilesWithPrefix(std::string(""));
+    for (auto it = allFilesInSave.begin(); it != allFilesInSave.end(); ++it) {
         FileEntry* fe = *it;
         std::string fName(fe->data.filename);
         std::string suffix(".mcr");
