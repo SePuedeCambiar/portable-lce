@@ -126,6 +126,8 @@ public:
     void setTilesDirty(int x0, int y0, int z0, int x1, int y1, int z1,
                        Level* level);  // 4J - added level param
 
+    void unloadRenderChunk(int x, int z, int dimensionId); 
+                       
     void cull(Culler* culler, float a);
     void playStreamingMusic(const std::string& name, int x, int y, int z);
     void playSound(int iSound, double x, double y, double z, float volume,

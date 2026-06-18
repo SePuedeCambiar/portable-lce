@@ -111,6 +111,8 @@ public:
     virtual void recreateLogicStructuresForChunk(int chunkX, int chunkZ);
 
 private:
+// En ServerChunkCache.h, dentro de private:
+std::deque<std::pair<LevelChunk*, int64_t>> m_deletionQueue; 
     typedef struct _SaveThreadData {
         ServerChunkCache* cache;
         LevelChunk* chunkToSave;

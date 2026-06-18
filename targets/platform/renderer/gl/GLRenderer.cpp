@@ -111,6 +111,8 @@ static std::mutex s_sharedMtx;
 static std::mutex s_glCallMtx;
 static std::thread::id s_mainThreadId;
 static bool s_mainThreadSet = false;
+static std::vector<int> s_pendingDeletions; // <--- AQUÍ
+static std::mutex s_deletionMtx; 
 static thread_local unsigned int s_rs_dirty_mask = 0xFFFFFFFF;
 
 struct GLShadowState {
@@ -565,12 +567,12 @@ struct ChunkDrawCall {
 
 struct ChunkBuffer {
     GLuint vbo = 0;
-    // each chunks has its one VAO now
     GLuint vao = 0;
     std::vector<ChunkDrawCall> draws;
     std::vector<uint8_t> rawVerts;
     bool valid = false;
     bool vboReady = false;
+
     void destroy() {
         if (vbo) {
             glDeleteBuffers(1, &vbo);
@@ -582,6 +584,7 @@ struct ChunkBuffer {
         }
         draws.clear();
         rawVerts.clear();
+        rawVerts.shrink_to_fit(); // <--- AÑADIR ESTO: Libera la RAM físicamente
         valid = false;
         vboReady = false;
     }
@@ -762,7 +765,37 @@ void GLRenderer::StartFrame() {
 }
 
 void GLRenderer::Present() {
+    // --- 1. LIMPIEZA DE BUFFERS PENDIENTES (Sincronización de RAM/GPU) ---
+    // Esta sección procesa la cola de borrado que llenamos desde el hilo de lógica.
+    // Al hacerlo aquí, aseguramos que glDeleteBuffers se ejecute en el hilo de Renderizado.
+    {
+        std::lock_guard<std::mutex> lk_del(s_deletionMtx); 
+        if (!s_pendingDeletions.empty()) {
+            // Bloqueamos la pool de chunks para evitar que el renderizador intente 
+            // dibujar un chunk mientras lo estamos borrando.
+            std::lock_guard<std::mutex> lk_pool(s_glCallMtx); 
+            
+            for (int idx : s_pendingDeletions) {
+                auto it = s_chunkPool.find(idx);
+                if (it != s_chunkPool.end()) {
+                    // 1. Llamamos a destroy() para liberar VBOs, VAOs y rawVerts (RAM)
+                    // Importante: destroy() pone 'valid = false', lo que indica al
+                    // renderizador que ignore este chunk sin crashear.
+                    it->second.destroy(); 
+                    
+                    // NOTA: Hemos eliminado 's_chunkPool.erase(it)'.
+                    // Mantener la entrada en el mapa evita el Segmentation Fault (Signal 11)
+                    // ya que el hilo de renderizado no encontrará un puntero nulo inesperado.
+                }
+            }
+            // Vaciamos la cola ya que todo ha sido procesado
+            s_pendingDeletions.clear();
+        }
+    }
+
+    // --- 2. LÓGICA ORIGINAL DE PRESENTACIÓN ---
     if (!s_window) return;
+    
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_QUIT)
@@ -774,6 +807,7 @@ void GLRenderer::Present() {
                 onFramebufferResize(ev.window.data1, ev.window.data2);
         }
     }
+    
     glFlush();
     SDL_GL_SwapWindow(s_window);
 }
@@ -982,12 +1016,9 @@ void GLRenderer::CBuffEnd() {
 }
 
 void GLRenderer::CBuffClear(int index) {
-    std::lock_guard<std::mutex> lk(s_glCallMtx);
-    auto it = s_chunkPool.find(index);
-    if (it != s_chunkPool.end()) {
-        it->second.destroy();
-        s_chunkPool.erase(it);
-    }
+    // En lugar de borrar aquí (que causa el crash), lo anotamos en la lista
+    std::lock_guard<std::mutex> lk(s_deletionMtx);
+    s_pendingDeletions.push_back(index);
 }
 
 bool GLRenderer::CBuffCall(int index, bool) {

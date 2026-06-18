@@ -2491,33 +2491,28 @@ void LevelChunk::reorderBlocksAndDataToXZY(int y0, int xs, int ys, int zs,
 }
 
 void LevelChunk::unloadLogicData() {
-    // 1. Limpiar Entidades (con bloqueo de seguridad)
+    // 1. Limpiar Entidades (Esto es lo que más RAM consume y CPU)
     {
         std::lock_guard<std::recursive_mutex> lock(m_csEntities);
         for (int i = 0; i < ENTITY_BLOCKS_LENGTH; i++) {
             if (entityBlocks[i]) {
                 entityBlocks[i]->clear();
-                // No borramos el vector en sí para evitar crashes en el render, 
-                // solo vaciamos su contenido.
             }
         }
     }
 
-    // 2. Limpiar TileEntities (Cofres, etc.)
+    // 2. Limpiar TileEntities (Cofres, hornos, etc.)
     {
         std::lock_guard<std::recursive_mutex> lock(m_csTileEntities);
         tileEntities.clear();
     }
 
-    // 3. Liberar Iluminación y Datos (Vía segura para la GPU)
-    // Usamos AddForDelete para que el renderizador no acceda a memoria liberada
-    if (lowerSkyLight) { GameRenderer::AddForDelete(lowerSkyLight); lowerSkyLight = nullptr; }
-    if (upperSkyLight) { GameRenderer::AddForDelete(upperSkyLight); upperSkyLight = nullptr; }
-    if (lowerBlockLight) { GameRenderer::AddForDelete(lowerBlockLight); lowerBlockLight = nullptr; }
-    if (upperBlockLight) { GameRenderer::AddForDelete(upperBlockLight); upperBlockLight = nullptr; }
-    
+    // 3. Liberar solo los metadatos (Sigue siendo seguro para el render)
     if (lowerData) { GameRenderer::AddForDelete(lowerData); lowerData = nullptr; }
     if (upperData) { GameRenderer::AddForDelete(upperData); upperData = nullptr; }
 
-    Log::info("Chunk [%d, %d] degradado a modo MEDIANO (RAM liberada)\n", x, z);
+    // NOTA: NO borramos lowerSkyLight, upperSkyLight, lowerBlockLight, ni upperBlockLight.
+    // Si los borramos, el chunk se vuelve transparente.
+    
+    Log::info("Chunk [%d, %d] degradado: Entidades y Datos liberados, Bloques y Luces mantenidos.\n", x, z);
 }

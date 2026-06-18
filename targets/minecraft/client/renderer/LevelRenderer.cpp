@@ -4110,3 +4110,26 @@ int LevelRenderer::checkAllPresentChunks(bool* faultFound) {
     }
     return presentCount;
 }
+
+void LevelRenderer::unloadRenderChunk(int x, int z, int dimensionId) {
+    // Un chunk lógico (16x16) tiene varias secciones de renderizado (16x16x16)
+    // Debemos limpiar todas las secciones Y para ese X y Z.
+    for (int y = 0; y < CHUNK_Y_COUNT; y++) {
+        int index = getGlobalIndexForChunk(x, y, z, dimensionId);
+        if (index == -1) continue;
+
+        // Calculamos la posición de las listas de renderizado (Opaca y Transparente)
+        int lists = index * 2 + chunkLists;
+        
+        // ESTO ES LO MÁS IMPORTANTE: Forzamos la liberación de la memoria en la GPU/RAM
+        PlatformRenderer.CBuffClear(lists);     // Capa Opaca
+        PlatformRenderer.CBuffClear(lists + 1); // Capa Transparente
+        
+        // Marcamos el chunk como vacío para que el renderizador no intente dibujarlo
+        setGlobalChunkFlag(index, CHUNK_FLAG_EMPTYBOTH, 0);
+        
+        // Decrementamos el contador de referencias para mantener la consistencia
+        decGlobalChunkRefCount(x, y, z, level[0]); // Usamos level[0] como referencia de dimensión
+    }
+    Log::info("RenderRenderer: GPU buffers liberados para chunk [%d, %d]\n", x, z);
+}
