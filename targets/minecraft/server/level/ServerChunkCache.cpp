@@ -23,6 +23,9 @@
 #include "minecraft/world/level/storage/ConsoleSaveFileIO/compression.h"
 #include "minecraft/world/level/tile/Tile.h"
 
+#include "minecraft/client/Minecraft.h"
+#include "minecraft/world/entity/Entity.h" 
+
 ServerChunkCache::ServerChunkCache(ServerLevel* level, ChunkStorage* storage,
                                    ChunkSource* source) {
     XZSIZE = source->m_XZSize;  // 4J Added
@@ -759,39 +762,80 @@ bool ServerChunkCache::save(bool force, ProgressListener* progressListener) {
 
     return !maxSavesReached;
 }
+
 bool ServerChunkCache::tick() {
     if (!level->noSave) {
 #if defined(_LARGE_WORLDS)
-        for (int i = 0; i < 100; i++) { // Volvemos a 100 para estabilidad, puedes subirlo a 200 luego
+        // Procesamos varios chunks por tick para evitar que la cola m_toDrop crezca infinitamente
+        for (int i = 0; i < 100; i++) {
             if (!m_toDrop.empty()) {
                 LevelChunk* chunk = m_toDrop.front();
-                if (!chunk->isUnloaded()) {
-                    if (!chunk->containsPlayer()) {
-                        save(chunk);
-                        saveEntities(chunk);
-                        chunk->unload(true);
 
-                        auto it = find(m_loadedChunkList.begin(), m_loadedChunkList.end(), chunk);
-                        if (it != m_loadedChunkList.end()) {
-                            m_loadedChunkList.erase(it);
-                        }
-
-                        int ix = chunk->x + XZOFFSET;
-                        int iz = chunk->z + XZOFFSET;
-                        int idx = ix * XZSIZE + iz;
-
-                        // --- EL PARCHE MAGICO ---
-                        // Si ya había un chunk en esta posición del cache, 
-                        // lo borramos PRIMERO para que no haya fuga.
-                        if (m_unloadedCache[idx] != nullptr) {
-                            delete m_unloadedCache[idx];
-                        }
-                        
-                        m_unloadedCache[idx] = chunk; // Ahora ponemos el nuevo
-                        cache[idx] = nullptr;
-                    }
+                // Si el chunk ya está descargado o contiene al jugador, no lo procesamos ahora
+                if (chunk->isUnloaded() || chunk->containsPlayer()) {
+                    m_toDrop.pop_front();
+                    continue;
                 }
-                m_toDrop.pop_front();
+
+                // 1. Guardar siempre antes de degradar o borrar
+                save(chunk);
+                saveEntities(chunk);
+                chunk->unload(true);
+
+                auto it = find(m_loadedChunkList.begin(), m_loadedChunkList.end(), chunk);
+                if (it != m_loadedChunkList.end()) {
+                    m_loadedChunkList.erase(it);
+                }
+
+                int ix = chunk->x + XZOFFSET;
+                int iz = chunk->z + XZOFFSET;
+                int idx = ix * XZSIZE + iz;
+
+                // --- SEGURIDAD: Verificar si el jugador existe ---
+                if (Minecraft::GetInstance()->player == nullptr) {
+                    // Si no hay jugador, no podemos calcular la distancia.
+                    // Dejamos el chunk en la cola y salimos del bucle por este tick.
+                    break;
+                }
+
+                // --- SOLUCIÓN DEFINITIVA AL ERROR DE COMPILACIÓN ---
+                // Forzamos la interpretación del puntero del jugador como una Entity.
+                // Esto evita que el compilador pida el archivo MultiplayerLocalPlayer.h
+                Entity* playerEnt = reinterpret_cast<Entity*>(Minecraft::GetInstance()->player.get());
+                
+                float playerX = playerEnt->x / 16.0f;
+                float playerZ = playerEnt->z / 16.0f;
+                float distSq = (chunk->x - playerX) * (chunk->x - playerX) +
+                               (chunk->z - playerZ) * (chunk->z - playerZ);
+
+                // Radios al cuadrado para optimizar (evitar sqrt)
+                const float MEDIUM_RADIUS_SQ = 12.0f * 12.0f; // 12 chunks
+                const float FAR_RADIUS_SQ = 24.0f * 24.0f;    // 24 chunks
+
+                if (distSq > FAR_RADIUS_SQ) {
+                    // TIPO LEJANO: Borrado total de RAM
+                    if (m_unloadedCache[idx] != nullptr) delete m_unloadedCache[idx];
+                    m_unloadedCache[idx] = nullptr;
+                    delete chunk;
+                    Log::info("Chunk [%d, %d] -> LEJANO: Liberado de RAM\n", chunk->x, chunk->z);
+                }
+                else if (distSq > MEDIUM_RADIUS_SQ) {
+                    // TIPO MEDIANO: Degradación de datos (solo bloques)
+                    if (m_unloadedCache[idx] != nullptr) delete m_unloadedCache[idx];
+                    chunk->unloadLogicData(); // Libera luces y entidades, mantiene bloques
+                    m_unloadedCache[idx] = chunk;
+                    Log::info("Chunk [%d, %d] -> MEDIANO: Datos lógicos liberados\n", chunk->x, chunk->z);
+                }
+                else {
+                    // TIPO CERCANO: Se mantiene en hibernación completa en RAM
+                    if (m_unloadedCache[idx] != nullptr) delete m_unloadedCache[idx];
+                    m_unloadedCache[idx] = chunk;
+                }
+
+                cache[idx] = nullptr;
+                m_toDrop.pop_front(); // Solo sacamos de la cola si logramos procesarlo
+            } else {
+                break; // Si la cola está vacía, dejamos de procesar
             }
         }
 #endif
@@ -799,7 +843,6 @@ bool ServerChunkCache::tick() {
     }
     return source->tick();
 }
-
 bool ServerChunkCache::shouldSave() { return !level->noSave; }
 
 std::string ServerChunkCache::gatherStats() {

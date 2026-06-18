@@ -262,6 +262,7 @@ public:
                                std::shared_ptr<TileEntity> tileEntity);
     virtual void removeTileEntity(int x, int y, int z);
     virtual void load();
+    void unloadLogicData();
     virtual void unload(bool unloadTileEntities);  // 4J - added parameter
     virtual bool containsPlayer();                 // 4J - added
 #if defined(_LARGE_WORLDS)

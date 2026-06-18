@@ -1000,6 +1000,7 @@ bool LevelChunk::setTile(int x, int y, int z, int _tile) {
 int LevelChunk::getData(int x, int y, int z) {
     SparseDataStorage* data =
         y >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT ? upperData : lowerData;
+    if (!data) return 0;
     return data->get(x, y % Level::COMPRESSED_CHUNK_SECTION_HEIGHT, z);
 }
 
@@ -1007,6 +1008,8 @@ bool LevelChunk::setData(int x, int y, int z, int val, int mask,
                          bool* maskedBitsChanged) {
     SparseDataStorage* data =
         y >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT ? upperData : lowerData;
+    
+    if (!data) return false; 
     this->setUnsaved(true);
     int old = data->get(x, y % Level::COMPRESSED_CHUNK_SECTION_HEIGHT, z);
 
@@ -1028,26 +1031,26 @@ bool LevelChunk::setData(int x, int y, int z, int val, int mask,
     return true;
 }
 
-int LevelChunk::getBrightness(LightLayer::variety layer, int x, int y, int z) {
+ int LevelChunk::getBrightness(LightLayer::variety layer, int x, int y, int z) {
     if (layer == LightLayer::Sky) {
-        if (level->dimension->hasCeiling) {
-            return 0;
+if (level->dimension->hasCeiling) {
+return 0;
         }
         SparseLightStorage* skyLight =
             y >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT ? upperSkyLight
-                                                        : lowerSkyLight;
-        if (!skyLight) return 0;
-        return skyLight->get(x, y % Level::COMPRESSED_CHUNK_SECTION_HEIGHT, z);
+: lowerSkyLight;
+if (!skyLight) return 0;
+return skyLight->get(x, y % Level::COMPRESSED_CHUNK_SECTION_HEIGHT, z);
     } else if (layer == LightLayer::Block) {
         SparseLightStorage* blockLight =
             y >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT ? upperBlockLight
-                                                        : lowerBlockLight;
-        if (!blockLight) return 0;
-        return blockLight->get(x, y % Level::COMPRESSED_CHUNK_SECTION_HEIGHT,
+: lowerBlockLight;
+if (!blockLight) return 0;
+return blockLight->get(x, y % Level::COMPRESSED_CHUNK_SECTION_HEIGHT,
                                z);
     } else
-        return 0;
-}
+return 0;
+} 
 
 // 4J added
 void LevelChunk::getNeighbourBrightnesses(int* brightnesses,
@@ -1097,30 +1100,29 @@ void LevelChunk::getNeighbourBrightnesses(int* brightnesses,
             light->get(x, (y + 1) % Level::COMPRESSED_CHUNK_SECTION_HEIGHT, z);
 }
 
-void LevelChunk::setBrightness(LightLayer::variety layer, int x, int y, int z,
-                               int brightness) {
+void LevelChunk::setBrightness(LightLayer::variety layer, int x, int y, int z, int brightness) {
     this->setUnsaved(true);
     if (layer == LightLayer::Sky) {
         if (!level->dimension->hasCeiling) {
-            SparseLightStorage* skyLight =
-                y >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT ? upperSkyLight
-                                                            : lowerSkyLight;
-            skyLight->set(x, y % Level::COMPRESSED_CHUNK_SECTION_HEIGHT, z,
-                          brightness);
+            SparseLightStorage* skyLight = y >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT ? upperSkyLight : lowerSkyLight;
+            
+            if (skyLight) { // <--- AÑADIR ESTE IF
+                skyLight->set(x, y % Level::COMPRESSED_CHUNK_SECTION_HEIGHT, z, brightness);
+            }
         }
     } else if (layer == LightLayer::Block) {
-        SparseLightStorage* blockLight =
-            y >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT ? upperBlockLight
-                                                        : lowerBlockLight;
-        blockLight->set(x, y % Level::COMPRESSED_CHUNK_SECTION_HEIGHT, z,
-                        brightness);
+        SparseLightStorage* blockLight = y >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT ? upperBlockLight : lowerBlockLight;
+        
+        if (blockLight) { // <--- AÑADIR ESTE IF
+            blockLight->set(x, y % Level::COMPRESSED_CHUNK_SECTION_HEIGHT, z, brightness);
+        }
     }
 }
-
 int LevelChunk::getRawBrightness(int x, int y, int z, int skyDampen) {
     SparseLightStorage* skyLight = y >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT
                                        ? upperSkyLight
                                        : lowerSkyLight;
+    if (!skyLight) return 0;
     int light =
         level->dimension->hasCeiling
             ? 0
@@ -2486,4 +2488,36 @@ void LevelChunk::reorderBlocksAndDataToXZY(int y0, int xs, int ys, int zs,
     //	delete buffer.data();
     //	buffer.data() = newBuffer.data();
     //}
+}
+
+void LevelChunk::unloadLogicData() {
+    // 1. Limpiar Entidades (con bloqueo de seguridad)
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_csEntities);
+        for (int i = 0; i < ENTITY_BLOCKS_LENGTH; i++) {
+            if (entityBlocks[i]) {
+                entityBlocks[i]->clear();
+                // No borramos el vector en sí para evitar crashes en el render, 
+                // solo vaciamos su contenido.
+            }
+        }
+    }
+
+    // 2. Limpiar TileEntities (Cofres, etc.)
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_csTileEntities);
+        tileEntities.clear();
+    }
+
+    // 3. Liberar Iluminación y Datos (Vía segura para la GPU)
+    // Usamos AddForDelete para que el renderizador no acceda a memoria liberada
+    if (lowerSkyLight) { GameRenderer::AddForDelete(lowerSkyLight); lowerSkyLight = nullptr; }
+    if (upperSkyLight) { GameRenderer::AddForDelete(upperSkyLight); upperSkyLight = nullptr; }
+    if (lowerBlockLight) { GameRenderer::AddForDelete(lowerBlockLight); lowerBlockLight = nullptr; }
+    if (upperBlockLight) { GameRenderer::AddForDelete(upperBlockLight); upperBlockLight = nullptr; }
+    
+    if (lowerData) { GameRenderer::AddForDelete(lowerData); lowerData = nullptr; }
+    if (upperData) { GameRenderer::AddForDelete(upperData); upperData = nullptr; }
+
+    Log::info("Chunk [%d, %d] degradado a modo MEDIANO (RAM liberada)\n", x, z);
 }

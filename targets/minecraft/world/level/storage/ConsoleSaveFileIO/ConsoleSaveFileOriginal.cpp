@@ -560,6 +560,8 @@ void ConsoleSaveFileOriginal::Flush(bool autosave, bool updateThumbnail) {
         gameServices().getSaveThumbnail(&pbThumbnailData, &dwThumbnailDataSize,
                                         &pbDataSaveImage, &dwDataSizeSaveImage);
 #endif
+// Forzamos la escritura en el disco duro de la PC
+DebugFlushToFile(compData, compLength + 8);
 
         std::uint8_t bTextMetadata[88] = {};
 
