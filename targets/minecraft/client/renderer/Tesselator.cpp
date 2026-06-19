@@ -81,15 +81,15 @@ Tesselator::Tesselator(int size) {
 
 // --- ESTO ES LO QUE DEBES AÑADIR ---
 Tesselator::~Tesselator() {
-    // Ya no necesitamos 'delete _array' porque ahora es un objeto, no un puntero.
-    // El vector se liberará solo al morir el objeto Tesselator.
-    
-    if (vboMode && vboIds) {
-        // Si vboIds es un IntBuffer (tipo la clase de MemoryTracker), 
-        // asegúrate de que se libere aquí si es necesario.
+    // 1. Verificamos que el ID no sea 0 (0 significa que no hay buffer)
+    if (this->vboId != 0) { 
+        // 2. Pasamos la dirección del entero (&) y hacemos el cast a GLuint*
+        glDeleteBuffers(1, (GLuint*)&this->vboId); 
+        
+        // 3. Lo reseteamos a 0 por seguridad
+        this->vboId = 0;
     }
 }
-
 
 Tesselator* Tesselator::getUniqueInstance(int size) {
     return new Tesselator(size);
