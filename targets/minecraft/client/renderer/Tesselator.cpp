@@ -81,19 +81,29 @@ Tesselator::Tesselator(int size) {
 
 // --- ESTO ES LO QUE DEBES AÑADIR ---
 Tesselator::~Tesselator() {
-    // 1. Verificamos que el ID no sea 0 (0 significa que no hay buffer)
-    if (this->vboId != 0) { 
-        // 2. Pasamos la dirección del entero (&) y hacemos el cast a GLuint*
-        glDeleteBuffers(1, (GLuint*)&this->vboId); 
+    // 1. Limpiar los buffers de la GPU (vboIds es el array de 10 IDs)
+    if (this->vboIds != nullptr) {
+        // Borramos los 'vboCounts' (10) buffers que creamos en el constructor
+        glDeleteBuffers(this->vboCounts, (GLuint*)this->vboIds);
         
-        // 3. Lo reseteamos a 0 por seguridad
+        // Cambiamos MemoryTracker por delete[] que es el estándar de C++
+        // para liberar arrays de enteros.
+        delete[] this->vboIds; 
+        this->vboIds = nullptr;
+    }
+
+    // Borramos vboId singular por si acaso
+    if (this->vboId != 0) {
+        glDeleteBuffers(1, (GLuint*)&this->vboId);
         this->vboId = 0;
     }
 }
 
 Tesselator* Tesselator::getUniqueInstance(int size) {
+    // Volvemos a Tesselator* para que coincida con el header y no dé error
     return new Tesselator(size);
 }
+
 
 void Tesselator::end() {
     //    if (!tesselating) throw new IllegalStateException("Not tesselating!");

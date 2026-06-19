@@ -1598,11 +1598,11 @@ void Minecraft::run_middle() {
                     //                setLevel(null);
                     //                setScreen(new LevelConflictScreen());
                     //            }
-                    // 				SparseLightStorage::tick();
+                     				SparseLightStorage::tick();
                     // // 4J added
-                    // CompressedTileStorage::tick();	// 4J added
-                    // 				SparseDataStorage::tick();
-                    // // 4J added
+                    CompressedTileStorage::tick();	// 4J added
+                     				SparseDataStorage::tick();
+                    // 4J added
                 }
                 // int64_t tickDuraction = System::nanoTime() - beforeTickTime;
                 checkGlError("Pre render");

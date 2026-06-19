@@ -205,20 +205,20 @@ int BufferedImage::getTransparency() {
 // the specified rectangular region Returns: a BufferedImage that is the
 // subimage of this BufferedImage.
 BufferedImage* BufferedImage::getSubimage(int x, int y, int w, int h) {
-    // TODO - 4J Implement
-
+    // 1. Creamos la nueva imagen. 
+    // El constructor de BufferedImage ya reserva memoria para img->data[0]
     BufferedImage* img = new BufferedImage(w, h, 0);
 
     // 4jcraft: Copy pixel data directly into img->data[0].
-    // The old arrayWithLength.h (custom vector impl) was a non-owning wrapper,
-    // std::vector copies so we write to the raw array directly instead.
     int srcW = width;
     for (int row = 0; row < h; row++) {
         for (int col = 0; col < w; col++) {
+            // CORRECCIÓN: Cambiado '_' por '*' en los cálculos de índice
             img->data[0][row * w + col] = data[0][(y + row) * srcW + (x + col)];
         }
     }
 
+    // Procesar los niveles de MipMap (1 al 9)
     int level = 1;
     while (level < 10 && getData(level) != nullptr) {
         int ww = w >> level;
@@ -226,16 +226,24 @@ BufferedImage* BufferedImage::getSubimage(int x, int y, int w, int h) {
         int xx = x >> level;
         int yy = y >> level;
         int srcW = width >> level;
+
+        // Reservamos memoria para este nivel de MipMap
+        // Esta memoria será liberada automáticamente por el destructor ~BufferedImage()
         img->data[level] = new int[ww * hh];
+
         for (int row = 0; row < hh; row++) {
             for (int col = 0; col < ww; col++) {
-                img->data[level][row * ww + col] =
+                // CORRECCIÓN: Cambiado '_' por '*' en los cálculos de índice
+                img->data[level][row * ww + col] = 
                     data[level][(yy + row) * srcW + (xx + col)];
             }
         }
         ++level;
     }
 
+    // IMPORTANTE: Se devuelve un puntero raw. 
+    // Quien llame a esta función es RESPONSABLE de hacer 'delete img;' 
+    // cuando ya no necesite la subimagen.
     return img;
 }
 

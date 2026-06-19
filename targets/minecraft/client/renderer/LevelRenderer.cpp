@@ -423,7 +423,14 @@ void LevelRenderer::setLevel(int playerIndex, MultiPlayerLevel* level) {
         // 0x%x\n",playerIndex,chunks[playerIndex]);
         if (!chunks[playerIndex].empty()) {
             for (unsigned int i = 0; i < chunks[playerIndex].size(); i++) {
-                chunks[playerIndex][i].chunk->_delete();
+                // --- NUEVO: Liberar memoria de la GPU ---
+                if (chunks[playerIndex][i].chunk != nullptr) {
+                    int gIdx = chunks[playerIndex][i].globalIdx;
+                    if (gIdx != -1) {
+                        PlatformRenderer.CBuffDelete(gIdx * 2 + chunkLists, 2);
+                    }
+                    chunks[playerIndex][i].chunk->_delete();
+                }
                 delete chunks[playerIndex][i].chunk;
             }
             chunks[playerIndex].clear();
@@ -496,11 +503,19 @@ void LevelRenderer::allChanged(int playerIndex) {
 
     if (!chunks[playerIndex].empty()) {
         for (unsigned int i = 0; i < chunks[playerIndex].size(); i++) {
-            chunks[playerIndex][i].chunk->_delete();
+            // --- NUEVO: Liberar memoria de la GPU antes de borrar el objeto ---
+            if (chunks[playerIndex][i].chunk != nullptr) {
+                int gIdx = chunks[playerIndex][i].globalIdx;
+                if (gIdx != -1) {
+                    // Borramos las dos capas (Opaca y Transparente)
+                    // globalIdx * 2 es la base, + chunkLists es el offset global
+                    PlatformRenderer.CBuffDelete(gIdx * 2 + chunkLists, 2);
+                }
+                chunks[playerIndex][i].chunk->_delete();
+            }
             delete chunks[playerIndex][i].chunk;
         }
-        //		delete sortedChunks[playerIndex];	// 4J - removed
-        //- not sorting our chunks anymore
+        chunks[playerIndex].clear();
     }
 
     chunks[playerIndex] = std::vector<ClipChunk>(xChunks * yChunks * zChunks);
@@ -4113,23 +4128,29 @@ int LevelRenderer::checkAllPresentChunks(bool* faultFound) {
 
 void LevelRenderer::unloadRenderChunk(int x, int z, int dimensionId) {
     // Un chunk lógico (16x16) tiene varias secciones de renderizado (16x16x16)
-    // Debemos limpiar todas las secciones Y para ese X y Z.
     for (int y = 0; y < CHUNK_Y_COUNT; y++) {
-        int index = getGlobalIndexForChunk(x, y, z, dimensionId);
+        // CORRECCIÓN: Convertimos coordenadas de chunk a coordenadas de bloque reales (* 16)
+        int blockX = x * CHUNK_XZSIZE;
+        int blockY = y * CHUNK_SIZE;
+        int blockZ = z * CHUNK_XZSIZE;
+
+        int index = getGlobalIndexForChunk(blockX, blockY, blockZ, dimensionId);
         if (index == -1) continue;
 
         // Calculamos la posición de las listas de renderizado (Opaca y Transparente)
         int lists = index * 2 + chunkLists;
-        
-        // ESTO ES LO MÁS IMPORTANTE: Forzamos la liberación de la memoria en la GPU/RAM
+
+        // Forzamos la liberación segura de la memoria en la GPU
         PlatformRenderer.CBuffClear(lists);     // Capa Opaca
         PlatformRenderer.CBuffClear(lists + 1); // Capa Transparente
-        
+
         // Marcamos el chunk como vacío para que el renderizador no intente dibujarlo
         setGlobalChunkFlag(index, CHUNK_FLAG_EMPTYBOTH, 0);
-        
-        // Decrementamos el contador de referencias para mantener la consistencia
-        decGlobalChunkRefCount(x, y, z, level[0]); // Usamos level[0] como referencia de dimensión
+
+        // Decrementamos el contador de referencias de manera segura
+        if (level[0] != nullptr) {
+            decGlobalChunkRefCount(blockX, blockY, blockZ, level[0]);
+        }
     }
     Log::info("RenderRenderer: GPU buffers liberados para chunk [%d, %d]\n", x, z);
 }

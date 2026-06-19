@@ -1,5 +1,4 @@
 #include "GLRenderer.h"
-
 #include "SDL.h"
 #include "SDL_error.h"
 #include "SDL_events.h"
@@ -10,14 +9,6 @@
 #include "java/IntBuffer.h"
 #include "platform/PlatformTypes.h"
 #include "platform/renderer/renderer.h"
-
-// --- SOLUCIÓN IGGY (Sustituye al antiguo iggy_draw.h) ---
-#include "app/common/Iggy/include/gdraw.h" 
-// ------------------------------------------------------
-
-#include "minecraft/util/Log.h"
-
-
 
 // undefine macros from header to avoid argument mismatch
 #undef glGenTextures
@@ -45,9 +36,7 @@
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
-
 #define GLM_FORCE_RADIANS
-
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -57,13 +46,19 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
+#include <atomic> // Añadido para contadores estables
 #include "glm/glm.hpp"
 #include "glm/gtc/matrix_transform.hpp"
 #include "glm/gtc/type_ptr.hpp"
 
+#include "app/common/Iggy/include/gdraw.h"
+#include "minecraft/util/Log.h"
 
 
+// Contadores globales de diagnóstico
+static std::atomic<int> g_vboCount{0};
+static std::atomic<int> g_vaoCount{0};
+static std::atomic<int> g_texCount{0};
 
 namespace platform_internal {
 IPlatformRenderer& PlatformRenderer_get() {
@@ -73,33 +68,25 @@ IPlatformRenderer& PlatformRenderer_get() {
 }  // namespace platform_internal
 
 // MARK: Shaders
-
 #define CPP_GLSL_INCLUDE
-
 #ifdef GLES
 static const char* VERT_SRC =
 #include "./shaders/vertex_es.vert"
-
     ;
 static const char* FRAG_SRC =
 #include "./shaders/fragment_es.frag"
-
     ;
 #else
 static const char* VERT_SRC =
 #include "./shaders/vertex.vert"
-
     ;
 static const char* FRAG_SRC =
 #include "./shaders/fragment.frag"
     ;
 #endif
-
 #undef CPP_GLSL_INCLUDE
 
 // MARK: OpenGL state
-
-// Hello SDL and opengl 3.3
 static SDL_Window* s_window = nullptr;
 static SDL_GLContext s_glContext = nullptr;
 static bool s_shouldClose = false;
@@ -108,11 +95,8 @@ static int s_windowHeight = 1080;
 static int s_reqWidth = 1920;
 static int s_reqHeight = 1080;
 static bool s_fullscreen = false;
-
 static thread_local SDL_GLContext s_glCtx = nullptr;
-
 static std::once_flag s_glCtxKeyOnce;
-
 static const int MAX_SHARED_CTXS = 6;
 static SDL_Window* s_sharedWins[MAX_SHARED_CTXS] = {};
 static SDL_GLContext s_sharedCtxs[MAX_SHARED_CTXS] = {};
@@ -122,8 +106,6 @@ static std::mutex s_sharedMtx;
 static std::mutex s_glCallMtx;
 static std::thread::id s_mainThreadId;
 static bool s_mainThreadSet = false;
-static std::vector<int> s_pendingDeletions; // <--- AQUÍ
-static std::mutex s_deletionMtx; 
 static thread_local unsigned int s_rs_dirty_mask = 0xFFFFFFFF;
 
 struct GLShadowState {
@@ -145,7 +127,6 @@ struct GLShadowState {
     GLuint stencilMask;
     GLuint stencilWriteMask;
 };
-
 static GLShadowState s_gl_state;
 static unsigned int s_gl_shadow_mask = 0;
 
@@ -208,7 +189,6 @@ static GLuint linkProgram(GLuint v, GLuint f) {
 // Shader struct
 struct ShaderUniforms {
     GLuint prog = 0;
-
     GLint uMVP = -1, uMV = -1, uBaseColor = -1;
     GLint uTexMat0 = -1;
     GLint uNormalMatrix = -1, uNormalSign = -1;
@@ -221,7 +201,6 @@ struct ShaderUniforms {
     GLint uUseTexture = -1;
     GLint uInvGamma = -1;
     GLint uChunkOffset = -1;
-
     void build(const char* vs, const char* fs) {
         GLuint v = compileShader(GL_VERTEX_SHADER, vs);
         GLuint f = compileShader(GL_FRAGMENT_SHADER, fs);
@@ -229,7 +208,6 @@ struct ShaderUniforms {
         glDeleteShader(v);
         glDeleteShader(f);
         if (!prog) return;
-
 #define L(x) x = glGetUniformLocation(prog, #x)
         L(uMVP);
         L(uMV);
@@ -258,7 +236,6 @@ struct ShaderUniforms {
         L(uInvGamma);
         L(uChunkOffset);
 #undef L
-
         glUseProgram(prog);
         glUniform1i(uTex0, 0);
         glUniform1i(uTex1, 1);
@@ -294,7 +271,6 @@ static thread_local float s_cachedNormalSign = 1.0f;
 static thread_local bool s_matDirty = true;
 static inline void markNormalDirty() { s_normalMatDirty = true; }
 static inline void markMatrixDirty() { s_matDirty = true; }
-
 static MatrixStack& activeStack() {
     switch (s_matMode) {
         case 1:
@@ -306,20 +282,17 @@ static MatrixStack& activeStack() {
     }
     return s_mv;
 }
-
 static void flushMatrices() {
     if (s_matDirty) {
         glm::mat4 mvp = s_proj.cur() * s_mv.cur();
         glUniformMatrix4fv(s_shader.uMVP, 1, GL_FALSE, glm::value_ptr(mvp));
         glUniformMatrix4fv(s_shader.uMV, 1, GL_FALSE,
                            glm::value_ptr(s_mv.cur()));
-
         // Send the texture matrix to the depths of hell...
         glUniformMatrix4fv(s_shader.uTexMat0, 1, GL_FALSE,
                            glm::value_ptr(s_tex[0].cur()));
         s_matDirty = false;
     }
-
     if (s_shader.uNormalMatrix >= 0 && s_normalMatDirty) {
         glm::mat3 m3 = glm::mat3(s_mv.cur());
         s_cachedNormalMat = glm::transpose(glm::inverse(m3));
@@ -349,7 +322,6 @@ struct RenderState {
     glm::vec2 globalLM = {240.f, 240.f};  // fullbright default
     int activeTexture = 0;
 };
-
 enum RenderDirtyBits {
     DIRTY_BASECOLOR = 1 << 0,
     DIRTY_LIGHTING = 1 << 1,
@@ -360,14 +332,11 @@ enum RenderDirtyBits {
     DIRTY_LMT = 1 << 6,
     DIRTY_GLOBAL_LM = 1 << 7,
 };
-
 static inline void markDirty(unsigned int bit) { s_rs_dirty_mask |= bit; }
-
 static thread_local RenderState s_rs;
 
 // track currently bound program to avoid iggy shitting up
 static GLuint s_boundProgram = 0;
-
 static void glShadowSetBlend(bool e) {
     if (!(s_gl_shadow_mask & SHADOW_BLEND) || s_gl_state.blend != e) {
         if (e)
@@ -378,7 +347,6 @@ static void glShadowSetBlend(bool e) {
         s_gl_shadow_mask |= SHADOW_BLEND;
     }
 }
-
 static void glShadowSetCull(bool e) {
     if (!(s_gl_shadow_mask & SHADOW_CULL) || s_gl_state.cull != e) {
         if (e)
@@ -389,7 +357,6 @@ static void glShadowSetCull(bool e) {
         s_gl_shadow_mask |= SHADOW_CULL;
     }
 }
-
 static void glShadowSetDepthTest(bool e) {
     if (!(s_gl_shadow_mask & SHADOW_DEPTH) || s_gl_state.depth != e) {
         if (e)
@@ -400,7 +367,6 @@ static void glShadowSetDepthTest(bool e) {
         s_gl_shadow_mask |= SHADOW_DEPTH;
     }
 }
-
 static void glShadowSetBlendFunc(GLint s, GLint d) {
     if (!(s_gl_shadow_mask & SHADOW_BLEND_FUNC) || s_gl_state.blendSrc != s ||
         s_gl_state.blendDst != d) {
@@ -410,7 +376,6 @@ static void glShadowSetBlendFunc(GLint s, GLint d) {
         s_gl_shadow_mask |= SHADOW_BLEND_FUNC;
     }
 }
-
 static void glShadowSetDepthMask(GLboolean e) {
     if (!(s_gl_shadow_mask & SHADOW_DEPTH_MASK) || s_gl_state.depthMask != e) {
         ::glDepthMask(e);
@@ -418,7 +383,6 @@ static void glShadowSetDepthMask(GLboolean e) {
         s_gl_shadow_mask |= SHADOW_DEPTH_MASK;
     }
 }
-
 static void glShadowSetColorMask(GLboolean r, GLboolean g, GLboolean b,
                                  GLboolean a) {
     if (!(s_gl_shadow_mask & SHADOW_COLOR_MASK) ||
@@ -432,7 +396,6 @@ static void glShadowSetColorMask(GLboolean r, GLboolean g, GLboolean b,
         s_gl_shadow_mask |= SHADOW_COLOR_MASK;
     }
 }
-
 static void glShadowSetLineWidth(float w) {
     if (!(s_gl_shadow_mask & SHADOW_LINE_WIDTH) || s_gl_state.lineWidth != w) {
         ::glLineWidth(w);
@@ -440,7 +403,6 @@ static void glShadowSetLineWidth(float w) {
         s_gl_shadow_mask |= SHADOW_LINE_WIDTH;
     }
 }
-
 static void glShadowSetFrontFace(GLenum mode) {
     if (!(s_gl_shadow_mask & SHADOW_FRONT_FACE) ||
         s_gl_state.frontFace != mode) {
@@ -449,7 +411,6 @@ static void glShadowSetFrontFace(GLenum mode) {
         s_gl_shadow_mask |= SHADOW_FRONT_FACE;
     }
 }
-
 static void glShadowSetPolygonOffset(float slope, float bias) {
     bool enable = (slope != 0.0f || bias != 0.0f);
     if (!(s_gl_shadow_mask & SHADOW_POLY_OFFSET) ||
@@ -471,7 +432,6 @@ static void glShadowSetPolygonOffset(float slope, float bias) {
         }
     }
 }
-
 static void glShadowSetStencil(GLenum fn, uint8_t ref, uint8_t fmask,
                                uint8_t wmask) {
     if (!(s_gl_shadow_mask & SHADOW_STENCIL) || !s_gl_state.stencil) {
@@ -494,10 +454,8 @@ static void glShadowSetStencil(GLenum fn, uint8_t ref, uint8_t fmask,
 }
 static thread_local bool s_chunkOffsetValid = false;
 static thread_local glm::vec3 s_chunkOffset;
-
 static void pushRenderState() {
     if (!s_shader.prog) return;
-
     // only call glUseProgram when something actually changed the binding
     if (s_boundProgram != s_shader.prog) {
         glUseProgram(s_shader.prog);
@@ -506,7 +464,6 @@ static void pushRenderState() {
         s_normalMatDirty = true;
         s_rs_dirty_mask = 0xFFFFFFFF;
     }
-
     if (s_rs_dirty_mask) {
         if (s_rs_dirty_mask & DIRTY_BASECOLOR)
             glUniform4fv(s_shader.uBaseColor, 1,
@@ -542,10 +499,8 @@ static void pushRenderState() {
     }
     flushMatrices();
 }
-
 static GLuint s_sVAO_std = 0, s_sVBO_std = 0;
 static GLsizeiptr s_streamVBOSize = 0;
-
 static void bindStdAttribs() {
     glEnableVertexAttribArray(0);
     glEnableVertexAttribArray(1);
@@ -558,7 +513,6 @@ static void bindStdAttribs() {
     glVertexAttribPointer(3, 3, GL_BYTE, GL_TRUE, 32, (void*)24);
     glVertexAttribIPointer(4, 2, GL_SHORT, 32, (void*)28);
 }
-
 static void initStreamingVAOs() {
     glGenVertexArrays(1, &s_sVAO_std);
     glGenBuffers(1, &s_sVBO_std);
@@ -583,29 +537,36 @@ struct ChunkBuffer {
     std::vector<uint8_t> rawVerts;
     bool valid = false;
     bool vboReady = false;
+    Uint32 lastUsedFrame = 0; // Registro temporal para la Válvula de Seguridad
+
+    ChunkBuffer() {
+        lastUsedFrame = SDL_GetTicks();
+    }
 
     void destroy() {
-        // MUY IMPORTANTE: Liberar la GPU primero
         if (vbo) {
             glDeleteBuffers(1, &vbo);
             vbo = 0;
+            g_vboCount--;
         }
         if (vao) {
             glDeleteVertexArrays(1, &vao);
             vao = 0;
+            g_vaoCount--;
         }
-        
-        // Liberar la RAM del sistema
         draws.clear();
         rawVerts.clear();
-        rawVerts.shrink_to_fit(); // Esto obliga a liberar la RAM físicamente
-        
         valid = false;
         vboReady = false;
     }
 };
+
 static std::unordered_map<int, ChunkBuffer> s_chunkPool;
 static int s_nextListBase = 1;
+
+// Cola segura para liberar memoria OpenGL diferida en el hilo principal
+static std::vector<ChunkBuffer> s_pendingDestructions;
+static std::mutex s_destructionMtx;
 
 // Per-thread recording state
 static thread_local int s_recListId = -1;
@@ -617,7 +578,6 @@ static bool isQuadPrim(int pt) {
     return (pt == 0x0007 /*GL_QUADS*/ ||
             pt == (int)GLRenderer::PRIMITIVE_TYPE_QUAD_LIST);
 }
-
 static GLenum mapPrim(int pt) {
     if (isQuadPrim(pt)) return GL_TRIANGLES;
     switch (pt) {
@@ -641,7 +601,6 @@ static GLenum mapPrim(int pt) {
 }
 
 // MARK: Renderer impl
-
 // Initialises the renderer
 void GLRenderer::Initialise() {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
@@ -704,11 +663,9 @@ void GLRenderer::Initialise() {
     glViewport(0, 0, s_windowWidth, s_windowHeight);
     s_shader.build(VERT_SRC, FRAG_SRC);
     initStreamingVAOs();
-
     s_mainThreadId = std::this_thread::get_id();
     s_mainThreadSet = true;
     s_glCtx = s_glContext;
-
     SDL_GL_MakeCurrent(s_window, s_glContext);
     for (int i = 0; i < MAX_SHARED_CTXS; i++) {
         SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
@@ -727,7 +684,6 @@ void GLRenderer::Initialise() {
     }
     SDL_GL_MakeCurrent(s_window, s_glContext);
     pushRenderState();
-
 #ifdef ENABLE_VSYNC
     SDL_GL_SetSwapInterval(1);
 #else
@@ -737,13 +693,11 @@ void GLRenderer::Initialise() {
 
 void GLRenderer::InitialiseContext() {
     if (!s_window) return;
-
     if (s_mainThreadSet && std::this_thread::get_id() == s_mainThreadId) {
         SDL_GL_MakeCurrent(s_window, s_glContext);
         s_glCtx = s_glContext;
         return;
     }
-
     if (s_glCtx) {
         for (int i = 0; i < s_sharedCtxCount; i++) {
             if (s_sharedCtxs[i] == s_glCtx) {
@@ -753,7 +707,6 @@ void GLRenderer::InitialiseContext() {
         }
         return;
     }
-
     SDL_GLContext shared = nullptr;
     {
         std::lock_guard<std::mutex> lk(s_sharedMtx);
@@ -761,7 +714,6 @@ void GLRenderer::InitialiseContext() {
             shared = s_sharedCtxs[s_nextSharedCtx++];
     }
     if (!shared) return;
-
     for (int i = 0; i < s_sharedCtxCount; i++) {
         if (s_sharedCtxs[i] == shared)
             SDL_GL_MakeCurrent(s_sharedWins[i], shared);
@@ -778,47 +730,58 @@ void GLRenderer::StartFrame() {
     glViewport(0, 0, s_windowWidth, s_windowHeight);
 }
 
+// NUEVA FUNCIÓN PRESENT DE ALTA SEGURIDAD
 void GLRenderer::Present() {
-    // 1. Extraemos los IDs a borrar a una lista temporal para soltar el mutex rápido
-    std::vector<int> toDelete;
+    // 1. Procesar la cola diferida de destrucciones en el hilo de renderizado principal
+    std::vector<ChunkBuffer> toDestroy;
     {
-        std::lock_guard<std::mutex> lk_del(s_deletionMtx);
-        if (!s_pendingDeletions.empty()) {
-            toDelete = std::move(s_pendingDeletions);
-            s_pendingDeletions.clear();
+        std::lock_guard<std::mutex> lk_del(s_destructionMtx);
+        if (!s_pendingDestructions.empty()) {
+            toDestroy = std::move(s_pendingDestructions);
+            s_pendingDestructions.clear();
         }
-    } // <--- AQUÍ SE LIBERA s_deletionMtx inmediatamente
-
-    // 2. Ahora procesamos los borrados usando SOLO el mutex de la pool
-    if (!toDelete.empty()) {
+    }
+    if (!toDestroy.empty()) {
         std::lock_guard<std::mutex> lk_pool(s_glCallMtx);
-        for (int idx : toDelete) {
-            auto it = s_chunkPool.find(idx);
-            if (it != s_chunkPool.end()) {
-                it->second.destroy();
+        for (auto& cb : toDestroy) {
+            cb.destroy();
+        }
+    }
+
+    // 2. VÁLVULA DE SEGURIDAD CONTRA FUGA INFINITA (Panic Valve)
+    // Solo destruye memoria si hay una presión extrema (> 4500 chunks cargados)
+    {
+        std::lock_guard<std::mutex> lk_pool(s_glCallMtx);
+        if (s_chunkPool.size() > 4500) {
+            Uint32 currentTime = SDL_GetTicks();
+            for (auto it = s_chunkPool.begin(); it != s_chunkPool.end(); ) {
+                // Si el chunk lleva más de 90s inactivo, lo liberamos por completo de forma segura
+                if (currentTime - it->second.lastUsedFrame > 90000) {
+                    it->second.destroy();
+                    it = s_chunkPool.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
     }
 
-    // 3. Temporizador de UI (Sigue siendo seguro)
-    static Uint32 lastIggyFlush = 0;
-    Uint32 currentTime = SDL_GetTicks();
-    if (currentTime - lastIggyFlush > 60000) {
-        flushIggyCache();
-        lastIggyFlush = currentTime;
-    }
-
-    // 4. Lógica de ventana y Swap
     if (!s_window) return;
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT) s_shouldClose = true;
-        else if (ev.type == SDL_WINDOWEVENT) {
-            if (ev.window.event == SDL_WINDOWEVENT_CLOSE) s_shouldClose = true;
-            else if (ev.window.event == SDL_WINDOWEVENT_RESIZED) onFramebufferResize(ev.window.data1, ev.window.data2);
-        }
+        if (ev.type == SDL_QUIT)
+            s_shouldClose = true;
+        else if (ev.window.event == SDL_WINDOWEVENT_CLOSE)
+            s_shouldClose = true;
+        else if (ev.window.event == SDL_WINDOWEVENT_RESIZED)
+            onFramebufferResize(ev.window.data1, ev.window.data2);
     }
     glFlush();
+
+    // Imprimir el uso real de recursos
+    printf("GPU Resources -> VBOs: %d | VAOs: %d | Texs: %d | Pool: %zu\n",
+           g_vboCount.load(), g_vaoCount.load(), g_texCount.load(), s_chunkPool.size());
+
     SDL_GL_SwapWindow(s_window);
 }
 
@@ -826,16 +789,12 @@ void GLRenderer::SetWindowSize(int w, int h) {
     s_reqWidth = w;
     s_reqHeight = h;
 }
-
 void GLRenderer::SetFullscreen(bool fs) { s_fullscreen = fs; }
-
 bool GLRenderer::ShouldClose() { return !s_window || s_shouldClose; }
-
 void GLRenderer::GetFramebufferSize(int& w, int& h) {
     w = s_windowWidth;
     h = s_windowHeight;
 }
-
 void GLRenderer::Close() { s_window = nullptr; }
 
 void GLRenderer::Shutdown() {
@@ -862,34 +821,27 @@ void GLRenderer::Shutdown() {
     SDL_Quit();
 }
 
+// PIPELINE DE DIBUJO ORIGINAL INTEGRAL (Garantiza entidades visibles)
 void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn,
                               eVertexType vType, ePixelShaderType) {
     if (count <= 0 || !dataIn) return;
-
     bool wasQuad = isQuadPrim((int)ptype);
     GLenum glMode = mapPrim((int)ptype);
     static thread_local std::vector<uint8_t> stdData;
     static thread_local std::vector<uint8_t> triData;
     stdData.clear();
     triData.clear();
-
     if (vType == VERTEX_TYPE_COMPRESSED) {
         stdData.resize((size_t)count * 32);
         const int16_t* src = (const int16_t*)dataIn;
         uint8_t* dst = stdData.data();
         for (int i = 0; i < count; i++) {
             float* dstF = (float*)dst;
-
-            // Position: int16 / 1024
             dstF[0] = src[0] / 1024.0f;
             dstF[1] = src[1] / 1024.0f;
             dstF[2] = src[2] / 1024.0f;
-
-            // int16 / 8192
             dstF[3] = src[4] / 8192.0f;
             dstF[4] = src[5] / 8192.0f;
-
-            // RGB565 −32768
             {
                 uint16_t packed = (uint16_t)((int)src[3] + 32768);
                 dst[20] = 255;
@@ -901,20 +853,16 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn,
             dst[25] = 127;  // +Y (up)
             dst[26] = 0;
             dst[27] = 0;
-
-            // Lightmap
             {
                 int16_t* dstS = (int16_t*)(dst + 28);
                 dstS[0] = src[6];
                 dstS[1] = src[7];
             }
-
             src += 8;
             dst += 32;
         }
         dataIn = stdData.data();
     }
-
     static const size_t stride = 32;
     if (wasQuad) {
         int numQuads = count / 4;
@@ -927,11 +875,9 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn,
             const uint8_t* v1 = src + (q * 4 + 1) * stride;
             const uint8_t* v2 = src + (q * 4 + 2) * stride;
             const uint8_t* v3 = src + (q * 4 + 3) * stride;
-            // Triangle 1: 0,1,2
             memcpy(dst + 0 * stride, v0, stride);
             memcpy(dst + 1 * stride, v1, stride);
             memcpy(dst + 2 * stride, v2, stride);
-            // Triangle 2: 0,2,3
             memcpy(dst + 3 * stride, v0, stride);
             memcpy(dst + 4 * stride, v2, stride);
             memcpy(dst + 5 * stride, v3, stride);
@@ -941,9 +887,7 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn,
         count = triVerts;
         glMode = GL_TRIANGLES;
     }
-
     size_t bytes = (size_t)count * stride;
-
     if (s_recListId >= 0) {
         int first = (int)(s_recVerts.size() / stride);
         s_recVerts.insert(s_recVerts.end(), (const uint8_t*)dataIn,
@@ -951,20 +895,14 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn,
         s_recDraws.push_back({glMode, first, (GLsizei)count});
         return;
     }
-
     std::lock_guard<std::mutex> lk(s_glCallMtx);
     pushRenderState();
-
     glBindVertexArray(s_sVAO_std);
     glBindBuffer(GL_ARRAY_BUFFER, s_sVBO_std);
-
-    // Standard orphaning
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)bytes, nullptr, GL_STREAM_DRAW);
     glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)bytes, dataIn);
     s_streamVBOSize = (GLsizeiptr)bytes;
-
     glDrawArrays(glMode, 0, count);
-
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
@@ -982,12 +920,16 @@ int GLRenderer::CBuffCreate(int count) {
     return b;
 }
 
+// BORRADO DIFERIDO THREAD-SAFE
 void GLRenderer::CBuffDelete(int first, int count) {
     std::lock_guard<std::mutex> lk(s_glCallMtx);
     for (int i = first; i < first + count; i++) {
         auto it = s_chunkPool.find(i);
         if (it != s_chunkPool.end()) {
-            it->second.destroy();
+            {
+                std::lock_guard<std::mutex> lk_del(s_destructionMtx);
+                s_pendingDestructions.push_back(std::move(it->second));
+            }
             s_chunkPool.erase(it);
         }
     }
@@ -996,7 +938,8 @@ void GLRenderer::CBuffDelete(int first, int count) {
 void GLRenderer::CBuffDeleteAll() {
     std::lock_guard<std::mutex> lk(s_glCallMtx);
     for (auto& kv : s_chunkPool) {
-        kv.second.destroy();
+        std::lock_guard<std::mutex> lk_del(s_destructionMtx);
+        s_pendingDestructions.push_back(std::move(kv.second));
     }
     s_chunkPool.clear();
     s_nextListBase = 1;
@@ -1012,23 +955,36 @@ void GLRenderer::CBuffEnd() {
     if (s_recListId < 0) return;
     std::lock_guard<std::mutex> lk(s_glCallMtx);
     ChunkBuffer& cb = s_chunkPool[s_recListId];
-    cb.destroy();
+    {
+        std::lock_guard<std::mutex> lk_del(s_destructionMtx);
+        s_pendingDestructions.push_back(std::move(cb));
+    }
     if (s_recVerts.empty()) {
         s_chunkPool.erase(s_recListId);
         s_recListId = -1;
         return;
     }
-    cb.rawVerts = std::move(s_recVerts);
-    cb.draws = std::move(s_recDraws);
-    cb.valid = true;
-    cb.vboReady = false;
+    ChunkBuffer newCb;
+    newCb.rawVerts = std::move(s_recVerts);
+    newCb.draws = std::move(s_recDraws);
+    newCb.valid = true;
+    newCb.vboReady = false;
+    newCb.lastUsedFrame = SDL_GetTicks();
+    s_chunkPool[s_recListId] = std::move(newCb);
     s_recListId = -1;
 }
 
+// BORRADO DIFERIDO THREAD-SAFE EN CLEAR
 void GLRenderer::CBuffClear(int index) {
-    // En lugar de borrar aquí (que causa el crash), lo anotamos en la lista
-    std::lock_guard<std::mutex> lk(s_deletionMtx);
-    s_pendingDeletions.push_back(index);
+    std::lock_guard<std::mutex> lk(s_glCallMtx);
+    auto it = s_chunkPool.find(index);
+    if (it != s_chunkPool.end()) {
+        {
+            std::lock_guard<std::mutex> lk_del(s_destructionMtx);
+            s_pendingDestructions.push_back(std::move(it->second));
+        }
+        s_chunkPool.erase(it);
+    }
 }
 
 bool GLRenderer::CBuffCall(int index, bool) {
@@ -1038,32 +994,32 @@ bool GLRenderer::CBuffCall(int index, bool) {
         return false;
     }
     ChunkBuffer& cb = it->second;
+    cb.lastUsedFrame = SDL_GetTicks(); // Refrescar timer para evitar que la Panic Valve lo borre
+
     if (!cb.vboReady) {
         if (cb.rawVerts.empty()) {
             return false;
         }
-
         glGenVertexArrays(1, &cb.vao);
         glGenBuffers(1, &cb.vbo);
+        g_vaoCount++;
+        g_vboCount++;
+
         glBindVertexArray(cb.vao);
         glBindBuffer(GL_ARRAY_BUFFER, cb.vbo);
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)cb.rawVerts.size(),
                      cb.rawVerts.data(), GL_STATIC_DRAW);
-        bindStdAttribs();  // single time bindstdattrib
+        bindStdAttribs();
         glBindVertexArray(0);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
-
         cb.rawVerts.clear();
         cb.rawVerts.shrink_to_fit();
         cb.vboReady = true;
     }
-
     pushRenderState();
-
     glBindVertexArray(cb.vao);
     for (const auto& dc : cb.draws) glDrawArrays(dc.prim, dc.first, dc.count);
     glBindVertexArray(0);
-
     return true;
 }
 
@@ -1075,7 +1031,6 @@ void GLRenderer::MatrixMode(int t) {
     else
         s_matMode = 0;
 }
-
 void GLRenderer::MatrixSetIdentity() {
     activeStack().load(glm::mat4(1.f));
     markMatrixDirty();
@@ -1083,8 +1038,6 @@ void GLRenderer::MatrixSetIdentity() {
 }
 void GLRenderer::MatrixPush() {
     activeStack().push();
-    // push doesn't change cur() so no dirty needed but mark anyway to be safe
-    // ;w;
     markMatrixDirty();
     if (s_matMode == 0) markNormalDirty();
 }
@@ -1130,13 +1083,11 @@ const float* GLRenderer::MatrixGet(int t) {
     if (m) memcpy(buf, glm::value_ptr(*m), 64);
     return buf;
 }
-
 void GLRenderer::Set_matrixDirty() {
-    // iggy wipes opengl state
     s_boundProgram = 0;
     s_rs_dirty_mask = 0xFFFFFFFF;
     s_gl_shadow_mask = 0;
-    s_normalMatDirty = true;  // normal matrix dirt after iggy reset
+    s_normalMatDirty = true;
     s_matDirty = true;
     s_chunkOffsetValid = false;
     if (s_shader.prog) {
@@ -1144,7 +1095,6 @@ void GLRenderer::Set_matrixDirty() {
         s_boundProgram = s_shader.prog;
     }
 }
-
 void GLRenderer::Clear(int f) { glClear(f); }
 void GLRenderer::SetClearColour(const float c[4]) {
     glClearColor(c[0], c[1], c[2], c[3]);
@@ -1312,15 +1262,19 @@ void GLRenderer::StateSetActiveTexture(int tex) {
     s_rs.activeTexture = (tex == 0x84C1 /*GL_TEXTURE1*/) ? 1 : 0;
 }
 
+// TEXTURE TRACKING IN STANDARD CREATOR
 int GLRenderer::TextureCreate() {
     GLuint id;
     glGenTextures(1, &id);
+    g_texCount++;
     return (int)id;
 }
 void GLRenderer::TextureFree(int i) {
     GLuint id = (GLuint)i;
     glDeleteTextures(1, &id);
+    g_texCount--;
 }
+
 void GLRenderer::TextureBind(int idx) {
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, idx < 0 ? 0 : (GLuint)idx);
@@ -1381,7 +1335,6 @@ void GLRenderer::TextureDataUpdate(int xo, int yo, int w, int h, void* d,
 void GLRenderer::TextureSetParam(int p, int v) {
     glTexParameteri(GL_TEXTURE_2D, p, v);
 }
-
 static int stbLoad(unsigned char* data, int w, int h, D3DXIMAGE_INFO* info,
                    int** out) {
     int* px = new int[w * h];
@@ -1414,36 +1367,42 @@ int GLRenderer::LoadTextureData(uint8_t* pb, uint32_t nb, D3DXIMAGE_INFO* i,
     stbi_image_free(d);
     return hr;
 }
-
 // TODO: TO REMOVE SOON.
 void GLRenderer::UpdateGamma(unsigned short usGamma) {
     constexpr unsigned short GAMMA_MAX = 32768;
     s_rs.gamma = 0.5f + ((float)(usGamma) * (1.0f / GAMMA_MAX));
 }
 
-// MARK: C hooks
+// HELPER FUNCTIONS (DECLARADAS ARRIBA PARA EVITAR SCOPE ERRORS)
+inline int* getIntPtr(IntBuffer* buf) {
+    return buf ? (int*)buf->getBuffer() + buf->position() : nullptr;
+}
+inline void* getBytePtr(ByteBuffer* buf) {
+    return buf ? (char*)buf->getBuffer() + buf->position() : nullptr;
+}
 
+// MARK: C hooks (CON CONTADOR DE TEXTURAS CORREGIDO)
 int glGenTextures_4J() {
     GLuint id = 0;
     ::glGenTextures(1, &id);
+    g_texCount++;
     return (int)id;
 }
-
 void glGenTextures_4J(int n, unsigned int* textures) {
     ::glGenTextures(n, textures);
+    g_texCount += n;
 }
-
 void glDeleteTextures_4J(int id) {
     GLuint uid = (GLuint)id;
     ::glDeleteTextures(1, &uid);
+    g_texCount--;
 }
-
 void glDeleteTextures_4J(int n, const unsigned int* textures) {
     ::glDeleteTextures(n, textures);
+    g_texCount -= n;
 }
 
 // MARK: LinuxStubs
-
 #ifdef GLES
 extern "C" {
 extern void glClearDepthf(float depth);
@@ -1459,27 +1418,18 @@ void glCallLists(int, unsigned int, const void*) {}
 }
 #endif
 
-inline int* getIntPtr(IntBuffer* buf) {
-    return buf ? (int*)buf->getBuffer() + buf->position() : nullptr;
-}
-inline void* getBytePtr(ByteBuffer* buf) {
-    return buf ? (char*)buf->getBuffer() + buf->position() : nullptr;
-}
-
 void glGenTextures_4J(IntBuffer* buf) {
     if (!buf) return;
     int n = buf->limit() - buf->position();
     int* dst = getIntPtr(buf);
     for (int i = 0; i < n; i++) dst[i] = PlatformRenderer.TextureCreate();
 }
-
 void glDeleteTextures_4J(IntBuffer* buf) {
     if (!buf) return;
     int n = buf->limit() - buf->position();
     int* src = getIntPtr(buf);
     for (int i = 0; i < n; i++) PlatformRenderer.TextureFree(src[i]);
 }
-
 void glTexImage2D_4J(int target, int level, int internalformat, int width,
                      int height, int border, int format, int type,
                      ByteBuffer* pixels) {
@@ -1491,7 +1441,6 @@ void glTexImage2D_4J(int target, int level, int internalformat, int width,
     PlatformRenderer.TextureData(width, height, getBytePtr(pixels), level,
                                  IPlatformRenderer::TEXTURE_FORMAT_RxGyBzAw);
 }
-
 void glLight_4J(int light, int pname, FloatBuffer* params) {
     const float* p = params->_getDataPointer();
     int idx = (light == 0x4001) ? 1 : 0;
@@ -1502,24 +1451,20 @@ void glLight_4J(int light, int pname, FloatBuffer* params) {
     else if (pname == 0x1200)
         PlatformRenderer.StateSetLightAmbientColour(p[0], p[1], p[2]);
 }
-
 void glLightModel_4J(int pname, FloatBuffer* params) {
     if (pname == 0x0B53) {
         const float* p = params->_getDataPointer();
         PlatformRenderer.StateSetLightAmbientColour(p[0], p[1], p[2]);
     }
 }
-
 void glFog_4J(int pname, FloatBuffer* params) {
     const float* p = params->_getDataPointer();
     if (pname == 0x0B66) PlatformRenderer.StateSetFogColour(p[0], p[1], p[2]);
 }
-
 void glGetFloat_4J(int pname, FloatBuffer* params) {
     const float* m = PlatformRenderer.MatrixGet(pname);
     if (m) memcpy(params->_getDataPointer(), m, 16 * sizeof(float));
 }
-
 void glCallLists_4J(IntBuffer* lists) {
     if (!lists) return;
     int count = lists->limit() - lists->position();
@@ -1527,13 +1472,11 @@ void glCallLists_4J(IntBuffer* lists) {
     for (int i = 0; i < count; i++)
         (void)PlatformRenderer.CBuffCall(ids[i], false);
 }
-
 void glReadPixels_4J(int x, int y, int w, int h, int f, int t, ByteBuffer* p) {
     (void)f;
     (void)t;
     PlatformRenderer.ReadPixels(x, y, w, h, getBytePtr(p));
 }
-
 // dead stubs
 void glTexCoordPointer_4J(int, int, FloatBuffer*) {}
 void glNormalPointer_4J(int, ByteBuffer*) {}
@@ -1542,15 +1485,12 @@ void glVertexPointer_4J(int, int, FloatBuffer*) {}
 void glEndList_4J(int) {}
 void glTexGen_4J(int, int, FloatBuffer*) {}
 
-#include <stdio.h>
-#include <string.h>
-
 void glGetFloat(int pname, FloatBuffer* params) {
     glGetFloat_4J(pname, params);
 }
 
 void GLRenderer::flushIggyCache() {
-    // No llamamos a funciones internas, llamamos a nuestro "puente"
-    Iggy_FlushCache(); 
+    // Llamamos al puente de Iggy para limpiar la caché de texturas de la UI
+    Iggy_FlushCache();
     Log::info("RenderRenderer: Iggy Cache flushed via Bridge.\n");
 }

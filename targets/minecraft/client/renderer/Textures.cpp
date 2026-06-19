@@ -1171,30 +1171,29 @@ void Textures::tick(
 }
 
 void Textures::reloadAll() {
-    TexturePack* skin = skins->getSelected();
-
+    // 1. Liberar texturas pre-cargadas
     for (int i = 0; i < TN_COUNT - 2; i++) {
         releaseTexture(preLoadedIdx[i]);
     }
 
+    // 2. ¡NUEVO! Liberar TODO lo que esté en el idMap antes de borrarlo
+    for (auto const& [name, id] : idMap) {
+        if (id > 0) {
+            glDeleteTextures(1, (GLuint*)&id);
+        }
+    }
     idMap.clear();
+
+    // 3. Liberar las imágenes cargadas en RAM
+    // Como loadedImages guarda punteros a BufferedImage, debemos borrarlos
+    for (auto const& [id, img] : loadedImages) {
+        if (img) delete img; 
+    }
     loadedImages.clear();
 
     loadIndexedTextures();
-
-    pixelsMap.clear();
-    // 4J Stu - These are not used any more
-    // WaterColor::init(loadTexturePixels("misc/watercolor.png"));
-    // GrassColor::init(loadTexturePixels("misc/grasscolor.png"));
-    // FoliageColor::init(loadTexturePixels("misc/foliagecolor.png"));
-
     stitch();
-
     skins->clearInvalidTexturePacks();
-
-    // Recalculate fonts
-    // Minecraft::GetInstance()->font->loadCharacterWidths();
-    // Minecraft::GetInstance()->altFont->loadCharacterWidths();
 }
 
 void Textures::stitch() {
