@@ -732,7 +732,7 @@ void GLRenderer::StartFrame() {
 
 // NUEVA FUNCIÓN PRESENT DE ALTA SEGURIDAD
 void GLRenderer::Present() {
-    // 1. Procesar la cola diferida de destrucciones en el hilo de renderizado principal
+    // 1. Procesar la cola diferida de destrucciones en el hilo de renderizado principal (Thread-safe)
     std::vector<ChunkBuffer> toDestroy;
     {
         std::lock_guard<std::mutex> lk_del(s_destructionMtx);
@@ -748,23 +748,9 @@ void GLRenderer::Present() {
         }
     }
 
-    // 2. VÁLVULA DE SEGURIDAD CONTRA FUGA INFINITA (Panic Valve)
-    // Solo destruye memoria si hay una presión extrema (> 4500 chunks cargados)
-    {
-        std::lock_guard<std::mutex> lk_pool(s_glCallMtx);
-        if (s_chunkPool.size() > 4500) {
-            Uint32 currentTime = SDL_GetTicks();
-            for (auto it = s_chunkPool.begin(); it != s_chunkPool.end(); ) {
-                // Si el chunk lleva más de 90s inactivo, lo liberamos por completo de forma segura
-                if (currentTime - it->second.lastUsedFrame > 90000) {
-                    it->second.destroy();
-                    it = s_chunkPool.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-        }
-    }
+    // [VÁLVULA DE SEGURIDAD ELIMINADA] 
+    // Dejamos que el motor del juego gestione el ciclo de vida de los chunks.
+    // Esto soluciona el bug de los chunks transparentes de forma definitiva.
 
     if (!s_window) return;
     SDL_Event ev;
@@ -778,7 +764,7 @@ void GLRenderer::Present() {
     }
     glFlush();
 
-    // Imprimir el uso real de recursos
+    // Imprimir el uso real de recursos para monitorear
     printf("GPU Resources -> VBOs: %d | VAOs: %d | Texs: %d | Pool: %zu\n",
            g_vboCount.load(), g_vaoCount.load(), g_texCount.load(), s_chunkPool.size());
 
