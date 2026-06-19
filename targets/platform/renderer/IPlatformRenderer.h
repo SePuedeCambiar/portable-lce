@@ -98,6 +98,9 @@ public:
     virtual void CBuffDeleteAll() = 0;
     virtual void CBuffStart(int index, bool full = false) = 0;
     virtual void CBuffClear(int index) = 0;
+
+    virtual void flushIggyCache() = 0; // 
+    
     [[nodiscard]] virtual int CBuffSize(int index) = 0;
     virtual void CBuffEnd() = 0;
     [[nodiscard]] virtual bool CBuffCall(int index, bool full = true) = 0;

@@ -838,4 +838,15 @@ IDOC struct GDrawFunctions {
 
 RADDEFEND
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+void Iggy_FlushCache(); //a;adido 
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif

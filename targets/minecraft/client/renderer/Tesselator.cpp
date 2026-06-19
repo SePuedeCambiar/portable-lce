@@ -2,6 +2,8 @@
 
 #include <vector>
 
+#include <memory> 
+
 #include "minecraft/client/MemoryTracker.h"
 #include "minecraft/util/Log.h"
 #include "platform/renderer/renderer.h"
@@ -26,12 +28,15 @@ int normal;
 
 
 */
-thread_local Tesselator* Tesselator::m_tlsInstance = nullptr;
+thread_local std::unique_ptr<Tesselator> Tesselator::m_tlsInstance; // ✅ CORRECTO
 
-Tesselator* Tesselator::getInstance() { return m_tlsInstance; }
+Tesselator* Tesselator::getInstance() { 
+    return m_tlsInstance.get(); 
+}
 
 void Tesselator::CreateNewThreadStorage(int bytes) {
-    Tesselator::m_tlsInstance = new Tesselator(bytes / 4);
+    // En lugar de make_unique, usamos el constructor de unique_ptr con un 'new' manual
+    Tesselator::m_tlsInstance = std::unique_ptr<Tesselator>(new Tesselator(bytes / 4));
 }
 
 // she tessalate my vertices till i render
@@ -65,7 +70,7 @@ Tesselator::Tesselator(int size) {
     useProjectedTexturePixelShader = false;  // 4J added
 
     this->size = size;
-    _array = new std::vector<int>(size); // <--- Aquí se crea la memoria
+    _array.resize(size); // <--- Aquí se crea la memoria
 
     vboMode = USE_VBO;
     if (vboMode) {
@@ -76,16 +81,14 @@ Tesselator::Tesselator(int size) {
 
 // --- ESTO ES LO QUE DEBES AÑADIR ---
 Tesselator::~Tesselator() {
-    // Liberamos el vector que causaba la fuga de RAM
-    if (_array != nullptr) {
-        delete _array; 
-        _array = nullptr;
-    }
+    // Ya no necesitamos 'delete _array' porque ahora es un objeto, no un puntero.
+    // El vector se liberará solo al morir el objeto Tesselator.
     
-    // Si vboIds fue creado con new o un asignador similar, 
-    // también debería liberarse aquí.
+    if (vboMode && vboIds) {
+        // Si vboIds es un IntBuffer (tipo la clase de MemoryTracker), 
+        // asegúrate de que se libere aquí si es necesario.
+    }
 }
-// ----------------------------------
 
 
 Tesselator* Tesselator::getUniqueInstance(int size) {
@@ -105,7 +108,7 @@ void Tesselator::end() {
             // 0xffffffff) so DrawVertices skips glColor for these vertices,
             // letting any caller-set GL colour (e.g. sky colour) pass through
             // unmodified.
-            unsigned int* pColData = (unsigned int*)_array->data();
+            unsigned int* pColData = (unsigned int*)_array.data();
             pColData += 5;
             for (int i = 0; i < vertices; i++) {
                 *pColData = 0x00000000;
@@ -116,7 +119,7 @@ void Tesselator::end() {
             // glDrawArrays(GL_TRIANGLES, 0, vertices); // 4J - changed for xbox
             PlatformRenderer.DrawVertices(
                 IPlatformRenderer::PRIMITIVE_TYPE_TRIANGLE_LIST, vertices,
-                _array->data(),
+                _array.data(),
                 useCompactFormat360
                     ? IPlatformRenderer::VERTEX_TYPE_COMPRESSED
                     : IPlatformRenderer::VERTEX_TYPE_PF3_TF2_CB4_NB4_XW1,
@@ -134,20 +137,20 @@ void Tesselator::end() {
             if (useCompactFormat360) {
                 PlatformRenderer.DrawVertices(
                     (IPlatformRenderer::ePrimitiveType)mode, vertexCount,
-                    _array->data(), IPlatformRenderer::VERTEX_TYPE_COMPRESSED,
+                    _array.data(), IPlatformRenderer::VERTEX_TYPE_COMPRESSED,
                     IPlatformRenderer::PIXEL_SHADER_TYPE_STANDARD);
             } else {
                 if (useProjectedTexturePixelShader) {
                     PlatformRenderer.DrawVertices(
                         (IPlatformRenderer::ePrimitiveType)mode, vertexCount,
-                        _array->data(),
+                        _array.data(),
                         IPlatformRenderer::
                             VERTEX_TYPE_PF3_TF2_CB4_NB4_XW1_TEXGEN,
                         IPlatformRenderer::PIXEL_SHADER_TYPE_PROJECTION);
                 } else {
                     PlatformRenderer.DrawVertices(
                         (IPlatformRenderer::ePrimitiveType)mode, vertexCount,
-                        _array->data(),
+                        _array.data(),
                         IPlatformRenderer::VERTEX_TYPE_PF3_TF2_CB4_NB4_XW1,
                         IPlatformRenderer::PIXEL_SHADER_TYPE_STANDARD);
                 }
@@ -337,7 +340,7 @@ void Tesselator::packCompactQuad() {
         m_iz[i] -= basez << 7;
     }
     // Now write the data out
-    unsigned int* data = (unsigned int*)&_array->data()[p];
+    unsigned int* data = (unsigned int*)&_array.data()[p];
 
     for (int i = 0; i < 4; i++) {
         data[i * 2 + 0] = (m_ix[i] << 8) | (m_iy[i]);
@@ -470,7 +473,7 @@ void Tesselator::vertex(float x, float y, float z) {
         ipackedcol -= 32768;  // -32768 to 32767 range
         ipackedcol &= 0xffff;
 
-        std::int16_t* pShortData = (std::int16_t*)&_array->data()[p];
+        std::int16_t* pShortData = (std::int16_t*)&_array.data()[p];
 
         pShortData[0] = (((int)((x + xo) * 1024.0f)) & 0xffff);
         pShortData[1] = (((int)((y + yo) * 1024.0f)) & 0xffff);
@@ -506,16 +509,16 @@ void Tesselator::vertex(float x, float y, float z) {
             for (int i = 0; i < 2; i++) {
                 int offs = 8 * (3 - i);
                 if (hasTexture) {
-                    _array->data()[p + 3] = _array->data()[p - offs + 3];
-                    _array->data()[p + 4] = _array->data()[p - offs + 4];
+                    _array.data()[p + 3] = _array.data()[p - offs + 3];
+                    _array.data()[p + 4] = _array.data()[p - offs + 4];
                 }
                 if (hasColor) {
-                    _array->data()[p + 5] = _array->data()[p - offs + 5];
+                    _array.data()[p + 5] = _array.data()[p - offs + 5];
                 }
 
-                _array->data()[p + 0] = _array->data()[p - offs + 0];
-                _array->data()[p + 1] = _array->data()[p - offs + 1];
-                _array->data()[p + 2] = _array->data()[p - offs + 2];
+                _array.data()[p + 0] = _array.data()[p - offs + 0];
+                _array.data()[p + 1] = _array.data()[p - offs + 1];
+                _array.data()[p + 2] = _array.data()[p - offs + 2];
 
                 vertices++;
                 p += 8;
@@ -523,15 +526,15 @@ void Tesselator::vertex(float x, float y, float z) {
         }
 
         if (hasTexture) {
-            float* fdata = (float*)(_array->data() + p + 3);
+            float* fdata = (float*)(_array.data() + p + 3);
             *fdata++ = uu;
             *fdata++ = v;
         }
         if (hasColor) {
-            _array->data()[p + 5] = col;
+            _array.data()[p + 5] = col;
         }
         if (hasNormal) {
-            _array->data()[p + 6] = _normal;
+            _array.data()[p + 6] = _normal;
         }
         if (hasTexture2) {
 // 4jcraft: we will be lighting the blocks right in here
@@ -540,20 +543,20 @@ void Tesselator::vertex(float x, float y, float z) {
             std::int16_t tex2V;
             packLinuxLightmapCoords(_tex2, tex2U, tex2V);
             logLinuxPackedLightmapCoords("standard", _tex2, tex2U, tex2V);
-            std::int16_t* pShortArray = (std::int16_t*)&_array->data()[p + 7];
+            std::int16_t* pShortArray = (std::int16_t*)&_array.data()[p + 7];
             pShortArray[0] = tex2U;
             pShortArray[1] = tex2V;
 #else
-            _array->data()[p + 7] = _tex2;
+            _array.data()[p + 7] = _tex2;
 #endif
         } else {
             // -512 each for u/v will mean that the renderer will use global
             // settings (set via PlatformRenderer.StateSetVertexTextureUV)
             // rather than these local ones
-            *(unsigned int*)(&_array->data()[p + 7]) = 0xfe00fe00;
+            *(unsigned int*)(&_array.data()[p + 7]) = 0xfe00fe00;
         }
 
-        float* fdata = (float*)(_array->data() + p);
+        float* fdata = (float*)(_array.data() + p);
         *fdata++ = (x + xo);
         *fdata++ = (y + yo);
         *fdata++ = (z + zo);

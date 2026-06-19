@@ -2692,3 +2692,20 @@ void gdraw_GLx_(DestroyContext)(void) {
     opengl_check();
     free_gdraw();
 }
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+void Iggy_FlushCache() {
+    GDrawStats stats = {0};
+    if (gdraw) {
+        if (gdraw->texturecache) gdraw_res_flush(gdraw->texturecache, &stats);
+        if (gdraw->vbufcache) gdraw_res_flush(gdraw->vbufcache, &stats);
+    }
+}
+
+#ifdef __cplusplus
+}
+#endif

@@ -37,6 +37,8 @@ public:
     void StartFrame();
     void DoScreenGrabOnNextPresent();
     void Present();
+
+
     void Clear(int flags);
     void SetClearColour(const float colourRGBA[4]);
     void SetChunkOffset(float x, float y, float z);
@@ -61,6 +63,7 @@ public:
     void CBuffDeleteAll();
     void CBuffStart(int index, bool full = false);
     void CBuffClear(int index);
+    void flushIggyCache() override;
     int CBuffSize(int index);
     void CBuffEnd();
     bool CBuffCall(int index, bool full = true);

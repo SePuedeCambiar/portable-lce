@@ -11,6 +11,14 @@
 #include "platform/PlatformTypes.h"
 #include "platform/renderer/renderer.h"
 
+// --- SOLUCIÓN IGGY (Sustituye al antiguo iggy_draw.h) ---
+#include "app/common/Iggy/include/gdraw.h" 
+// ------------------------------------------------------
+
+#include "minecraft/util/Log.h"
+
+
+
 // undefine macros from header to avoid argument mismatch
 #undef glGenTextures
 #undef glDeleteTextures
@@ -53,6 +61,9 @@
 #include "glm/glm.hpp"
 #include "glm/gtc/matrix_transform.hpp"
 #include "glm/gtc/type_ptr.hpp"
+
+
+
 
 namespace platform_internal {
 IPlatformRenderer& PlatformRenderer_get() {
@@ -574,6 +585,7 @@ struct ChunkBuffer {
     bool vboReady = false;
 
     void destroy() {
+        // MUY IMPORTANTE: Liberar la GPU primero
         if (vbo) {
             glDeleteBuffers(1, &vbo);
             vbo = 0;
@@ -582,14 +594,16 @@ struct ChunkBuffer {
             glDeleteVertexArrays(1, &vao);
             vao = 0;
         }
+        
+        // Liberar la RAM del sistema
         draws.clear();
         rawVerts.clear();
-        rawVerts.shrink_to_fit(); // <--- AÑADIR ESTO: Libera la RAM físicamente
+        rawVerts.shrink_to_fit(); // Esto obliga a liberar la RAM físicamente
+        
         valid = false;
         vboReady = false;
     }
 };
-
 static std::unordered_map<int, ChunkBuffer> s_chunkPool;
 static int s_nextListBase = 1;
 
@@ -765,49 +779,45 @@ void GLRenderer::StartFrame() {
 }
 
 void GLRenderer::Present() {
-    // --- 1. LIMPIEZA DE BUFFERS PENDIENTES (Sincronización de RAM/GPU) ---
-    // Esta sección procesa la cola de borrado que llenamos desde el hilo de lógica.
-    // Al hacerlo aquí, aseguramos que glDeleteBuffers se ejecute en el hilo de Renderizado.
+    // 1. Extraemos los IDs a borrar a una lista temporal para soltar el mutex rápido
+    std::vector<int> toDelete;
     {
-        std::lock_guard<std::mutex> lk_del(s_deletionMtx); 
+        std::lock_guard<std::mutex> lk_del(s_deletionMtx);
         if (!s_pendingDeletions.empty()) {
-            // Bloqueamos la pool de chunks para evitar que el renderizador intente 
-            // dibujar un chunk mientras lo estamos borrando.
-            std::lock_guard<std::mutex> lk_pool(s_glCallMtx); 
-            
-            for (int idx : s_pendingDeletions) {
-                auto it = s_chunkPool.find(idx);
-                if (it != s_chunkPool.end()) {
-                    // 1. Llamamos a destroy() para liberar VBOs, VAOs y rawVerts (RAM)
-                    // Importante: destroy() pone 'valid = false', lo que indica al
-                    // renderizador que ignore este chunk sin crashear.
-                    it->second.destroy(); 
-                    
-                    // NOTA: Hemos eliminado 's_chunkPool.erase(it)'.
-                    // Mantener la entrada en el mapa evita el Segmentation Fault (Signal 11)
-                    // ya que el hilo de renderizado no encontrará un puntero nulo inesperado.
-                }
-            }
-            // Vaciamos la cola ya que todo ha sido procesado
+            toDelete = std::move(s_pendingDeletions);
             s_pendingDeletions.clear();
+        }
+    } // <--- AQUÍ SE LIBERA s_deletionMtx inmediatamente
+
+    // 2. Ahora procesamos los borrados usando SOLO el mutex de la pool
+    if (!toDelete.empty()) {
+        std::lock_guard<std::mutex> lk_pool(s_glCallMtx);
+        for (int idx : toDelete) {
+            auto it = s_chunkPool.find(idx);
+            if (it != s_chunkPool.end()) {
+                it->second.destroy();
+            }
         }
     }
 
-    // --- 2. LÓGICA ORIGINAL DE PRESENTACIÓN ---
+    // 3. Temporizador de UI (Sigue siendo seguro)
+    static Uint32 lastIggyFlush = 0;
+    Uint32 currentTime = SDL_GetTicks();
+    if (currentTime - lastIggyFlush > 60000) {
+        flushIggyCache();
+        lastIggyFlush = currentTime;
+    }
+
+    // 4. Lógica de ventana y Swap
     if (!s_window) return;
-    
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT)
-            s_shouldClose = true;
+        if (ev.type == SDL_QUIT) s_shouldClose = true;
         else if (ev.type == SDL_WINDOWEVENT) {
-            if (ev.window.event == SDL_WINDOWEVENT_CLOSE)
-                s_shouldClose = true;
-            else if (ev.window.event == SDL_WINDOWEVENT_RESIZED)
-                onFramebufferResize(ev.window.data1, ev.window.data2);
+            if (ev.window.event == SDL_WINDOWEVENT_CLOSE) s_shouldClose = true;
+            else if (ev.window.event == SDL_WINDOWEVENT_RESIZED) onFramebufferResize(ev.window.data1, ev.window.data2);
         }
     }
-    
     glFlush();
     SDL_GL_SwapWindow(s_window);
 }
@@ -1537,4 +1547,10 @@ void glTexGen_4J(int, int, FloatBuffer*) {}
 
 void glGetFloat(int pname, FloatBuffer* params) {
     glGetFloat_4J(pname, params);
+}
+
+void GLRenderer::flushIggyCache() {
+    // No llamamos a funciones internas, llamamos a nuestro "puente"
+    Iggy_FlushCache(); 
+    Log::info("RenderRenderer: Iggy Cache flushed via Bridge.\n");
 }

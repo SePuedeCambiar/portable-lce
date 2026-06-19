@@ -20,7 +20,7 @@ private:
     static const int MAX_MEMORY_USE = 16 * 1024 * 1024;
     static const int MAX_FLOATS = MAX_MEMORY_USE / 4 / 2;
 
-    std::vector<int>* _array;
+    std::vector<int> _array;
 
     int vertices;
     float u, v;
@@ -48,7 +48,7 @@ public:
     static void CreateNewThreadStorage(int bytes);
 
 private:
-    static thread_local Tesselator* m_tlsInstance;
+    static thread_local std::unique_ptr<Tesselator> m_tlsInstance;
 
 public:
     static Tesselator* getInstance();
