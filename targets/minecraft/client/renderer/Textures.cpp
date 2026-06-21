@@ -1176,7 +1176,7 @@ void Textures::reloadAll() {
         releaseTexture(preLoadedIdx[i]);
     }
 
-    // 2. ¡NUEVO! Liberar TODO lo que esté en el idMap antes de borrarlo
+    // 2. Liberar de forma segura las texturas del idMap en la GPU
     for (auto const& [name, id] : idMap) {
         if (id > 0) {
             glDeleteTextures(1, (GLuint*)&id);
@@ -1184,15 +1184,19 @@ void Textures::reloadAll() {
     }
     idMap.clear();
 
-    // 3. Liberar las imágenes cargadas en RAM
-    // Como loadedImages guarda punteros a BufferedImage, debemos borrarlos
-    for (auto const& [id, img] : loadedImages) {
-        if (img) delete img; 
-    }
-    loadedImages.clear();
+    // 3. Limpiar el mapa de imágenes cargadas en RAM de manera segura (Sin borrar los punteros no-propios)
+    loadedImages.clear(); 
 
+    // 4. Recargar texturas indexadas básicas
     loadIndexedTextures();
+
+    // 5. ¡NUEVO/RESTAURADO! Limpiar el mapa de píxeles en caché para evitar congelamiento de texturas viejas
+    pixelsMap.clear();
+
+    // 6. Volver a coser (stitch) el atlas de texturas
     stitch();
+
+    // 7. Limpiar paquetes de texturas inválidos
     skins->clearInvalidTexturePacks();
 }
 
