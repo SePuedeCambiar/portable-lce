@@ -24,8 +24,8 @@ class XLockFreeStack;
 // bytes in total (2) The type of index is determined by the least significant 2
 // bits, the other 14 bits represent an offset for the data, stored divided by 2
 //			0 - the data for this block is represented at 1 bit per
-// tile. Data pointed to is 2 bytes describing the 2 possible tiles stored in
-// this block, followed by 32 bytes of data (total 34 bytes)
+//L tile. Data pointed to is 2 bytes describing the 2 possible tiles stored in
+//this block, followed by 32 bytes of data (total 34 bytes)
 // 1 - the data for this block is represented at 2 bit per tile. Data pointed to
 // is 4 bytes describing the 4 possible tiles stored in this block, followed by
 // 64 bytes of data (total 68 bytes) 			2 - the data for this
@@ -69,8 +69,8 @@ class XLockFreeStack;
 // in particular to allow the freeing of memory to actually free whole memory
 // pages cleanly rather than leaving them as managed by the heap manager. The
 // downside to this is that all storage is done in whole 4K pages. Annoyingly,
-// a lot of our compressed chunks are just on the edge of fitting in 4K, so an
-// awful lot of them end up being 8K when they are just a small amount over.
+// a lot of our compressed chunks are just on the edge of fitting in 4K, so
+// an awful lot of them end up being 8K when they are just a small amount over.
 // However, in testing absolutely no chunks were seen that got close to going
 // over 8K compressed, so doing things this way then we at least know that we
 // are reliably getting 25% compression, and freeing things up cleanly. Note:
@@ -86,6 +86,8 @@ class CompressedTileStorage {
 
 private:
     unsigned char* indicesAndData;
+    uint8_t* unpackedCache = nullptr; // [FASE 1] Buffer Sombra para acceso rápido
+    bool isDirty = true;              // [FASE 1] Flag de estado del cache
 
 public:
     int allocatedSize;
@@ -130,8 +132,8 @@ public:
         unsigned int inOffset);  // Set all tile values from a data array of
                                  // length 32768 (128 x 16 x 16).
     void getData(std::vector<uint8_t>& retArray,
-                 unsigned int retOffset);  // Gets all tile values into an array
-                                           // of length 32768.
+                 unsigned int retOffset);  // Gets all tile values into an array of
+                                           // length 32768.
     int get(int x, int y, int z);          // Get an individual tile value
     void set(int x, int y, int z, int val);  // Set an individual tile value
     typedef void (*tileUpdatedCallback)(int x, int y, int z, void* param,
