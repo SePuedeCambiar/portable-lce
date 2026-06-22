@@ -2302,9 +2302,24 @@ void LevelChunk::setBlockData(std::vector<uint8_t>& data) {
 
 // Sets data in passed in array of size 32768, from the block data in this chunk
 void LevelChunk::getBlockData(std::vector<uint8_t>& data) {
-    lowerBlocks->getData(data, 0);
-    if (data.size() > Level::COMPRESSED_CHUNK_SECTION_TILES)
-        upperBlocks->getData(data, Level::COMPRESSED_CHUNK_SECTION_TILES);
+    // 1. Aseguramos que el vector tenga el tamaño necesario (32768 * 2)
+    if (data.size() < 65536) {
+        data.resize(65536);
+    }
+
+    // 2. Copiamos la parte inferior (0-127) desde el Shadow Buffer
+    if (lowerBlocks) {
+        lowerBlocks->copyTo(data.data()); // .data() convierte el vector en puntero
+    } else {
+        memset(data.data(), 0, 32768);
+    }
+
+    // 3. Copiamos la parte superior (128-255)
+    if (upperBlocks) {
+        upperBlocks->copyTo(data.data() + 32768);
+    } else {
+        memset(data.data() + 32768, 0, 32768);
+    }
 }
 
 int LevelChunk::getBlocksAllocatedSize(int* count0, int* count1, int* count2,

@@ -13,62 +13,43 @@
 #include "java/System.h"
 #include "platform/network/NetTypes.h"
 
-// Note: See header for an overview of this class
-
 int CompressedTileStorage::deleteQueueIndex;
 XLockFreeStack<unsigned char> CompressedTileStorage::deleteQueue[3];
 
 std::recursive_mutex CompressedTileStorage::cs_write;
 
-#if defined(PSVITA_PRECOMPUTED_TABLE)
-// AP - this will create a precomputed table to speed up getData
-static int* CompressedTile_StorageIndexTable = nullptr;
-
-void CompressedTileStorage_InitTable() {
-    if (CompressedTile_StorageIndexTable == nullptr) {
-        CompressedTile_StorageIndexTable = (int*)malloc(sizeof(int) * 64);
-        for (int j = 0; j < 64; j += 1) {
-            int index = ((j & 0x30) << 7) | ((j & 0x0c) << 5) | (j & 0x03);
-            CompressedTile_StorageIndexTable[j] = index;
-        }
-    }
-}
-#endif
-
+// Constructor vacío
 CompressedTileStorage::CompressedTileStorage() {
     indicesAndData = nullptr;
     allocatedSize = 0;
-
-#if defined(PSVITA_PRECOMPUTED_TABLE)
-    CompressedTileStorage_InitTable();
-#endif
+    unpackedCache = nullptr; // Garantizar inicialización segura
+    isDirty = true;          // Garantizar inicialización segura
 }
 
+// Constructor de copia
 CompressedTileStorage::CompressedTileStorage(CompressedTileStorage* copyFrom) {
+    unpackedCache = nullptr; // El clon generará su propio cache al usarse
+    isDirty = true;
     {
         std::lock_guard<std::recursive_mutex> lock(cs_write);
         allocatedSize = copyFrom->allocatedSize;
         if (allocatedSize > 0) {
-            indicesAndData = (unsigned char*)malloc(
-                allocatedSize);  //(unsigned char *)malloc(allocatedSize);
+            indicesAndData = (unsigned char*)malloc(allocatedSize);
             memcpy(indicesAndData, copyFrom->indicesAndData, allocatedSize);
         } else {
             indicesAndData = nullptr;
         }
     }
-
-#if defined(PSVITA_PRECOMPUTED_TABLE)
-    CompressedTileStorage_InitTable();
-#endif
 }
 
+// Constructor desde vector de inicialización
 CompressedTileStorage::CompressedTileStorage(std::vector<uint8_t>& initFrom,
                                              unsigned int initOffset) {
     indicesAndData = nullptr;
     allocatedSize = 0;
+    unpackedCache = nullptr;
+    isDirty = true;
 
-    // We need 32768 bytes for a fully uncompressed chunk, plus 1024 for the
-    // index. Rounding up to nearest 4096 bytes for allocation
     indicesAndData = (unsigned char*)malloc(32768 + 4096);
 
     unsigned short* indices = (unsigned short*)indicesAndData;
@@ -87,53 +68,34 @@ CompressedTileStorage::CompressedTileStorage(std::vector<uint8_t>& initFrom,
                 *data++ = 0;
             }
         }
-
         offset += 64;
     }
 
-    allocatedSize =
-        32768 +
-        1024;  // This is used for copying (see previous ctor), and as such it
-               // only needs to be the actual size of the data used rather than
-               // the one rounded up to a page size actually allocated
-
-#if defined(PSVITA_PRECOMPUTED_TABLE)
-    CompressedTileStorage_InitTable();
-#endif
+    allocatedSize = 32768 + 1024;
 }
 
 bool CompressedTileStorage::isCompressed() {
     return allocatedSize != 32768 + 1024;
 }
 
+// Constructor vacío/comprimido
 CompressedTileStorage::CompressedTileStorage(bool isEmpty) {
     indicesAndData = nullptr;
     allocatedSize = 0;
+    unpackedCache = nullptr;
+    isDirty = true;
 
-    // Empty and already compressed, so we only need 1K. Rounding up to nearest
-    // 4096 bytes for allocation
     indicesAndData = (unsigned char*)malloc(4096);
     unsigned short* indices = (unsigned short*)indicesAndData;
-    // unsigned char *data = indicesAndData + 1024;
 
-    // int offset = 0;
     for (int i = 0; i < 512; i++) {
         indices[i] = INDEX_TYPE_0_OR_8_BIT | INDEX_TYPE_0_BIT_FLAG;
     }
 
-    allocatedSize =
-        1024;  // This is used for copying (see previous ctor), and as such it
-               // only needs to be the actual size of the data used rather than
-               // the one rounded up to a page size actually allocated
-
-#if defined(PSVITA_PRECOMPUTED_TABLE)
-    CompressedTileStorage_InitTable();
-#endif
+    allocatedSize = 1024;
 }
 
-bool CompressedTileStorage::isRenderChunkEmpty(
-    int y)  // y == 0, 16, 32... 112 (representing a 16 byte range)
-{
+bool CompressedTileStorage::isRenderChunkEmpty(int y) {
     int block;
     unsigned short* blockIndices = (unsigned short*)indicesAndData;
 
@@ -141,8 +103,6 @@ bool CompressedTileStorage::isRenderChunkEmpty(
         for (int z = 0; z < 16; z += 4) {
             getBlock(&block, x, y, z);
             uint64_t* comp = (uint64_t*)&blockIndices[block];
-            // Are the 4 y regions stored here all zero? (INDEX_TYPE_0_OR_8_BIT
-            // | INDEX_TYPE_0_BIT_FLAG )
             if ((*comp) != 0x0007000700070007L) return false;
         }
     return true;
@@ -154,8 +114,6 @@ bool CompressedTileStorage::isSameAs(CompressedTileStorage* other) {
         return false;
     }
 
-    // Attempt to compare as much as we can in 64-byte chunks (8 groups of 8
-    // bytes)
     int quickCount = allocatedSize / 64;
     int64_t* pOld = (int64_t*)indicesAndData;
     int64_t* pNew = (int64_t*)other->indicesAndData;
@@ -181,7 +139,6 @@ bool CompressedTileStorage::isSameAs(CompressedTileStorage* other) {
         pNew += 8;
     }
 
-    // Now test anything remaining just byte at a time
     unsigned char* pucOld = (unsigned char*)pOld;
     unsigned char* pucNew = (unsigned char*)pNew;
     for (int i = 0; i < allocatedSize - (quickCount * 64); i++) {
@@ -195,44 +152,15 @@ bool CompressedTileStorage::isSameAs(CompressedTileStorage* other) {
 
 CompressedTileStorage::~CompressedTileStorage() {
     if (indicesAndData) free(indicesAndData);
+    if (unpackedCache) free(unpackedCache); // Liberar de forma segura
 }
 
-// Get an index into the normal ordering of tiles for the java game, given a
-// block index (0 to 511) and a tile index (0 to 63)
 inline int CompressedTileStorage::getIndex(int block, int tile) {
-    // bits for index into data is: xxxxzzzzyyyyyyy
-    // we want block(b) & tile(t) spread out as:
-    //			from:		______bbbbbbbbb
-    //          to:			bb__bb__bbbbb__
-    //
-    //			from:		_________tttttt
-    //			to:			__tt__tt_____tt
-
     int index = ((block & 0x180) << 6) | ((block & 0x060) << 4) |
                 ((block & 0x01f) << 2);
     index |= ((tile & 0x30) << 7) | ((tile & 0x0c) << 5) | (tile & 0x03);
-
     return index;
 }
-
-// Get the block and tile (reversing getIndex above) for a given x, y, z
-// coordinate
-//
-// bits for index into data is: xxxxzzzzyyyyyyy
-//                              bbttbbttbbbbbtt
-//
-// so x is:						___________xxxx
-// and maps to this bit of b	______bb_______
-//         and this bit of t	_________tt____
-//
-// y is:						________yyyyyyy
-// and maps to this bit of b	__________bbbbb
-//         and this bit of t	_____________tt
-//
-// and z is:					___________zzzz
-// and maps to this bit of b	________bb_____
-//         and this bit of t    ___________tt__
-//
 
 inline void CompressedTileStorage::getBlockAndTile(int* block, int* tile, int x,
                                                    int y, int z) {
@@ -244,19 +172,15 @@ inline void CompressedTileStorage::getBlock(int* block, int x, int y, int z) {
     *block = ((x & 0x0c) << 5) | ((z & 0x0c) << 3) | (y >> 2);
 }
 
-// Set all tile values from a data array of length 32768 (128 x 16 x 16).
 void CompressedTileStorage::setData(std::vector<uint8_t>& dataIn,
                                     unsigned int inOffset) {
     unsigned short _blockIndices[512];
 
     std::lock_guard<std::recursive_mutex> lock(cs_write);
+    isDirty = true; // Forzar descompresión en el siguiente renderizado
     unsigned char* data = dataIn.data() + inOffset;
 
-    // Is the destination fully uncompressed? If so just write our data in -
-    // this happens when writing schematics and we don't want this setting of
-    // data to trigger compression
     if (allocatedSize == (32768 + 1024)) {
-        // unsigned short *indices = (unsigned short *)indicesAndData;
         unsigned char* dataOut = indicesAndData + 1024;
 
         for (int i = 0; i < 512; i++) {
@@ -269,74 +193,45 @@ void CompressedTileStorage::setData(std::vector<uint8_t>& dataIn,
 
     int offsets[512];
     int memToAlloc = 0;
-    //	static int type0 = 0, type1 = 0, type2 = 0, type4 = 0, type8 = 0,
-    // chunkTotal = 0;
 
-    // Loop round all blocks
     for (int i = 0; i < 512; i++) {
         offsets[i] = memToAlloc;
-        // Count how many unique tile types are in the block - if unpacked_data
-        // isn't set then there isn't any data so we can't compress any further
-        // and require no storage. Store flags for each tile type used in an
-        // array of 4 64-bit flags.
-
         uint64_t usedFlags[4] = {0, 0, 0, 0};
-        int64_t i64_1 = 1;  // MGH - instead of 1i64, which is MS specific
-        for (int j = 0; j < 64; j++)  // This loop of 64 is to go round the 4 x
-                                      // 4 tiles in the block
-        {
+        int64_t i64_1 = 1;
+        for (int j = 0; j < 64; j++) {
             int tile = data[getIndex(i, j)];
-
             usedFlags[tile & 3] |= (i64_1 << (tile >> 2));
         }
         int count = 0;
-        for (int tile = 0; tile < 256;
-             tile++)  // This loop of 256 is to go round the 256 possible values
-                      // that the tiles might have had to find how many are
-                      // actually used
-        {
+        for (int tile = 0; tile < 256; tile++) {
             if (usedFlags[tile & 3] & (i64_1 << (tile >> 2))) {
                 count++;
             }
         }
         if (count == 1) {
             _blockIndices[i] = INDEX_TYPE_0_OR_8_BIT | INDEX_TYPE_0_BIT_FLAG;
-            //			type0++;
         } else if (count == 2) {
             _blockIndices[i] = INDEX_TYPE_1_BIT;
-            memToAlloc += 10;  // 8 bytes + 2 tile index
-                               //			type1++;
+            memToAlloc += 10;
         } else if (count <= 4) {
             _blockIndices[i] = INDEX_TYPE_2_BIT;
-            memToAlloc += 20;  // 16 bytes + 4 tile index
-                               //			type2++;
+            memToAlloc += 20;
         } else if (count <= 16) {
             _blockIndices[i] = INDEX_TYPE_4_BIT;
-            memToAlloc += 48;  // 32 bytes + 16 tile index
-                               //			type4++;
+            memToAlloc += 48;
         } else {
             _blockIndices[i] = INDEX_TYPE_0_OR_8_BIT;
-            memToAlloc =
-                (memToAlloc + 3) &
-                0xfffc;  // Make sure we are 4-byte aligned for 8-bit storage
+            memToAlloc = (memToAlloc + 3) & 0xfffc;
             memToAlloc += 64;
-            //			type8++;
         }
     }
 
-    //	chunkTotal++;
-    //	printf("%d: %d (0) %d (1) %d (2) %d (4) %d (8)\n", chunkTotal, type0 /
-    // chunkTotal, type1 / chunkTotal, type2 / chunkTotal, type4 / chunkTotal,
-    // type8 / chunkTotal);
-
-    memToAlloc += 1024;  // For the indices
-    unsigned char* newIndicesAndData = (unsigned char*)malloc(
-        memToAlloc);  //(unsigned char *)malloc( memToAlloc );
+    memToAlloc += 1024;
+    unsigned char* newIndicesAndData = (unsigned char*)malloc(memToAlloc);
     unsigned char* pucData = newIndicesAndData + 1024;
     unsigned short usDataOffset = 0;
     unsigned short* newIndices = (unsigned short*)newIndicesAndData;
 
-    // Now pass through again actually making the final compressed data
     for (int i = 0; i < 512; i++) {
         unsigned short indexTypeNew = _blockIndices[i] & INDEX_TYPE_MASK;
         newIndices[i] = indexTypeNew;
@@ -348,47 +243,31 @@ void CompressedTileStorage::setData(std::vector<uint8_t>& dataIn,
                                  << INDEX_TILE_SHIFT);
             } else {
                 usDataOffset = (usDataOffset + 3) & 0xfffc;
-                for (int j = 0; j < 64;
-                     j++)  // This loop of 64 is to go round the 4 x 4 x 4 tiles
-                           // in the block
-                {
+                for (int j = 0; j < 64; j++) {
                     pucData[usDataOffset + j] = data[getIndex(i, j)];
                 }
-                newIndices[i] |= (usDataOffset & INDEX_OFFSET_MASK)
-                                 << INDEX_OFFSET_SHIFT;
+                newIndices[i] |= (usDataOffset & INDEX_OFFSET_MASK) << INDEX_OFFSET_SHIFT;
                 usDataOffset += 64;
             }
         } else {
-            // Need to repack - TODO - from here onwards!
             unsigned char ucMappings[256] = {0};
             for (int j = 0; j < 256; j++) {
                 ucMappings[j] = 255;
             }
 
             unsigned char* repacked = nullptr;
-
-            int bitspertile = 1 << indexTypeNew;   // will be 1, 2 or 4 (from
-                                                   // index values of 0, 1, 2)
-            int tiletypecount = 1 << bitspertile;  // will be 2, 4 or 16 (from
-                                                   // index values of 0, 1, 2)
-            // int tiletypemask = tiletypecount - 1;		// will be 1, 3
-            // or 15 (from index values of 0, 1, 2)
-            int tiledatasize = 8 << indexTypeNew;  // will be 8, 16 or 32 (from
-                                                   // index values of 0, 1, 2)
-            int indexshift = 3 - indexTypeNew;  // will be 3, 2 or 1 (from index
-                                                // values of 0, 1, 2)
-            int indexmask_bits = 7 >> indexTypeNew;  // will be 7, 3 or 1 (from
-                                                     // index values of 0, 1, 2)
-            int indexmask_bytes =
-                62 >> indexshift;  // will be 7, 15 or 31 (from index values of
-                                   // 0, 1, 2)
+            int bitspertile = 1 << indexTypeNew;
+            int tiletypecount = 1 << bitspertile;
+            int tiledatasize = 8 << indexTypeNew;
+            int indexshift = 3 - indexTypeNew;
+            int indexmask_bits = 7 >> indexTypeNew;
+            int indexmask_bytes = 62 >> indexshift;
 
             unsigned char* tile_types = pucData + usDataOffset;
             repacked = tile_types + tiletypecount;
             memset(tile_types, 255, tiletypecount);
             memset(repacked, 0, tiledatasize);
-            newIndices[i] |= (usDataOffset & INDEX_OFFSET_MASK)
-                             << INDEX_OFFSET_SHIFT;
+            newIndices[i] |= (usDataOffset & INDEX_OFFSET_MASK) << INDEX_OFFSET_SHIFT;
             usDataOffset += tiletypecount + tiledatasize;
             int count = 0;
             for (int j = 0; j < 64; j++) {
@@ -411,47 +290,34 @@ void CompressedTileStorage::setData(std::vector<uint8_t>& dataIn,
     allocatedSize = memToAlloc;
 }
 
-#if defined(PSVITA_PRECOMPUTED_TABLE)
+// NUEVA FUNCIÓN GETDATA (100% LIMPIA, ESTABLE Y COMPATIBLE)
+void CompressedTileStorage::getData(std::vector<uint8_t>& retArray,
+                                    unsigned int retOffset) {
+    std::lock_guard<std::recursive_mutex> lock(cs_write);
 
-// AP - When called in pairs from LevelChunk::getBlockData this version of
-// getData reduces the time from ~5.2ms to ~1.6ms on the Vita Gets all tile
-// values into an array of length 32768.
-// REEMPLAZA TODO EL BLOQUE DE getData (Tanto el de PSVITA como el normal) POR ESTO:
-void CompressedTileStorage::getData(std::vector<uint8_t>& retArray, unsigned int retOffset) {
-    // 1. Gestión del Buffer Sombra
+    // 1. Asegurar la existencia del Buffer Sombra
     if (!unpackedCache) {
         unpackedCache = (uint8_t*)malloc(32768);
     }
 
-    // 2. Si el cache está sucio, lo descomprimimos UNA SOLA VEZ
+    // 2. Si el cache está sucio, realizamos la descompresión usando 'getIndex' original de C++
     if (isDirty) {
         unsigned short* blockIndices = (unsigned short*)indicesAndData;
         unsigned char* data = indicesAndData + 1024;
 
         for (int i = 0; i < 512; i++) {
             int indexType = blockIndices[i] & INDEX_TYPE_MASK;
-            int baseIndex = ((i & 0x180) << 6) | ((i & 0x060) << 4) | ((i & 0x01f) << 2);
 
             if (indexType == INDEX_TYPE_0_OR_8_BIT) {
                 if (blockIndices[i] & INDEX_TYPE_0_BIT_FLAG) {
                     uint8_t val = (blockIndices[i] >> INDEX_TILE_SHIFT) & INDEX_TILE_MASK;
                     for (int j = 0; j < 64; j++) {
-                        #if defined(PSVITA_PRECOMPUTED_TABLE)
-                            unpackedCache[CompressedTile_StorageIndexTable[j]] = val;
-                        #else
-                            int tileIdx = ((j & 0x30) << 7) | ((j & 0x0c) << 5) | (j & 0x03);
-                            unpackedCache[baseIndex | tileIdx] = val;
-                        #endif
+                        unpackedCache[getIndex(i, j)] = val;
                     }
                 } else {
                     unsigned char* packed = data + ((blockIndices[i] >> INDEX_OFFSET_SHIFT) & INDEX_OFFSET_MASK);
                     for (int j = 0; j < 64; j++) {
-                        #if defined(PSVITA_PRECOMPUTED_TABLE)
-                            unpackedCache[CompressedTile_StorageIndexTable[j]] = packed[j];
-                        #else
-                            int tileIdx = ((j & 0x30) << 7) | ((j & 0x0c) << 5) | (j & 0x03);
-                            unpackedCache[baseIndex | tileIdx] = packed[j];
-                        #endif
+                        unpackedCache[getIndex(i, j)] = packed[j];
                     }
                 }
             } else {
@@ -468,87 +334,20 @@ void CompressedTileStorage::getData(std::vector<uint8_t>& retArray, unsigned int
                 for (int j = 0; j < 64; j++) {
                     int idx = (j >> indexshift) & indexmask_bytes;
                     int bit = (j & indexmask_bits) * bitspertile;
-                    #if defined(PSVITA_PRECOMPUTED_TABLE)
-                        unpackedCache[CompressedTile_StorageIndexTable[j]] = tile_types[(packed[idx] >> bit) & tiletypemask];
-                    #else
-                        int tileIdx = ((j & 0x30) << 7) | ((j & 0x0c) << 5) | (j & 0x03);
-                        unpackedCache[baseIndex | tileIdx] = tile_types[(packed[idx] >> bit) & tiletypemask];
-                    #endif
+                    unpackedCache[getIndex(i, j)] = tile_types[(packed[idx] >> bit) & tiletypemask];
                 }
             }
         }
-        isDirty = false; 
+        isDirty = false; // Cache validado
     }
 
-    // 3. Copia ultra rápida del cache al vector
+    // 3. Retornar los datos copiando desde el cache lineal
+    if (retArray.size() < 32768 + retOffset) {
+        retArray.resize(32768 + retOffset);
+    }
     memcpy(&retArray[retOffset], unpackedCache, 32768);
 }
 
-#else
-
-// Gets all tile values into an array of length 32768.
-void CompressedTileStorage::getData(std::vector<uint8_t>& retArray,
-                                    unsigned int retOffset) {
-    unsigned short* blockIndices = (unsigned short*)indicesAndData;
-    unsigned char* data = indicesAndData + 1024;
-
-    for (int i = 0; i < 512; i++) {
-        int indexType = blockIndices[i] & INDEX_TYPE_MASK;
-        if (indexType == INDEX_TYPE_0_OR_8_BIT) {
-            if (blockIndices[i] & INDEX_TYPE_0_BIT_FLAG) {
-                for (int j = 0; j < 64; j++) {
-                    retArray[getIndex(i, j) + retOffset] =
-                        (blockIndices[i] >> INDEX_TILE_SHIFT) & INDEX_TILE_MASK;
-                }
-            } else {
-                // 8-bit reads are just directly read from the 64 long array of
-                // values stored for the block
-                unsigned char* packed =
-                    data + ((blockIndices[i] >> INDEX_OFFSET_SHIFT) &
-                            INDEX_OFFSET_MASK);
-
-                for (int j = 0; j < 64; j++) {
-                    retArray[getIndex(i, j) + retOffset] = packed[j];
-                }
-            }
-        } else {
-            // 1, 2, or 4 bits per block packed format
-
-            int bitspertile = 1 << indexType;  // will be 1, 2 or 4 (from index
-                                               // values of 0, 1, 2)
-            int tiletypecount = 1 << bitspertile;  // will be 2, 4 or 16 (from
-                                                   // index values of 0, 1, 2)
-            int tiletypemask =
-                tiletypecount -
-                1;  // will be 1, 3 or 15 (from index values of 0, 1, 2)
-            int indexshift =
-                3 -
-                indexType;  // will be 3, 2 or 1 (from index values of 0, 1, 2)
-            int indexmask_bits =
-                7 >>
-                indexType;  // will be 7, 3 or 1 (from index values of 0, 1, 2)
-            int indexmask_bytes =
-                62 >> indexshift;  // will be 7, 15 or 31 (from index values of
-                                   // 0, 1, 2)
-
-            unsigned char* tile_types =
-                data +
-                ((blockIndices[i] >> INDEX_OFFSET_SHIFT) & INDEX_OFFSET_MASK);
-            unsigned char* packed = tile_types + tiletypecount;
-
-            for (int j = 0; j < 64; j++) {
-                int idx = (j >> indexshift) & indexmask_bytes;
-                int bit = (j & indexmask_bits) * bitspertile;
-                retArray[getIndex(i, j) + retOffset] =
-                    tile_types[(packed[idx] >> bit) & tiletypemask];
-            }
-        }
-    }
-}
-
-#endif
-
-// Get an individual tile value
 int CompressedTileStorage::get(int x, int y, int z) {
     if (!indicesAndData) return 0;
 
@@ -561,35 +360,20 @@ int CompressedTileStorage::get(int x, int y, int z) {
 
     if (indexType == INDEX_TYPE_0_OR_8_BIT) {
         if (blockIndices[block] & INDEX_TYPE_0_BIT_FLAG) {
-            // 0 bit reads are easy - the value is packed in the index
             return (blockIndices[block] >> INDEX_TILE_SHIFT) & INDEX_TILE_MASK;
         } else {
-            // 8-bit reads are just directly read from the 64 long array of
-            // values stored for the block
-            unsigned char* packed =
-                data + ((blockIndices[block] >> INDEX_OFFSET_SHIFT) &
-                        INDEX_OFFSET_MASK);
+            unsigned char* packed = data + ((blockIndices[block] >> INDEX_OFFSET_SHIFT) & INDEX_OFFSET_MASK);
             return packed[tile];
         }
     } else {
-        int bitspertile =
-            1 << indexType;  // will be 1, 2 or 4 (from index values of 0, 1, 2)
-        int tiletypecount = 1 << bitspertile;  // will be 2, 4 or 16 (from index
-                                               // values of 0, 1, 2)
-        int tiletypemask =
-            tiletypecount -
-            1;  // will be 1, 3 or 15 (from index values of 0, 1, 2)
-        int indexshift =
-            3 - indexType;  // will be 3, 2 or 1 (from index values of 0, 1, 2)
-        int indexmask_bits =
-            7 >> indexType;  // will be 7, 3 or 1 (from index values of 0, 1, 2)
-        int indexmask_bytes =
-            62 >>
-            indexshift;  // will be 7, 15 or 31 (from index values of 0, 1, 2)
+        int bitspertile = 1 << indexType;
+        int tiletypecount = 1 << bitspertile;
+        int tiletypemask = tiletypecount - 1;
+        int indexshift = 3 - indexType;
+        int indexmask_bits = 7 >> indexType;
+        int indexmask_bytes = 62 >> indexshift;
 
-        unsigned char* tile_types =
-            data +
-            ((blockIndices[block] >> INDEX_OFFSET_SHIFT) & INDEX_OFFSET_MASK);
+        unsigned char* tile_types = data + ((blockIndices[block] >> INDEX_OFFSET_SHIFT) & INDEX_OFFSET_MASK);
         unsigned char* packed = tile_types + tiletypecount;
         int idx = (tile >> indexshift) & indexmask_bytes;
         int bit = (tile & indexmask_bits) * bitspertile;
@@ -598,16 +382,13 @@ int CompressedTileStorage::get(int x, int y, int z) {
     return 0;
 }
 
-// Set an individual tile value
 void CompressedTileStorage::set(int x, int y, int z, int val) {
     std::lock_guard<std::recursive_mutex> lock(cs_write);
+    isDirty = true; // Marcar el cache como sucio para que se actualice en el siguiente frame
     assert(val != 255);
     int block, tile;
     getBlockAndTile(&block, &tile, x, y, z);
 
-    // 2 passes - first pass will try and store within the current levels of
-    // compression, then if that fails will upgrade the block we are writing to
-    // (so more bits can be stored) to achieve the storage required
     for (int pass = 0; pass < 2; pass++) {
         unsigned short* blockIndices = (unsigned short*)indicesAndData;
         unsigned char* data = indicesAndData + 1024;
@@ -616,42 +397,23 @@ void CompressedTileStorage::set(int x, int y, int z, int val) {
 
         if (indexType == INDEX_TYPE_0_OR_8_BIT) {
             if (blockIndices[block] & INDEX_TYPE_0_BIT_FLAG) {
-                // 0 bits - if its the value already, we're done, otherwise
-                // continue on to upgrade storage
-                if (val == ((blockIndices[block] >> INDEX_TILE_SHIFT) &
-                            INDEX_TILE_MASK)) {
-                    return; // Retorno temprano: No hubo cambios, no ensuciamos el cache
+                if (val == ((blockIndices[block] >> INDEX_TILE_SHIFT) & INDEX_TILE_MASK)) {
+                    return;
                 }
             } else {
-                // 8 bits - just store directly and we're done
-                unsigned char* packed =
-                    data + ((blockIndices[block] >> INDEX_OFFSET_SHIFT) &
-                            INDEX_OFFSET_MASK);
+                unsigned char* packed = data + ((blockIndices[block] >> INDEX_OFFSET_SHIFT) & INDEX_OFFSET_MASK);
                 packed[tile] = val;
-                isDirty = true; // <--- MODIFICACIÓN REAL: Marcamos el cache como sucio
                 return;
             }
         } else {
-            int bitspertile = 1 << indexType;  // will be 1, 2 or 4 (from index
-                                               // values of 0, 1, 2)
-            int tiletypecount = 1 << bitspertile;  // will be 2, 4 or 16 (from
-                                                   // index values of 0, 1, 2)
-            int tiletypemask =
-                tiletypecount -
-                1;  // will be 1, 3 or 15 (from index values of 0, 1, 2)
-            int indexshift =
-                3 -
-                indexType;  // will be 3, 2 or 1 (from index values of 0, 1, 2)
-            int indexmask_bits =
-                7 >>
-                indexType;  // will be 7, 3 or 1 (from index values of 0, 1, 2)
-            int indexmask_bytes =
-                62 >> indexshift;  // will be 7, 15 or 31 (from index values of
-                                   // 0, 1, 2)
+            int bitspertile = 1 << indexType;
+            int tiletypecount = 1 << bitspertile;
+            int tiletypemask = tiletypecount - 1;
+            int indexshift = 3 - indexType;
+            int indexmask_bits = 7 >> indexType;
+            int indexmask_bytes = 62 >> indexshift;
 
-            unsigned char* tile_types =
-                data + ((blockIndices[block] >> INDEX_OFFSET_SHIFT) &
-                        INDEX_OFFSET_MASK);
+            unsigned char* tile_types = data + ((blockIndices[block] >> INDEX_OFFSET_SHIFT) & INDEX_OFFSET_MASK);
 
             for (int i = 0; i < tiletypecount; i++) {
                 if ((tile_types[i] == val) || (tile_types[i] == 255)) {
@@ -661,25 +423,22 @@ void CompressedTileStorage::set(int x, int y, int z, int val) {
                     int bit = (tile & indexmask_bits) * bitspertile;
                     packed[idx] &= ~(tiletypemask << bit);
                     packed[idx] |= i << bit;
-                    isDirty = true; // <--- MODIFICACIÓN REAL: Marcamos el cache como sucio
                     return;
                 }
             }
         }
         if (pass == 0) {
             compress(block);
-            isDirty = true; // <--- Al comprimir/actualizar almacenamiento, el cache cambia
         }
-    };
+    }
 }
 
-// Sets a region of tile values with the data at offset position in the array
-// dataIn - external ordering compatible with java DataLayer
 int CompressedTileStorage::setDataRegion(std::vector<uint8_t>& dataIn, int x0,
                                          int y0, int z0, int x1, int y1, int z1,
                                          int offset,
                                          tileUpdatedCallback callback,
                                          void* param, int yparam) {
+    isDirty = true;
     unsigned char* pucIn = &dataIn.data()[offset];
 
     if (callback) {
@@ -704,11 +463,9 @@ int CompressedTileStorage::setDataRegion(std::vector<uint8_t>& dataIn, int x0,
         }
     }
     ptrdiff_t count = pucIn - &dataIn.data()[offset];
-
     return (int)count;
 }
 
-// Tests whether setting data would actually change anything
 bool CompressedTileStorage::testSetDataRegion(std::vector<uint8_t>& dataIn,
                                               int x0, int y0, int z0, int x1,
                                               int y1, int z1, int offset) {
@@ -725,8 +482,6 @@ bool CompressedTileStorage::testSetDataRegion(std::vector<uint8_t>& dataIn,
     return false;
 }
 
-// Updates the data at offset position dataInOut with a region of tile
-// information - external ordering compatible with java DataLayer
 int CompressedTileStorage::getDataRegion(std::vector<uint8_t>& dataInOut,
                                          int x0, int y0, int z0, int x1, int y1,
                                          int z1, int offset) {
@@ -739,7 +494,6 @@ int CompressedTileStorage::getDataRegion(std::vector<uint8_t>& dataInOut,
         }
     }
     ptrdiff_t count = pucOut - &dataInOut.data()[offset];
-
     return (int)count;
 }
 
@@ -750,53 +504,32 @@ void CompressedTileStorage::staticCtor() {
 }
 
 void CompressedTileStorage::queueForDelete(unsigned char* data) {
-    // Add this into a queue for deleting. This shouldn't be actually deleted
-    // until tick has been called twice from when the data went into the queue.
     if (data) {
         deleteQueue[deleteQueueIndex].Push(data);
     }
 }
 
 void CompressedTileStorage::tick() {
-    // We have 3 queues for deleting. Always delete from the next one after
-    // where we are writing to, so it should take 2 ticks before we ever delete
-    // something, from when the request to delete it came in
     int freeIndex = (deleteQueueIndex + 1) % 3;
-
-    //	printf("Free queue: %d,
-    //%d\n",deleteQueue[freeIndex].GetEntryCount(),deleteQueue[freeIndex].GetAllocated());
     unsigned char* toFree = nullptr;
     do {
         toFree = deleteQueue[freeIndex].Pop();
-        //		if( toFree ) printf("Deleting 0x%x\n", toFree);
         if (toFree) free(toFree);
     } while (toFree);
 
     deleteQueueIndex = (deleteQueueIndex + 1) % 3;
 }
 
-// Compresses the data currently stored in one of two ways:
-// (1) Attempt to compresses every block as much as possible (if upgradeBlock is -1) 
-// (2) Copy all blocks as-is apart from the block specified by upgradeBlock ( if > -1 ), 
-//     which is changed to be the next-most-accomodating storage from its current state
-
 void CompressedTileStorage::compress(int upgradeBlock /*=-1*/) {
     unsigned char tempdata[64];
     unsigned short _blockIndices[512];
 
-    // If this is already fully compressed, early out
     if ((allocatedSize == 1024) && (upgradeBlock == -1)) return;
 
-    bool needsCompressed =
-        (upgradeBlock > -1);  // If an upgrade block is specified, we'll always
-                              // need to recompress - otherwise default to false
+    bool needsCompressed = (upgradeBlock > -1);
 
     std::lock_guard<std::recursive_mutex> lock(cs_write);
-
-    // ==========================================
-    // CAMBIO FASE 1: Marcar cache como sucio
-    // ==========================================
-    isDirty = true; 
+    isDirty = true; // Forzar regeneración del cache de descompresión
 
     unsigned short* blockIndices = (unsigned short*)indicesAndData;
     unsigned char* data = indicesAndData + 1024;
@@ -808,126 +541,73 @@ void CompressedTileStorage::compress(int upgradeBlock /*=-1*/) {
         unsigned char* unpacked_data = nullptr;
         unsigned char* packed_data;
 
-        // First task is to find out what type of storage each block needs. Need
-        // to unpack each where required. Note that we don't need to fully
-        // unpack the data at this stage since we are only interested in working
-        // out how many unique types of tiles are in each block, not what those
-        // actual tile ids are.
         if (upgradeBlock == -1) {
             if (indexType == INDEX_TYPE_0_OR_8_BIT) {
-                // Note that we are only interested in data that can be packed
-                // further, so we don't need to consider things that are already
-                // at their most compressed (ie with INDEX_TYPE_0_BIT_FLAG set)
                 if ((blockIndices[i] & INDEX_TYPE_0_BIT_FLAG) == 0) {
-                    unpacked_data =
-                        data + ((blockIndices[i] >> INDEX_OFFSET_SHIFT) &
-                                INDEX_OFFSET_MASK);
+                    unpacked_data = data + ((blockIndices[i] >> INDEX_OFFSET_SHIFT) & INDEX_OFFSET_MASK);
                 }
             } else {
-                int bitspertile = 1 << indexType;  // will be 1, 2 or 4 (from
-                                                   // index values of 0, 1, 2)
-                int tiletypecount = 1 << bitspertile;  // will be 2, 4 or 16
-                int tiletypemask = tiletypecount - 1;  // will be 1, 3 or 15
-                int indexshift = 3 - indexType;  // will be 3, 2 or 1 (from
-                                                 // index values of 0, 1, 2)
-                int indexmask_bits =
-                    7 >> indexType;  // will be 7, 3 or 1 (from index values of
-                                     // 0, 1, 2)
-                int indexmask_bytes =
-                    62 >> indexshift;  // will be 7, 15 or 31 (from index values
-                                       // of 0, 1, 2)
+                int bitspertile = 1 << indexType;
+                int tiletypecount = 1 << bitspertile;
+                int tiletypemask = tiletypecount - 1;
+                int indexshift = 3 - indexType;
+                int indexmask_bits = 7 >> indexType;
+                int indexmask_bytes = 62 >> indexshift;
 
                 unpacked_data = tempdata;
-                packed_data = data +
-                              ((blockIndices[i] >> INDEX_OFFSET_SHIFT) &
-                               INDEX_OFFSET_MASK) +
-                              tiletypecount;
+                packed_data = data + ((blockIndices[i] >> INDEX_OFFSET_SHIFT) & INDEX_OFFSET_MASK) + tiletypecount;
 
                 for (int j = 0; j < 64; j++) {
                     int idx = (j >> indexshift) & indexmask_bytes;
                     int bit = (j & indexmask_bits) * bitspertile;
-
-                    unpacked_data[j] =
-                        (packed_data[idx] >> bit) &
-                        tiletypemask;  // Doesn't need the actual data for each
-                                       // tile, just unique values
+                    unpacked_data[j] = (packed_data[idx] >> bit) & tiletypemask;
                 }
             }
 
             if (unpacked_data) {
-                // Now count how many unique tile types are in the block - if
-                // unpacked_data isn't set then there isn't any data so we can't
-                // compress any further and require no storage. Store flags for
-                // each tile type used in an array of 4 64-bit flags.
-
                 uint64_t usedFlags[4] = {0, 0, 0, 0};
-                int64_t i64_1 =
-                    1;  // MGH - instead of 1i64, which is MS specific
-                for (int j = 0; j < 64; j++)  // This loop of 64 is to go round
-                                              // the 4x4x4 tiles in the block
-                {
+                int64_t i64_1 = 1;
+                for (int j = 0; j < 64; j++) {
                     int tiletype = unpacked_data[j];
                     usedFlags[tiletype & 3] |= (i64_1 << (tiletype >> 2));
                 }
                 int count = 0;
-                for (int tiletype = 0; tiletype < 256;
-                     tiletype++)  // This loop of 256 is to go round the 256
-                                  // possible values that the tiles might have
-                                  // had to find how many are actually used
-                {
+                for (int tiletype = 0; tiletype < 256; tiletype++) {
                     if (usedFlags[tiletype & 3] & (i64_1 << (tiletype >> 2))) {
                         count++;
                     }
                 }
 
                 if (count == 1) {
-                    _blockIndices[i] =
-                        INDEX_TYPE_0_OR_8_BIT | INDEX_TYPE_0_BIT_FLAG;
-
-                    // We'll need to compress if this isn't the same type as
-                    // before. If it *was* a 0-bit one though, then
-                    // unpacked_data wouldn't have been set and we wouldn't be
-                    // here
+                    _blockIndices[i] = INDEX_TYPE_0_OR_8_BIT | INDEX_TYPE_0_BIT_FLAG;
                     needsCompressed = true;
                 } else if (count == 2) {
                     _blockIndices[i] = INDEX_TYPE_1_BIT;
                     if (indexType != INDEX_TYPE_1_BIT) needsCompressed = true;
-                    memToAlloc += 10;  // 8 bytes + 2 tile index
+                    memToAlloc += 10;
                 } else if (count <= 4) {
                     _blockIndices[i] = INDEX_TYPE_2_BIT;
                     if (indexType != INDEX_TYPE_2_BIT) needsCompressed = true;
-                    memToAlloc += 20;  // 16 bytes + 4 tile index
+                    memToAlloc += 20;
                 } else if (count <= 16) {
                     _blockIndices[i] = INDEX_TYPE_4_BIT;
                     if (indexType != INDEX_TYPE_4_BIT) needsCompressed = true;
-                    memToAlloc += 48;  // 32 bytes + 16 tile index
+                    memToAlloc += 48;
                 } else {
                     _blockIndices[i] = INDEX_TYPE_0_OR_8_BIT;
-                    memToAlloc =
-                        (memToAlloc + 3) & 0xfffc;  // Make sure we are 4-byte
-                                                    // aligned for 8-bit storage
+                    memToAlloc = (memToAlloc + 3) & 0xfffc;
                     memToAlloc += 64;
                 }
             } else {
-                // Already will be 0 bits, so we can't do any further
-                // compression - just copy the index over.
                 _blockIndices[i] = blockIndices[i];
             }
         } else {
             if (i == upgradeBlock) {
-                // INDEX_TYPE_1_BIT (0) -> INDEX_TYPE_2_BIT (1)
-                // INDEX_TYPE_2_BIT (1) -> INDEX_TYPE_4_BIT (2)
-                // INDEX_TYPE_4_BIT (2) -> INDEX_TYPE_0_OR_8_BIT (3)	(new
-                // will be 8-bit) INDEX_TYPE_0_OR_8_BIT (3) -> INDEX_TYPE_1_BIT
-                // (0)	(assuming old was 0-bit)
-                _blockIndices[i] =
-                    ((blockIndices[i] & INDEX_TYPE_MASK) + 1) & INDEX_TYPE_MASK;
+                _blockIndices[i] = ((blockIndices[i] & INDEX_TYPE_MASK) + 1) & INDEX_TYPE_MASK;
             } else {
-                // Copy over the index, without the offset.
                 _blockIndices[i] = blockIndices[i] & INDEX_TYPE_MASK;
                 if (_blockIndices[i] == INDEX_TYPE_0_OR_8_BIT) {
-                    _blockIndices[i] |=
-                        (blockIndices[i] & INDEX_TYPE_0_BIT_FLAG);
+                    _blockIndices[i] |= (blockIndices[i] & INDEX_TYPE_0_BIT_FLAG);
                 }
             }
             switch (_blockIndices[i]) {
@@ -941,80 +621,55 @@ void CompressedTileStorage::compress(int upgradeBlock /*=-1*/) {
                     memToAlloc += 48;
                     break;
                 case INDEX_TYPE_0_OR_8_BIT:
-                    memToAlloc =
-                        (memToAlloc + 3) & 0xfffc;  // Make sure we are 4-byte
-                                                    // aligned for 8-bit storage
+                    memToAlloc = (memToAlloc + 3) & 0xfffc;
                     memToAlloc += 64;
                     break;
-                    // Note that INDEX_TYPE_8_BIT|INDEX_TYPE_0_BIT_FLAG not in
-                    // here as it doesn't need any further allocation
             }
         }
     }
 
-    // If we need to do something here, then lets allocate some memory
     if (needsCompressed) {
-        memToAlloc += 1024;  // For the indices
-        unsigned char* newIndicesAndData = (unsigned char*)malloc(
-            memToAlloc);  //(unsigned char *)malloc( memToAlloc );
+        memToAlloc += 1024;
+        unsigned char* newIndicesAndData = (unsigned char*)malloc(memToAlloc);
         if (newIndicesAndData == nullptr) {
             assert(0 && "Failed to allocate memory for CompressedTileStorage.");
-            // uint32_t lastError = GetLastError();
-            // MEMORYSTATUS memStatus;
-            // GlobalMemoryStatus(&memStatus);
-            // assert(0);
         }
         unsigned char* pucData = newIndicesAndData + 1024;
         unsigned short usDataOffset = 0;
         unsigned short* newIndices = (unsigned short*)newIndicesAndData;
 
-        // Now pass through again actually making the final compressed data
         for (int i = 0; i < 512; i++) {
             unsigned short indexTypeNew = _blockIndices[i] & INDEX_TYPE_MASK;
             unsigned short indexTypeOld = blockIndices[i] & INDEX_TYPE_MASK;
             newIndices[i] = indexTypeNew;
 
-            // Is the type unmodifed? Then can just copy over
             bool done = false;
             if (indexTypeOld == indexTypeNew) {
                 unsigned char* packed_data;
                 if (indexTypeOld == INDEX_TYPE_0_OR_8_BIT) {
-                    if ((blockIndices[i] & INDEX_TYPE_0_BIT_FLAG) ==
-                        (_blockIndices[i] & INDEX_TYPE_0_BIT_FLAG)) {
+                    if ((blockIndices[i] & INDEX_TYPE_0_BIT_FLAG) == (_blockIndices[i] & INDEX_TYPE_0_BIT_FLAG)) {
                         if (blockIndices[i] & INDEX_TYPE_0_BIT_FLAG) {
                             newIndices[i] = blockIndices[i];
                         } else {
-                            packed_data = data + ((blockIndices[i] >>
-                                                   INDEX_OFFSET_SHIFT) &
-                                                  INDEX_OFFSET_MASK);
+                            packed_data = data + ((blockIndices[i] >> INDEX_OFFSET_SHIFT) & INDEX_OFFSET_MASK);
                             usDataOffset = (usDataOffset + 3) & 0xfffc;
                             memcpy(pucData + usDataOffset, packed_data, 64);
-                            newIndices[i] |= (usDataOffset & INDEX_OFFSET_MASK)
-                                             << INDEX_OFFSET_SHIFT;
+                            newIndices[i] |= (usDataOffset & INDEX_OFFSET_MASK) << INDEX_OFFSET_SHIFT;
                             usDataOffset += 64;
                         }
                         done = true;
                     }
                 } else {
-                    packed_data =
-                        data + ((blockIndices[i] >> INDEX_OFFSET_SHIFT) &
-                                INDEX_OFFSET_MASK);
-
-                    int dataSize = 8 << indexTypeOld;  // 8, 16 or 32 bytes of
-                                                       // per-tile storage
-                    dataSize += 1
-                                << (1 << indexTypeOld);  // 2, 4 or 16 bytes to
-                                                         // store each tile type
-                    newIndices[i] |= (usDataOffset & INDEX_OFFSET_MASK)
-                                     << INDEX_OFFSET_SHIFT;
+                    packed_data = data + ((blockIndices[i] >> INDEX_OFFSET_SHIFT) & INDEX_OFFSET_MASK);
+                    int dataSize = 8 << indexTypeOld;
+                    dataSize += 1 << (1 << indexTypeOld);
+                    newIndices[i] |= (usDataOffset & INDEX_OFFSET_MASK) << INDEX_OFFSET_SHIFT;
                     memcpy(pucData + usDataOffset, packed_data, dataSize);
                     usDataOffset += dataSize;
                     done = true;
                 }
             }
 
-            // If we're not done, then we actually need to recompress this
-            // block. First of all decompress from its current format.
             if (!done) {
                 unsigned char* unpacked_data = nullptr;
                 unsigned char* tile_types = nullptr;
@@ -1022,98 +677,59 @@ void CompressedTileStorage::compress(int upgradeBlock /*=-1*/) {
                 if (indexTypeOld == INDEX_TYPE_0_OR_8_BIT) {
                     if (blockIndices[i] & INDEX_TYPE_0_BIT_FLAG) {
                         unpacked_data = tempdata;
-                        int value = (blockIndices[i] >> INDEX_TILE_SHIFT) &
-                                    INDEX_TILE_MASK;
+                        int value = (blockIndices[i] >> INDEX_TILE_SHIFT) & INDEX_TILE_MASK;
                         memset(tempdata, value, 64);
                     } else {
-                        unpacked_data =
-                            data + ((blockIndices[i] >> INDEX_OFFSET_SHIFT) &
-                                    INDEX_OFFSET_MASK);
+                        unpacked_data = data + ((blockIndices[i] >> INDEX_OFFSET_SHIFT) & INDEX_OFFSET_MASK);
                     }
                 } else {
-                    int bitspertile =
-                        1 << indexTypeOld;  // will be 1, 2 or 4 (from index
-                                            // values of 0, 1, 2)
-                    int tiletypecount = 1 << bitspertile;  // will be 2, 4 or 16
-                    int tiletypemask = tiletypecount - 1;  // will be 1, 3 or 15
-                    int indexshift =
-                        3 - indexTypeOld;  // will be 3, 2 or 1 (from index
-                                           // values of 0, 1, 2)
-                    int indexmask_bits =
-                        7 >> indexTypeOld;  // will be 7, 3 or 1 (from index
-                                            // values of 0, 1, 2)
-                    int indexmask_bytes =
-                        62 >> indexshift;  // will be 7, 15 or 31 (from index
-                                           // values of 0, 1, 2)
+                    int bitspertile = 1 << indexTypeOld;
+                    int tiletypecount = 1 << bitspertile;
+                    int tiletypemask = tiletypecount - 1;
+                    int indexshift = 3 - indexTypeOld;
+                    int indexmask_bits = 7 >> indexTypeOld;
+                    int indexmask_bytes = 62 >> indexshift;
 
                     unpacked_data = tempdata;
-                    tile_types =
-                        data + ((blockIndices[i] >> INDEX_OFFSET_SHIFT) &
-                                INDEX_OFFSET_MASK);
+                    tile_types = data + ((blockIndices[i] >> INDEX_OFFSET_SHIFT) & INDEX_OFFSET_MASK);
                     packed_data = tile_types + tiletypecount;
                     for (int j = 0; j < 64; j++) {
                         int idx = (j >> indexshift) & indexmask_bytes;
                         int bit = (j & indexmask_bits) * bitspertile;
-
-                        unpacked_data[j] =
-                            tile_types[(packed_data[idx] >> bit) &
-                                       tiletypemask];
+                        unpacked_data[j] = tile_types[(packed_data[idx] >> bit) & tiletypemask];
                     }
                 }
 
-                // And finally repack
                 unsigned char ucMappings[256] = {0};
                 for (int j = 0; j < 256; j++) {
-                    unsigned char val = 255;
-                    ucMappings[j] = val;
+                    ucMappings[j] = 255;
                 }
 
                 unsigned char* repacked = nullptr;
 
                 if (indexTypeNew == INDEX_TYPE_0_OR_8_BIT) {
                     if (_blockIndices[i] & INDEX_TYPE_0_BIT_FLAG) {
-                        newIndices[i] = INDEX_TYPE_0_OR_8_BIT |
-                                        INDEX_TYPE_0_BIT_FLAG |
-                                        (((unsigned short)unpacked_data[0])
-                                         << INDEX_TILE_SHIFT);
+                        newIndices[i] = INDEX_TYPE_0_OR_8_BIT | INDEX_TYPE_0_BIT_FLAG | (((unsigned short)unpacked_data[0]) << INDEX_TILE_SHIFT);
                     } else {
-                        usDataOffset =
-                            (usDataOffset + 3) &
-                            0xfffc;  // Make sure offset is 4 byte aligned
+                        usDataOffset = (usDataOffset + 3) & 0xfffc;
                         memcpy(pucData + usDataOffset, unpacked_data, 64);
-                        newIndices[i] |= (usDataOffset & INDEX_OFFSET_MASK)
-                                         << INDEX_OFFSET_SHIFT;
+                        newIndices[i] |= (usDataOffset & INDEX_OFFSET_MASK) << INDEX_OFFSET_SHIFT;
                         usDataOffset += 64;
                     }
                 } else {
-                    int bitspertile =
-                        1 << indexTypeNew;  // will be 1, 2 or 4 (from index
-                                            // values of 0, 1, 2)
-                    int tiletypecount =
-                        1 << bitspertile;  // will be 2, 4 or 16 (from index
-                                           // values of 0, 1, 2)
-                    int tiletypemask =
-                        tiletypecount -
-                        1;  // will be 1, 3 or 15 (from index values of 0, 1, 2)
-                    int tiledatasize =
-                        8 << indexTypeNew;  // will be 8, 16 or 32 (from index
-                                            // values of 0, 1, 2)
-                    int indexshift =
-                        3 - indexTypeNew;  // will be 3, 2 or 1 (from index
-                                           // values of 0, 1, 2)
-                    int indexmask_bits =
-                        7 >> indexTypeNew;  // will be 7, 3 or 1 (from index
-                                            // values of 0, 1, 2)
-                    int indexmask_bytes =
-                        62 >> indexshift;  // will be 7, 15 or 31 (from index
-                                           // values of 0, 1, 2)
+                    int bitspertile = 1 << indexTypeNew;
+                    int tiletypecount = 1 << bitspertile;
+                    int tiletypemask = tiletypecount - 1;
+                    int tiledatasize = 8 << indexTypeNew;
+                    int indexshift = 3 - indexTypeNew;
+                    int indexmask_bits = 7 >> indexTypeNew;
+                    int indexmask_bytes = 62 >> indexshift;
 
                     tile_types = pucData + usDataOffset;
                     repacked = tile_types + tiletypecount;
                     memset(tile_types, 255, tiletypecount);
                     memset(repacked, 0, tiledatasize);
-                    newIndices[i] |= (usDataOffset & INDEX_OFFSET_MASK)
-                                     << INDEX_OFFSET_SHIFT;
+                    newIndices[i] |= (usDataOffset & INDEX_OFFSET_MASK) << INDEX_OFFSET_SHIFT;
                     usDataOffset += tiletypecount + tiledatasize;
                     int count = 0;
                     for (int j = 0; j < 64; j++) {
@@ -1170,18 +786,12 @@ int CompressedTileStorage::getHighestNonEmptyY() {
     unsigned int highestYBlock = 0;
     bool found = false;
 
-    // The 512 "blocks" (4x4x4 tiles) are arranged in 32 layers
     for (int yBlock = 31; yBlock >= 0; --yBlock) {
-        // Each layer has 16 blocks
         for (unsigned int xzBlock = 0; xzBlock < 16; ++xzBlock) {
-            // Blocks are ordered in columns
             int index = yBlock + (xzBlock * 32);
-
             int indexType = blockIndices[index] & INDEX_TYPE_MASK;
-            if (indexType == INDEX_TYPE_0_OR_8_BIT &&
-                blockIndices[index] & INDEX_TYPE_0_BIT_FLAG) {
-                int val =
-                    (blockIndices[index] >> INDEX_TILE_SHIFT) & INDEX_TILE_MASK;
+            if (indexType == INDEX_TYPE_0_OR_8_BIT && blockIndices[index] & INDEX_TYPE_0_BIT_FLAG) {
+                int val = (blockIndices[index] >> INDEX_TILE_SHIFT) & INDEX_TILE_MASK;
                 if (val != 0) {
                     highestYBlock = yBlock;
                     found = true;
@@ -1193,14 +803,11 @@ int CompressedTileStorage::getHighestNonEmptyY() {
                 break;
             }
         }
-
         if (found) break;
     }
 
     int highestNonEmptyY = -1;
     if (found) {
-        // Multiply by the number of vertical tiles in a block, and then add
-        // that again to be at the top of the block
         highestNonEmptyY = (highestYBlock * 4) + 4;
     }
     return highestNonEmptyY;
@@ -1210,22 +817,17 @@ void CompressedTileStorage::write(DataOutputStream* dos) {
     dos->writeInt(allocatedSize);
     if (indicesAndData) {
         if (std::endian::native == std::endian::big) {
-            // The first 1024 bytes are an array of shorts, so we need to
-            // reverse the endianness
             std::vector<uint8_t> indicesCopy(1024);
             memcpy(indicesCopy.data(), indicesAndData, 1024);
             reverseIndices(indicesCopy.data());
             dos->write(indicesCopy);
 
-            // Write the rest of the data
             if (allocatedSize > 1024) {
-                std::vector<uint8_t> dataWrapper(
-                    indicesAndData + 1024, indicesAndData + allocatedSize);
+                std::vector<uint8_t> dataWrapper(indicesAndData + 1024, indicesAndData + allocatedSize);
                 dos->write(dataWrapper);
             }
         } else {
-            std::vector<uint8_t> wrapper(indicesAndData,
-                                         indicesAndData + allocatedSize);
+            std::vector<uint8_t> wrapper(indicesAndData, indicesAndData + allocatedSize);
             dos->write(wrapper);
         }
     }
@@ -1234,9 +836,6 @@ void CompressedTileStorage::write(DataOutputStream* dos) {
 void CompressedTileStorage::read(DataInputStream* dis) {
     allocatedSize = dis->readInt();
     if (allocatedSize > 0) {
-        // This delete should be safe to do in a non-thread safe way as the
-        // chunk is fully read before any external reference is available to it
-        // from another thread
         if (indicesAndData) {
             free(indicesAndData);
         }
@@ -1248,7 +847,6 @@ void CompressedTileStorage::read(DataInputStream* dis) {
         if (std::endian::native == std::endian::big) {
             reverseIndices(indicesAndData);
         }
-
         compress();
     }
 }
@@ -1257,5 +855,17 @@ void CompressedTileStorage::reverseIndices(unsigned char* indices) {
     unsigned short* blockIndices = (unsigned short*)indices;
     for (int i = 0; i < 512; i++) {
         System::ReverseUSHORT(&blockIndices[i]);
+    }
+}
+
+void CompressedTileStorage::copyTo(uint8_t* dst) {
+    if (isDirty || !unpackedCache) {
+        std::vector<uint8_t> dummy(32768);
+        getData(dummy, 0);
+    }
+    if (unpackedCache) {
+        memcpy(dst, unpackedCache, 32768);
+    } else {
+        memset(dst, 0, 32768);
     }
 }

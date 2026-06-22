@@ -222,160 +222,106 @@ void Chunk::makeCopyForRebuild(Chunk* source) {
         source->globalRenderableTileEntities_cs;
 }
 
-void Chunk::rebuild() {
-    //	if (!dirty) return;
 
+void Chunk::rebuild() {
+    //  if (!dirty) return;
+  
 #if defined(_LARGE_WORLDS)
     Tesselator* t = Tesselator::getInstance();
 #else
     Chunk::t = Tesselator::getInstance();  // 4J - added - static initialiser
                                            // being set at the wrong time
 #endif
-
+  
     updates++;
-
+  
     int x0 = x;
     int y0 = y;
     int z0 = z;
     int x1 = x + XZSIZE;
     int y1 = y + SIZE;
     int z1 = z + XZSIZE;
-
+  
     LevelChunk::touchedSky = false;
-
-    //	unordered_set<shared_ptr<TileEntity> >
-    // oldTileEntities(renderableTileEntities.begin(),renderableTileEntities.end());
-    //// 4J removed this & next line 	renderableTileEntities.clear();
-
-    std::vector<std::shared_ptr<TileEntity> >
-        renderableTileEntities;  // 4J - added
-
+  
+    std::vector<std::shared_ptr<TileEntity> > renderableTileEntities;  // 4J - added
+  
     int r = 1;
-
-    int lists = levelRenderer->getGlobalIndexForChunk(this->x, this->y, this->z,
-                                                      level) *
-                2;
+  
+    int lists = levelRenderer->getGlobalIndexForChunk(this->x, this->y, this->z, level) * 2;
     lists += levelRenderer->chunkLists;
-
+  
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-    // 4J - optimisation begins.
-
-    // Get the data for the level chunk that this render chunk is it (level
-    // chunk is 16 x 16 x 128, render chunk is 16 x 16 x 16. We wouldn't have to
-    // actually get all of it if the data was ordered differently, but currently
-    // it is ordered by x then z then y so just getting a small range of y out
-    // of it would involve getting the whole thing into the cache anyway.
-
+    // 4J - Optimización de Base de Datos (Fase 1)
+  
 #if defined(_LARGE_WORLDS)
     unsigned char* tileIds = GetTileIdsStorage();
 #else
     static unsigned char tileIds[16 * 16 * Level::maxBuildHeight];
 #endif
-    std::vector<uint8_t> tileArray(16 * 16 * Level::maxBuildHeight);
+  
+    // Copia instantánea desde el Shadow Buffer lineal
+    std::vector<uint8_t> tileArray(16 * 16 * Level::maxBuildHeight * 2); 
     level->getChunkAt(x, z)->getBlockData(tileArray);
-    memcpy(
-        tileIds, tileArray.data(),
-        16 * 16 * Level::maxBuildHeight);  // 4J - TODO - now our data has been
-                                           // re-arranged, we could just extra
-                                           // the vertical slice of this chunk
-                                           // rather than the whole thing
-
-    LevelSource* region =
-        new Region(level, x0 - r, y0 - r, z0 - r, x1 + r, y1 + r, z1 + r, r);
-    TileRenderer* tileRenderer =
-        new TileRenderer(region, this->x, this->y, this->z, tileIds);
-
-    // AP - added a caching system for Chunk::rebuild to take advantage of
-    // Basically we're storing of copy of the tileIDs array inside the region so
-    // that calls to Region::getTile can grab data more quickly from this array
-    // rather than calling CompressedTileStorage. On the Vita the total thread
-    // time spent in Region::getTile went from 20% to 4%.
-
-    // We now go through the vertical section of this level chunk that we are
-    // interested in and try and establish (1) if it is completely empty (2) if
-    // any of the tiles can be quickly determined to not need rendering because
-    // they are in the middle of other tiles and
-    //     so can't be seen. A large amount (> 60% in tests) of tiles that call
-    //     tesselateInWorld in the unoptimised version of this function fall
-    //     into this category. By far the largest category of these are tiles in
-    //     solid regions of rock.
+    memcpy(tileIds, tileArray.data(), 16 * 16 * Level::maxBuildHeight);
+  
+    LevelSource* region = new Region(level, x0 - r, y0 - r, z0 - r, x1 + r, y1 + r, z1 + r, r);
+    TileRenderer* tileRenderer = new TileRenderer(region, this->x, this->y, this->z, tileIds);
+  
+    // --- FAST CULLING PREPASS (Ahora corre en caché L1/L2) ---
     bool empty = true;
     {
         FRAME_PROFILE_SCOPE(ChunkPrepass);
         for (int yy = y0; yy < y1; yy++) {
             for (int zz = 0; zz < 16; zz++) {
                 for (int xx = 0; xx < 16; xx++) {
-                    // 4J Stu - tile data is ordered in 128 blocks of full
-                    // width, lower 128 then upper 128
                     int indexY = yy;
                     int offset = 0;
                     if (indexY >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT) {
                         indexY -= Level::COMPRESSED_CHUNK_SECTION_HEIGHT;
                         offset = Level::COMPRESSED_CHUNK_SECTION_TILES;
                     }
-
-                    unsigned char tileId =
-                        tileIds[offset + (((xx + 0) << 11) | ((zz + 0) << 7) |
-                                          (indexY + 0))];
+  
+                    unsigned char tileId = tileIds[offset + (((xx + 0) << 11) | ((zz + 0) << 7) | (indexY + 0))];
                     if (tileId > 0) empty = false;
-
-                    // Don't bother trying to work out neighbours for this tile
-                    // if we are at the edge of the chunk - apart from the very
-                    // bottom of the world where we shouldn't ever be able to
-                    // see
+  
                     if (yy == (Level::maxBuildHeight - 1)) continue;
                     if ((xx == 0) || (xx == 15)) continue;
                     if ((zz == 0) || (zz == 15)) continue;
-
-                    // Establish whether this tile and its neighbours are all
-                    // made of rock, dirt, unbreakable tiles, or have already
-                    // been determined to meet this criteria themselves and have
-                    // a tile of 255 set.
+  
+                    // Oclusión de caras internas (Cuevas/Subterráneo)
                     if (!((tileId == Tile::stone_Id) ||
                           (tileId == Tile::dirt_Id) ||
                           (tileId == Tile::unbreakable_Id) || (tileId == 255)))
                         continue;
-                    tileId = tileIds[offset + (((xx - 1) << 11) |
-                                               ((zz + 0) << 7) | (indexY + 0))];
+                    tileId = tileIds[offset + (((xx - 1) << 11) | ((zz + 0) << 7) | (indexY + 0))];
                     if (!((tileId == Tile::stone_Id) ||
                           (tileId == Tile::dirt_Id) ||
                           (tileId == Tile::unbreakable_Id) || (tileId == 255)))
                         continue;
-                    tileId = tileIds[offset + (((xx + 1) << 11) |
-                                               ((zz + 0) << 7) | (indexY + 0))];
+                    tileId = tileIds[offset + (((xx + 1) << 11) | ((zz + 0) << 7) | (indexY + 0))];
                     if (!((tileId == Tile::stone_Id) ||
                           (tileId == Tile::dirt_Id) ||
                           (tileId == Tile::unbreakable_Id) || (tileId == 255)))
                         continue;
-                    tileId = tileIds[offset + (((xx + 0) << 11) |
-                                               ((zz - 1) << 7) | (indexY + 0))];
+                    tileId = tileIds[offset + (((xx + 0) << 11) | ((zz - 1) << 7) | (indexY + 0))];
                     if (!((tileId == Tile::stone_Id) ||
                           (tileId == Tile::dirt_Id) ||
                           (tileId == Tile::unbreakable_Id) || (tileId == 255)))
                         continue;
-                    tileId = tileIds[offset + (((xx + 0) << 11) |
-                                               ((zz + 1) << 7) | (indexY + 0))];
+                    tileId = tileIds[offset + (((xx + 0) << 11) | ((zz + 1) << 7) | (indexY + 0))];
                     if (!((tileId == Tile::stone_Id) ||
                           (tileId == Tile::dirt_Id) ||
                           (tileId == Tile::unbreakable_Id) || (tileId == 255)))
                         continue;
-                    // Treat the bottom of the world differently - we shouldn't
-                    // ever be able to look up at this, so consider tiles as
-                    // invisible if they are surrounded on sides other than the
-                    // bottom
                     if (yy > 0) {
                         int indexYMinusOne = yy - 1;
                         int yMinusOneOffset = 0;
-                        if (indexYMinusOne >=
-                            Level::COMPRESSED_CHUNK_SECTION_HEIGHT) {
-                            indexYMinusOne -=
-                                Level::COMPRESSED_CHUNK_SECTION_HEIGHT;
-                            yMinusOneOffset =
-                                Level::COMPRESSED_CHUNK_SECTION_TILES;
+                        if (indexYMinusOne >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT) {
+                            indexYMinusOne -= Level::COMPRESSED_CHUNK_SECTION_HEIGHT;
+                            yMinusOneOffset = Level::COMPRESSED_CHUNK_SECTION_TILES;
                         }
-                        tileId = tileIds[yMinusOneOffset + (((xx + 0) << 11) |
-                                                            ((zz + 0) << 7) |
-                                                            indexYMinusOne)];
+                        tileId = tileIds[yMinusOneOffset + (((xx + 0) << 11) | ((zz + 0) << 7) | indexYMinusOne)];
                         if (!((tileId == Tile::stone_Id) ||
                               (tileId == Tile::dirt_Id) ||
                               (tileId == Tile::unbreakable_Id) ||
@@ -384,57 +330,45 @@ void Chunk::rebuild() {
                     }
                     int indexYPlusOne = yy + 1;
                     int yPlusOneOffset = 0;
-                    if (indexYPlusOne >=
-                        Level::COMPRESSED_CHUNK_SECTION_HEIGHT) {
+                    if (indexYPlusOne >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT) {
                         indexYPlusOne -= Level::COMPRESSED_CHUNK_SECTION_HEIGHT;
                         yPlusOneOffset = Level::COMPRESSED_CHUNK_SECTION_TILES;
                     }
-                    tileId = tileIds[yPlusOneOffset + (((xx + 0) << 11) |
-                                                       ((zz + 0) << 7) |
-                                                       indexYPlusOne)];
+                    tileId = tileIds[yPlusOneOffset + (((xx + 0) << 11) | ((zz + 0) << 7) | indexYPlusOne)];
                     if (!((tileId == Tile::stone_Id) ||
                           (tileId == Tile::dirt_Id) ||
                           (tileId == Tile::unbreakable_Id) || (tileId == 255)))
                         continue;
-
-                    // This tile is surrounded. Flag it as not requiring to be
-                    // rendered by setting its id to 255.
-                    tileIds[offset + (((xx + 0) << 11) | ((zz + 0) << 7) |
-                                      (indexY + 0))] = 0xff;
+  
+                    // Marcamos de forma segura en la copia local que el bloque está rodeado y no debe dibujarse
+                    tileIds[offset + (((xx + 0) << 11) | ((zz + 0) << 7) | (indexY + 0))] = 0xff;
                 }
             }
         }
     }
-
-    // Nothing at all to do for this chunk?
+  
     if (empty) {
-        // 4J - added - clear any renderer data associated with this
         for (int currentLayer = 0; currentLayer < 2; currentLayer++) {
             levelRenderer->setGlobalChunkFlag(this->x, this->y, this->z, level,
                                               LevelRenderer::CHUNK_FLAG_EMPTY0,
                                               currentLayer);
             PlatformRenderer.CBuffClear(lists + currentLayer);
         }
-
+  
 #ifdef OCCLUSION_MODE_BFS
-        int globalIdx = levelRenderer->getGlobalIndexForChunk(this->x, this->y,
-                                                              this->z, level);
+        int globalIdx = levelRenderer->getGlobalIndexForChunk(this->x, this->y, this->z, level);
         levelRenderer->setGlobalChunkConnectivity(globalIdx, ~0ULL);
         levelRenderer->setGlobalChunkFlag(this->x, this->y, this->z, level,
                                           LevelRenderer::CHUNK_FLAG_COMPILED);
 #endif
-
+  
         delete region;
         delete tileRenderer;
         return;
     }
-    // 4J - optimisation ends
-    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-    Tesselator::Bounds bounds;  // 4J MGH - added
+  
+    Tesselator::Bounds bounds;
     {
-        // this was the old default clip bounds for the chunk, set in
-        // Chunk::setPos.
         float g = 6.0f;
         bounds.boundingBox[0] = -g;
         bounds.boundingBox[1] = -g;
@@ -443,89 +377,69 @@ void Chunk::rebuild() {
         bounds.boundingBox[4] = SIZE + g;
         bounds.boundingBox[5] = XZSIZE + g;
     }
+  
     for (int currentLayer = 0; currentLayer < 2; currentLayer++) {
         bool renderNextLayer = false;
         bool rendered = false;
-
         bool started = false;
-
-        // 4J - changed loop order here to leave y as the innermost loop for
-        // better cache performance
+  
         for (int z = z0; z < z1; z++) {
             for (int x = x0; x < x1; x++) {
                 for (int y = y0; y < y1; y++) {
-                    // 4J Stu - tile data is ordered in 128 blocks of full
-                    // width, lower 128 then upper 128
                     int indexY = y;
                     int offset = 0;
                     if (indexY >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT) {
                         indexY -= Level::COMPRESSED_CHUNK_SECTION_HEIGHT;
                         offset = Level::COMPRESSED_CHUNK_SECTION_TILES;
                     }
-
-                    // 4J - get tile from those copied into our local array in
-                    // earlier optimisation
-                    unsigned char tileId =
-                        tileIds[offset +
-                                (((x - x0) << 11) | ((z - z0) << 7) | indexY)];
-                    // If flagged as not visible, drop out straight away
-                    if (tileId == 0xff) continue;
-                    //					int tileId =
-                    // region->getTile(x,y,z);
+  
+                    unsigned char tileId = tileIds[offset + (((x - x0) << 11) | ((z - z0) << 7) | indexY)];
+                    if (tileId == 0xff) continue; // Omitir bloques completamente ocultos
                     if (tileId > 0) {
                         if (!started) {
                             started = true;
-
                             glNewList(lists + currentLayer, GL_COMPILE);
-                            glDepthMask(true);            // 4J added
-                            t->useCompactVertices(true);  // 4J added
+                            glDepthMask(true);
+                            t->useCompactVertices(true);
                             t->begin();
-                            t->offset((float)(-this->x), (float)(-this->y),
-                                      (float)(-this->z));
+                            t->offset((float)(-this->x), (float)(-this->y), (float)(-this->z));
                         }
-
+  
                         Tile* tile = Tile::tiles[tileId];
                         if (currentLayer == 0 && tile->isEntityTile()) {
-                            std::shared_ptr<TileEntity> et =
-                                region->getTileEntity(x, y, z);
-                            if (TileEntityRenderDispatcher::instance
-                                    ->hasRenderer(et)) {
+                            std::shared_ptr<TileEntity> et = region->getTileEntity(x, y, z);
+                            if (TileEntityRenderDispatcher::instance->hasRenderer(et)) {
                                 renderableTileEntities.push_back(et);
                             }
                         }
                         int renderLayer = tile->getRenderLayer();
-
+  
                         if (renderLayer != currentLayer) {
                             renderNextLayer = true;
                         } else if (renderLayer == currentLayer) {
-                            rendered |=
-                                tileRenderer->tesselateInWorld(tile, x, y, z);
+                            rendered |= tileRenderer->tesselateInWorld(tile, x, y, z);
                         }
                     }
                 }
             }
         }
-
+  
         if (started) {
             t->end();
-            bounds.addBounds(t->bounds);  // 4J MGH - added
+            bounds.addBounds(t->bounds);
             glEndList();
-            t->useCompactVertices(false);  // 4J added
+            t->useCompactVertices(false);
             t->offset(0, 0, 0);
         } else {
             rendered = false;
         }
-
+  
         if (rendered) {
-            levelRenderer->clearGlobalChunkFlag(
-                this->x, this->y, this->z, level,
-                LevelRenderer::CHUNK_FLAG_EMPTY0, currentLayer);
+            levelRenderer->clearGlobalChunkFlag(this->x, this->y, this->z, level,
+                                                LevelRenderer::CHUNK_FLAG_EMPTY0, currentLayer);
         } else {
-            // 4J - added - clear any renderer data associated with this unused
-            // list
             levelRenderer->setGlobalChunkFlag(this->x, this->y, this->z, level,
-                                              LevelRenderer::CHUNK_FLAG_EMPTY0,
-                                              currentLayer);
+                                              LevelRenderer::CHUNK_FLAG_EMPTY0, currentLayer);
             PlatformRenderer.CBuffClear(lists + currentLayer);
         }
         if ((currentLayer == 0) && (!renderNextLayer)) {
@@ -535,45 +449,31 @@ void Chunk::rebuild() {
             break;
         }
     }
-
-    // 4J MGH - added this to take the bound from the value calc'd in the
-    // tesselator
+  
     bb = {bounds.boundingBox[0], bounds.boundingBox[1], bounds.boundingBox[2],
           bounds.boundingBox[3], bounds.boundingBox[4], bounds.boundingBox[5]};
-
+  
 #ifdef OCCLUSION_MODE_BFS
-    uint64_t conn = computeConnectivity(tileIds);  // pass tileIds
-    int globalIdx =
-        levelRenderer->getGlobalIndexForChunk(this->x, this->y, this->z, level);
+    uint64_t conn = computeConnectivity(tileIds);
+    int globalIdx = levelRenderer->getGlobalIndexForChunk(this->x, this->y, this->z, level);
     levelRenderer->setGlobalChunkConnectivity(globalIdx, conn);
 #endif
-
+  
     delete tileRenderer;
     delete region;
-
-    // 4J - have rewritten the way that tile entities are stored globally to
-    // make it work more easily with split screen. Chunks are now stored
-    // globally in the levelrenderer, in a hashmap with a special key made up
-    // from the dimension and chunk position (using same index as is used for
-    // global flags)
+  
     {
         std::lock_guard<std::mutex> lock(*globalRenderableTileEntities_cs);
         reconcileRenderableTileEntities(renderableTileEntities);
     }
-
-    // 4J - These removed items are now also removed from
-    // globalRenderableTileEntities
-
+  
     if (LevelChunk::touchedSky) {
-        levelRenderer->clearGlobalChunkFlag(
-            x, y, z, level, LevelRenderer::CHUNK_FLAG_NOTSKYLIT);
+        levelRenderer->clearGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_NOTSKYLIT);
     } else {
-        levelRenderer->setGlobalChunkFlag(x, y, z, level,
-                                          LevelRenderer::CHUNK_FLAG_NOTSKYLIT);
+        levelRenderer->setGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_NOTSKYLIT);
     }
-    levelRenderer->setGlobalChunkFlag(x, y, z, level,
-                                      LevelRenderer::CHUNK_FLAG_COMPILED);
-
+    levelRenderer->setGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_COMPILED);
+  
     return;
 }
 
