@@ -9,6 +9,8 @@
 #include "platform/network/NetTypes.h"
 #include "platform/thread/C4JThread.h"
 
+#include <atomic>
+
 class ClipChunk;
 class HitResult;
 class Icon;
@@ -330,7 +332,7 @@ public:
     unsigned char decGlobalChunkRefCount(int x, int y, int z, Level* level);
 
     // Actual storage for flags
-    unsigned char* globalChunkFlags;
+    std::atomic<unsigned char>* globalChunkFlags;
 
     // The flag definitions
     static const int CHUNK_FLAG_COMPILED = 0x01;

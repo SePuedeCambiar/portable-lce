@@ -222,8 +222,10 @@ LevelRenderer::LevelRenderer(Minecraft* mc, Textures* textures) {
         getGlobalChunkCount() *
         2);  // *2 here is because there is one renderlist per chunk here for
              // each of the opaque & transparent layers
-    globalChunkFlags = new unsigned char[getGlobalChunkCount()];
-    memset(globalChunkFlags, 0, getGlobalChunkCount());
+    globalChunkFlags = new std::atomic<unsigned char>[getGlobalChunkCount()];
+    for (int i = 0; i < getGlobalChunkCount(); i++) {
+    globalChunkFlags[i].store(0, std::memory_order_relaxed);
+    }
 
 #ifdef OCCLUSION_MODE_BFS
     globalChunkConnectivity = new uint64_t[getGlobalChunkCount()];
@@ -3704,51 +3706,35 @@ int LevelRenderer::getGlobalChunkCountForOverworld() {
             CHUNK_Y_COUNT);
 }
 
-unsigned char LevelRenderer::getGlobalChunkFlags(int x, int y, int z,
-                                                 Level* level) {
+unsigned char LevelRenderer::getGlobalChunkFlags(int x, int y, int z, Level* level) {
     int index = getGlobalIndexForChunk(x, y, z, level);
-    if (index == -1) {
-        return 0;
-    } else {
-        return globalChunkFlags[index];
+    if (index == -1) return 0;
+    return globalChunkFlags[index].load(std::memory_order_relaxed);
+}
+
+void LevelRenderer::setGlobalChunkFlag(int index, unsigned char flag, unsigned char shift) {
+    if (index != -1) {
+        unsigned char sflag = flag << shift;
+        // Operación atómica: OR bit a bit sin bloquear el hilo
+        globalChunkFlags[index].fetch_or(sflag, std::memory_order_relaxed);
     }
 }
 
-void LevelRenderer::setGlobalChunkFlags(int x, int y, int z, Level* level,
-                                        unsigned char flags) {
+void LevelRenderer::setGlobalChunkFlag(int x, int y, int z, Level* level, unsigned char flag, unsigned char shift) {
     int index = getGlobalIndexForChunk(x, y, z, level);
-    if (index != -1) {
-#if defined(_LARGE_WORLDS)
-        std::lock_guard<std::mutex> lock(m_csChunkFlags);
-#endif
-        globalChunkFlags[index] = flags;
-    }
+    setGlobalChunkFlag(index, flag, shift);
 }
 
-void LevelRenderer::setGlobalChunkFlag(int index, unsigned char flag,
-                                       unsigned char shift) {
-    unsigned char sflag = flag << shift;
 
-    if (index != -1) {
-#if defined(_LARGE_WORLDS)
-        std::lock_guard<std::mutex> lock(m_csChunkFlags);
-#endif
-        globalChunkFlags[index] |= sflag;
-    }
-}
-
-void LevelRenderer::setGlobalChunkFlag(int x, int y, int z, Level* level,
-                                       unsigned char flag,
-                                       unsigned char shift) {
-    unsigned char sflag = flag << shift;
+void LevelRenderer::clearGlobalChunkFlag(int x, int y, int z, Level* level, unsigned char flag, unsigned char shift) {
     int index = getGlobalIndexForChunk(x, y, z, level);
     if (index != -1) {
-#if defined(_LARGE_WORLDS)
-        std::lock_guard<std::mutex> lock(m_csChunkFlags);
-#endif
-        globalChunkFlags[index] |= sflag;
+        unsigned char sflag = flag << shift;
+        // Operación atómica: AND NOT para limpiar el bit
+        globalChunkFlags[index].fetch_and(~sflag, std::memory_order_relaxed);
     }
 }
+
 
 #ifdef OCCLUSION_MODE_BFS
 void LevelRenderer::setGlobalChunkConnectivity(int index, uint64_t conn) {
@@ -3765,64 +3751,54 @@ uint64_t LevelRenderer::getGlobalChunkConnectivity(int index) {
 }
 #endif
 
-void LevelRenderer::clearGlobalChunkFlag(int x, int y, int z, Level* level,
-                                         unsigned char flag,
-                                         unsigned char shift) {
-    unsigned char sflag = flag << shift;
+
+
+bool LevelRenderer::getGlobalChunkFlag(int x, int y, int z, Level* level, unsigned char flag, unsigned char shift) {
     int index = getGlobalIndexForChunk(x, y, z, level);
-    if (index != -1) {
-#if defined(_LARGE_WORLDS)
-        std::lock_guard<std::mutex> lock(m_csChunkFlags);
-#endif
-        globalChunkFlags[index] &= ~sflag;
-    }
+    if (index == -1) return false;
+    
+    unsigned char sflag = flag << shift;
+    // Lectura atómica simple
+    return (globalChunkFlags[index].load(std::memory_order_relaxed) & sflag) == sflag;
 }
 
-bool LevelRenderer::getGlobalChunkFlag(int x, int y, int z, Level* level,
-                                       unsigned char flag,
-                                       unsigned char shift) {
-    unsigned char sflag = flag << shift;
-    int index = getGlobalIndexForChunk(x, y, z, level);
-    if (index == -1) {
-        return false;
-    } else {
-        return (globalChunkFlags[index] & sflag) == sflag;
-    }
-}
 
-unsigned char LevelRenderer::incGlobalChunkRefCount(int x, int y, int z,
-                                                    Level* level) {
+unsigned char LevelRenderer::incGlobalChunkRefCount(int x, int y, int z, Level* level) {
     int index = getGlobalIndexForChunk(x, y, z, level);
-    if (index != -1) {
-        unsigned char flags = globalChunkFlags[index];
-        unsigned char refCount =
-            (flags >> CHUNK_FLAG_REF_SHIFT) & CHUNK_FLAG_REF_MASK;
+    if (index == -1) return 0;
+
+    unsigned char current = globalChunkFlags[index].load(std::memory_order_relaxed);
+    unsigned char next;
+    do {
+        unsigned char refCount = (current >> CHUNK_FLAG_REF_SHIFT) & CHUNK_FLAG_REF_MASK;
         refCount++;
-        flags &= ~(CHUNK_FLAG_REF_MASK << CHUNK_FLAG_REF_SHIFT);
-        flags |= refCount << CHUNK_FLAG_REF_SHIFT;
-        globalChunkFlags[index] = flags;
-
-        return refCount;
-    } else {
-        return 0;
-    }
+        next = (current & ~(CHUNK_FLAG_REF_MASK << CHUNK_FLAG_REF_SHIFT)) | (refCount << CHUNK_FLAG_REF_SHIFT);
+    } while (!globalChunkFlags[index].compare_exchange_weak(current, next, std::memory_order_relaxed));
+    
+    return (next >> CHUNK_FLAG_REF_SHIFT) & CHUNK_FLAG_REF_MASK;
 }
 
-unsigned char LevelRenderer::decGlobalChunkRefCount(int x, int y, int z,
-                                                    Level* level) {
+unsigned char LevelRenderer::decGlobalChunkRefCount(int x, int y, int z, Level* level) {
+    int index = getGlobalIndexForChunk(x, y, z, level);
+    if (index == -1) return 0;
+
+    unsigned char current = globalChunkFlags[index].load(std::memory_order_relaxed);
+    unsigned char next;
+    do {
+        unsigned char refCount = (current >> CHUNK_FLAG_REF_SHIFT) & CHUNK_FLAG_REF_MASK;
+        if (refCount == 0) return 0;
+        refCount--;
+        next = (current & ~(CHUNK_FLAG_REF_MASK << CHUNK_FLAG_REF_SHIFT)) | (refCount << CHUNK_FLAG_REF_SHIFT);
+    } while (!globalChunkFlags[index].compare_exchange_weak(current, next, std::memory_order_relaxed));
+    
+    return (next >> CHUNK_FLAG_REF_SHIFT) & CHUNK_FLAG_REF_MASK;
+}
+
+void LevelRenderer::setGlobalChunkFlags(int x, int y, int z, Level* level, unsigned char flags) {
     int index = getGlobalIndexForChunk(x, y, z, level);
     if (index != -1) {
-        unsigned char flags = globalChunkFlags[index];
-        unsigned char refCount =
-            (flags >> CHUNK_FLAG_REF_SHIFT) & CHUNK_FLAG_REF_MASK;
-        refCount--;
-        flags &= ~(CHUNK_FLAG_REF_MASK << CHUNK_FLAG_REF_SHIFT);
-        flags |= refCount << CHUNK_FLAG_REF_SHIFT;
-        globalChunkFlags[index] = flags;
-
-        return refCount;
-    } else {
-        return 0;
+        // Usamos .store() para escribir el valor completo del byte de forma atómica
+        globalChunkFlags[index].store(flags, std::memory_order_relaxed);
     }
 }
 
