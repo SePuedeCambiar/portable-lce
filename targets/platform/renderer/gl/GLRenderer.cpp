@@ -54,6 +54,9 @@
 #include "app/common/Iggy/include/gdraw.h"
 #include "minecraft/util/Log.h"
 
+static GLuint s_globalEBO = 0;
+// Capacidad máxima de vértices por sección de renderizado (Soporta hasta 65,536 Quads)
+static const int MAX_GLOBAL_VERTICES = 262144;
 
 // Contadores globales de diagnóstico
 static std::atomic<int> g_vboCount{0};
@@ -528,8 +531,8 @@ struct ChunkDrawCall {
     GLenum prim;
     GLint first;
     GLsizei count;
+    bool wasQuad; // NUEVO: Flag para saber si se renderiza con Index Buffer o directo
 };
-
 struct ChunkBuffer {
     GLuint vbo = 0;
     GLuint vao = 0;
@@ -538,11 +541,9 @@ struct ChunkBuffer {
     bool valid = false;
     bool vboReady = false;
     Uint32 lastUsedFrame = 0; // Registro temporal para la Válvula de Seguridad
-
     ChunkBuffer() {
         lastUsedFrame = SDL_GetTicks();
     }
-
     void destroy() {
         if (vbo) {
             glDeleteBuffers(1, &vbo);
@@ -560,19 +561,15 @@ struct ChunkBuffer {
         vboReady = false;
     }
 };
-
 static std::unordered_map<int, ChunkBuffer> s_chunkPool;
 static int s_nextListBase = 1;
-
 // Cola segura para liberar memoria OpenGL diferida en el hilo principal
 static std::vector<ChunkBuffer> s_pendingDestructions;
 static std::mutex s_destructionMtx;
-
 // Per-thread recording state
 static thread_local int s_recListId = -1;
 static thread_local std::vector<uint8_t> s_recVerts;
 static thread_local std::vector<ChunkDrawCall> s_recDraws;
-
 // Primitive helpers
 static bool isQuadPrim(int pt) {
     return (pt == 0x0007 /*GL_QUADS*/ ||
@@ -663,6 +660,26 @@ void GLRenderer::Initialise() {
     glViewport(0, 0, s_windowWidth, s_windowHeight);
     s_shader.build(VERT_SRC, FRAG_SRC);
     initStreamingVAOs();
+    // ------------------------------------------------------------------------
+    // NUEVO: Inicialización del EBO Global (Index Buffer para Quads)
+    // ------------------------------------------------------------------------
+    std::vector<GLuint> indices;
+    indices.reserve((MAX_GLOBAL_VERTICES / 4) * 6);
+    for (int i = 0; i < MAX_GLOBAL_VERTICES / 4; ++i) {
+        GLuint base = i * 4;
+        indices.push_back(base + 0);
+        indices.push_back(base + 1);
+        indices.push_back(base + 2);
+        indices.push_back(base + 0);
+        indices.push_back(base + 2);
+        indices.push_back(base + 3);
+    }
+    glGenBuffers(1, &s_globalEBO);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_globalEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(GLuint), indices.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    Log::info("RenderRenderer: EBO Estático Global generado con éxito (%zu índices).\n", indices.size());
+    // ------------------------------------------------------------------------
     s_mainThreadId = std::this_thread::get_id();
     s_mainThreadSet = true;
     s_glCtx = s_glContext;
@@ -690,7 +707,6 @@ void GLRenderer::Initialise() {
     SDL_GL_SetSwapInterval(0);
 #endif
 }
-
 void GLRenderer::InitialiseContext() {
     if (!s_window) return;
     if (s_mainThreadSet && std::this_thread::get_id() == s_mainThreadId) {
@@ -720,7 +736,6 @@ void GLRenderer::InitialiseContext() {
     }
     s_glCtx = shared;
 }
-
 void GLRenderer::StartFrame() {
     Set_matrixDirty();
     int w, h;
@@ -729,7 +744,6 @@ void GLRenderer::StartFrame() {
     s_windowHeight = h > 0 ? h : 1;
     glViewport(0, 0, s_windowWidth, s_windowHeight);
 }
-
 // NUEVA FUNCIÓN PRESENT DE ALTA SEGURIDAD
 void GLRenderer::Present() {
     // 1. Procesar la cola diferida de destrucciones en el hilo de renderizado principal (Thread-safe)
@@ -747,11 +761,9 @@ void GLRenderer::Present() {
             cb.destroy();
         }
     }
-
-    // [VÁLVULA DE SEGURIDAD ELIMINADA] 
+    // [VÁLVULA DE SEGURIDAD ELIMINADA]
     // Dejamos que el motor del juego gestione el ciclo de vida de los chunks.
     // Esto soluciona el bug de los chunks transparentes de forma definitiva.
-
     if (!s_window) return;
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
@@ -763,14 +775,11 @@ void GLRenderer::Present() {
             onFramebufferResize(ev.window.data1, ev.window.data2);
     }
     glFlush();
-
     // Imprimir el uso real de recursos para monitorear
     printf("GPU Resources -> VBOs: %d | VAOs: %d | Texs: %d | Pool: %zu\n",
            g_vboCount.load(), g_vaoCount.load(), g_texCount.load(), s_chunkPool.size());
-
     SDL_GL_SwapWindow(s_window);
 }
-
 void GLRenderer::SetWindowSize(int w, int h) {
     s_reqWidth = w;
     s_reqHeight = h;
@@ -782,7 +791,6 @@ void GLRenderer::GetFramebufferSize(int& w, int& h) {
     h = s_windowHeight;
 }
 void GLRenderer::Close() { s_window = nullptr; }
-
 void GLRenderer::Shutdown() {
     {
         std::lock_guard<std::mutex> lk(s_glCallMtx);
@@ -806,19 +814,20 @@ void GLRenderer::Shutdown() {
     }
     SDL_Quit();
 }
-
 // PIPELINE DE DIBUJO ORIGINAL INTEGRAL (Garantiza entidades visibles)
-void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn,
-                              eVertexType vType, ePixelShaderType) {
+void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVertexType vType, ePixelShaderType psType) {
     if (count <= 0 || !dataIn) return;
     bool wasQuad = isQuadPrim((int)ptype);
+    
+    size_t stride = 32; // Stride estándar de 32 bytes para el formato de vértices
+    size_t bytes = (size_t)count * stride;
     GLenum glMode = mapPrim((int)ptype);
+    
+    // --- CONVERSIÓN DE VÉRTICES COMPRIMIDOS (Si vienen en formato de 360) ---
     static thread_local std::vector<uint8_t> stdData;
-    static thread_local std::vector<uint8_t> triData;
     stdData.clear();
-    triData.clear();
     if (vType == VERTEX_TYPE_COMPRESSED) {
-        stdData.resize((size_t)count * 32);
+        stdData.resize((size_t)count * stride);
         const int16_t* src = (const int16_t*)dataIn;
         uint8_t* dst = stdData.data();
         for (int i = 0; i < count; i++) {
@@ -849,7 +858,21 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn,
         }
         dataIn = stdData.data();
     }
-    static const size_t stride = 32;
+
+    // ------------------------------------------------------------------------
+    // NUEVO: Grabador diferido (Hilo de reconstrucción de Chunks de fondo)
+    // Guardamos los Quads directos sin duplicar en RAM del CPU.
+    // ------------------------------------------------------------------------
+    if (s_recListId >= 0) {
+        int first = (int)(s_recVerts.size() / stride);
+        s_recVerts.insert(s_recVerts.end(), (const uint8_t*)dataIn,
+                          (const uint8_t*)dataIn + bytes);
+        s_recDraws.push_back({glMode, first, (GLsizei)count, wasQuad});
+        return;
+    }
+
+    // --- PIPELINE INMEDIATO (Menus, HUD, Entidades, Mobs) ---
+    std::vector<uint8_t> triData;
     if (wasQuad) {
         int numQuads = count / 4;
         int triVerts = numQuads * 6;
@@ -872,14 +895,7 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn,
         dataIn = triData.data();
         count = triVerts;
         glMode = GL_TRIANGLES;
-    }
-    size_t bytes = (size_t)count * stride;
-    if (s_recListId >= 0) {
-        int first = (int)(s_recVerts.size() / stride);
-        s_recVerts.insert(s_recVerts.end(), (const uint8_t*)dataIn,
-                          (const uint8_t*)dataIn + bytes);
-        s_recDraws.push_back({glMode, first, (GLsizei)count});
-        return;
+        bytes = (size_t)count * stride;
     }
     std::lock_guard<std::mutex> lk(s_glCallMtx);
     pushRenderState();
@@ -892,20 +908,17 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn,
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
-
 void GLRenderer::ReadPixels(int x, int y, int w, int h, void* buf) {
     if (!buf) return;
     std::lock_guard<std::mutex> lk(s_glCallMtx);
     glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf);
 }
-
 int GLRenderer::CBuffCreate(int count) {
     std::lock_guard<std::mutex> lk(s_glCallMtx);
     int b = s_nextListBase;
     s_nextListBase += count;
     return b;
 }
-
 // BORRADO DIFERIDO THREAD-SAFE
 void GLRenderer::CBuffDelete(int first, int count) {
     std::lock_guard<std::mutex> lk(s_glCallMtx);
@@ -920,7 +933,6 @@ void GLRenderer::CBuffDelete(int first, int count) {
         }
     }
 }
-
 void GLRenderer::CBuffDeleteAll() {
     std::lock_guard<std::mutex> lk(s_glCallMtx);
     for (auto& kv : s_chunkPool) {
@@ -930,13 +942,11 @@ void GLRenderer::CBuffDeleteAll() {
     s_chunkPool.clear();
     s_nextListBase = 1;
 }
-
 void GLRenderer::CBuffStart(int index, bool) {
     s_recListId = index;
     s_recVerts.clear();
     s_recDraws.clear();
 }
-
 void GLRenderer::CBuffEnd() {
     if (s_recListId < 0) return;
     std::lock_guard<std::mutex> lk(s_glCallMtx);
@@ -959,7 +969,6 @@ void GLRenderer::CBuffEnd() {
     s_chunkPool[s_recListId] = std::move(newCb);
     s_recListId = -1;
 }
-
 // BORRADO DIFERIDO THREAD-SAFE EN CLEAR
 void GLRenderer::CBuffClear(int index) {
     std::lock_guard<std::mutex> lk(s_glCallMtx);
@@ -972,7 +981,6 @@ void GLRenderer::CBuffClear(int index) {
         s_chunkPool.erase(it);
     }
 }
-
 bool GLRenderer::CBuffCall(int index, bool) {
     std::lock_guard<std::mutex> lk(s_glCallMtx);
     auto it = s_chunkPool.find(index);
@@ -980,8 +988,7 @@ bool GLRenderer::CBuffCall(int index, bool) {
         return false;
     }
     ChunkBuffer& cb = it->second;
-    cb.lastUsedFrame = SDL_GetTicks(); // Refrescar timer para evitar que la Panic Valve lo borre
-
+    cb.lastUsedFrame = SDL_GetTicks();
     if (!cb.vboReady) {
         if (cb.rawVerts.empty()) {
             return false;
@@ -990,7 +997,6 @@ bool GLRenderer::CBuffCall(int index, bool) {
         glGenBuffers(1, &cb.vbo);
         g_vaoCount++;
         g_vboCount++;
-
         glBindVertexArray(cb.vao);
         glBindBuffer(GL_ARRAY_BUFFER, cb.vbo);
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)cb.rawVerts.size(),
@@ -1004,11 +1010,28 @@ bool GLRenderer::CBuffCall(int index, bool) {
     }
     pushRenderState();
     glBindVertexArray(cb.vao);
-    for (const auto& dc : cb.draws) glDrawArrays(dc.prim, dc.first, dc.count);
+    // =================================================================================
+    // NUEVA ESTRATEGIA DE RENDERIZADO:
+    // Hacemos el binding del EBO (Buffer de Índices) si el primitivo es un Quad/Triángulo.
+    // Esto es procesado a nivel de hardware puro directamente en la GPU.
+    // =================================================================================
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_globalEBO);
+    for (const auto& dc : cb.draws) {
+        if (dc.wasQuad) {
+            // El número de triángulos a dIbujar es (Vértices / 4) * 6
+            GLsizei indexCount = (dc.count / 4) * 6;
+            // Usamos glDrawElementsBaseVertex para no tener que regenerar índices locales
+            glDrawElementsBaseVertex(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, (void*)0, dc.first);
+        } else {
+            glDrawArrays(dc.prim, dc.first, dc.count);
+        }
+    }
+    // HIGIENE DE ESTADO CRÍTICA PARA IGGY / GDRAW:
+    // Desvincular el EBO dentro de nuestro VAO para que no contamine el VAO 0
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     glBindVertexArray(0);
     return true;
 }
-
 void GLRenderer::MatrixMode(int t) {
     if (t == GL_PROJECTION)
         s_matMode = 1;
@@ -1247,7 +1270,6 @@ void GLRenderer::StateSetTextureEnable(bool e) {
 void GLRenderer::StateSetActiveTexture(int tex) {
     s_rs.activeTexture = (tex == 0x84C1 /*GL_TEXTURE1*/) ? 1 : 0;
 }
-
 // TEXTURE TRACKING IN STANDARD CREATOR
 int GLRenderer::TextureCreate() {
     GLuint id;
@@ -1260,7 +1282,6 @@ void GLRenderer::TextureFree(int i) {
     glDeleteTextures(1, &id);
     g_texCount--;
 }
-
 void GLRenderer::TextureBind(int idx) {
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, idx < 0 ? 0 : (GLuint)idx);
@@ -1358,7 +1379,6 @@ void GLRenderer::UpdateGamma(unsigned short usGamma) {
     constexpr unsigned short GAMMA_MAX = 32768;
     s_rs.gamma = 0.5f + ((float)(usGamma) * (1.0f / GAMMA_MAX));
 }
-
 // HELPER FUNCTIONS (DECLARADAS ARRIBA PARA EVITAR SCOPE ERRORS)
 inline int* getIntPtr(IntBuffer* buf) {
     return buf ? (int*)buf->getBuffer() + buf->position() : nullptr;
@@ -1366,7 +1386,6 @@ inline int* getIntPtr(IntBuffer* buf) {
 inline void* getBytePtr(ByteBuffer* buf) {
     return buf ? (char*)buf->getBuffer() + buf->position() : nullptr;
 }
-
 // MARK: C hooks (CON CONTADOR DE TEXTURAS CORREGIDO)
 int glGenTextures_4J() {
     GLuint id = 0;
@@ -1387,7 +1406,6 @@ void glDeleteTextures_4J(int n, const unsigned int* textures) {
     ::glDeleteTextures(n, textures);
     g_texCount -= n;
 }
-
 // MARK: LinuxStubs
 #ifdef GLES
 extern "C" {
@@ -1403,7 +1421,6 @@ void glEndList(void) {}
 void glCallLists(int, unsigned int, const void*) {}
 }
 #endif
-
 void glGenTextures_4J(IntBuffer* buf) {
     if (!buf) return;
     int n = buf->limit() - buf->position();
@@ -1470,11 +1487,9 @@ void glColorPointer_4J(int, bool, int, ByteBuffer*) {}
 void glVertexPointer_4J(int, int, FloatBuffer*) {}
 void glEndList_4J(int) {}
 void glTexGen_4J(int, int, FloatBuffer*) {}
-
 void glGetFloat(int pname, FloatBuffer* params) {
     glGetFloat_4J(pname, params);
 }
-
 void GLRenderer::flushIggyCache() {
     // Llamamos al puente de Iggy para limpiar la caché de texturas de la UI
     Iggy_FlushCache();

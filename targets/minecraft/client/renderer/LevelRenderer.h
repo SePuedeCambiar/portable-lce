@@ -10,6 +10,7 @@
 #include "platform/thread/C4JThread.h"
 
 #include <atomic>
+#include <shared_mutex>
 
 class ClipChunk;
 class HitResult;
@@ -182,7 +183,7 @@ private:
     typedef std::unordered_map<int, rtePendingRemovalSet, IntKeyHash, IntKeyEq>
         rtePendingRemovalMap;
     rtePendingRemovalMap m_renderableTileEntitiesPendingRemoval;
-    std::mutex m_csRenderableTileEntities;
+    std::shared_mutex m_csRenderableTileEntities; 
     MultiPlayerLevel* level[4];  // 4J - now one per player
     Textures* textures;
     //    std::vector<Chunk *> *sortedChunks[4];	// 4J - removed - not
@@ -237,7 +238,7 @@ private:
 public:
     void fullyFlagRenderableTileEntitiesToBeRemoved();  // 4J added
 
-    std::recursive_mutex m_csDirtyChunks;
+    std::shared_mutex m_csDirtyChunks; 
     bool m_nearDirtyChunk;
 
     // 4J - Destroyed Tile Management - these things added so we can track tiles

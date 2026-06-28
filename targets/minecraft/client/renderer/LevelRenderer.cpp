@@ -449,7 +449,7 @@ void LevelRenderer::setLevel(int playerIndex, MultiPlayerLevel* level) {
         if (playerIndex == PlatformInput.GetPrimaryPad()) {
             PlatformRenderer.CBuffDeleteAll();
             {
-                std::lock_guard<std::mutex> lock(m_csRenderableTileEntities);
+                std::unique_lock<std::shared_mutex> lock(m_csRenderableTileEntities);
                 renderableTileEntities.clear();
                 m_renderableTileEntitiesPendingRemoval.clear();
             }
@@ -648,10 +648,6 @@ void LevelRenderer::renderEntities(Vec3* cam, Culler* culler, float a) {
         }
 
         if (shouldRender) {
-            // 4J-PB - changing this to be per player
-            // if (entity == mc->cameraTargetPlayer &&
-            // !mc->options->thirdPersonView &&
-            // !mc->cameraTargetPlayer->isSleeping()) continue;
             std::shared_ptr<LocalPlayer> localplayer =
                 mc->cameraTargetPlayer->instanceof(eTYPE_LOCALPLAYER)
                     ? std::dynamic_pointer_cast<LocalPlayer>(
@@ -673,15 +669,19 @@ void LevelRenderer::renderEntities(Vec3* cam, Culler* culler, float a) {
     }
 
     Lighting::turnOn();
-    // 4J - have restructed this so that the tile entities are stored within a
-    // hashmap by chunk/dimension index. The index is calculated in the same way
-    // as the global flags.
+
+    // ============================================================================
+    // CAMBIO FASE B: Optimización de Lectura de Tile Entities
+    // ============================================================================
     {
-        std::lock_guard<std::mutex> lock(m_csRenderableTileEntities);
+        // Sustituimos std::lock_guard<std::mutex> por std::shared_lock<std::shared_mutex>
+        // Esto permite que el renderizado no bloquee a otros hilos que solo quieran leer,
+        // y que el hilo principal no se detenga si otro hilo está leyendo la lista.
+        std::shared_lock<std::shared_mutex> lock(m_csRenderableTileEntities);
+        
         for (auto it = renderableTileEntities.begin();
              it != renderableTileEntities.end(); it++) {
             int idx = it->first;
-            // Don't render if it isn't in the same dimension as this player
             if (!isGlobalIndexInSameDimension(idx, level[playerIndex]))
                 continue;
 
@@ -691,6 +691,7 @@ void LevelRenderer::renderEntities(Vec3* cam, Culler* culler, float a) {
             }
         }
     }
+    // ============================================================================
 
     mc->gameRenderer->turnOffLightLayer(a);  // 4J - brought forward from 1.8.2
 }
@@ -711,10 +712,14 @@ std::string LevelRenderer::gatherStats2() {
 }
 
 void LevelRenderer::resortChunks(int xc, int yc, int zc) {
-    std::lock_guard<std::recursive_mutex> lock(m_csDirtyChunks);
+    // Usamos unique_lock porque estamos modificando la estructura de coordenadas
+    // de todos los chunks. Nadie puede leer ni escribir mientras hacemos esto.
+    std::unique_lock<std::shared_mutex> lock(m_csDirtyChunks);
+
     xc -= CHUNK_XZSIZE / 2;
     yc -= CHUNK_SIZE / 2;
     zc -= CHUNK_XZSIZE / 2;
+    
     xMinChunk = INT_MAX;
     yMinChunk = INT_MAX;
     zMinChunk = INT_MAX;
@@ -722,14 +727,13 @@ void LevelRenderer::resortChunks(int xc, int yc, int zc) {
     yMaxChunk = INT_MIN;
     zMaxChunk = INT_MIN;
 
-    int playerIndex = mc->player->GetXboxPad();  // 4J added
+    int playerIndex = mc->player->GetXboxPad();
 
     int s2 = xChunks * CHUNK_XZSIZE;
     int s1 = s2 / 2;
 
     for (int x = 0; x < xChunks; x++) {
         int xx = x * CHUNK_XZSIZE;
-
         int xOff = (xx + s1 - xc);
         if (xOff < 0) xOff -= (s2 - 1);
         xOff /= s2;
@@ -753,9 +757,11 @@ void LevelRenderer::resortChunks(int xc, int yc, int zc) {
                 if (yy < yMinChunk) yMinChunk = yy;
                 if (yy > yMaxChunk) yMaxChunk = yy;
 
-                Chunk* chunk =
-                    chunks[playerIndex][(z * yChunks + y) * xChunks + x].chunk;
-                chunk->setPos(xx, yy, zz);
+                Chunk* chunk = chunks[playerIndex][(z * yChunks + y) * xChunks + x].chunk;
+                
+                // --- CAMBIO CRÍTICO ---
+                // Llamamos a la versión INTERNAL para evitar el Deadlock
+                chunk->setPos_Internal(xx, yy, zz); 
             }
         }
     }
@@ -1719,29 +1725,23 @@ void LevelRenderer::renderAdvancedClouds(float alpha) {
 bool LevelRenderer::updateDirtyChunks() {
 #if defined(_LARGE_WORLDS)
     struct NearestClipChunkSet {
-        std::array<std::pair<ClipChunk*, int>, MAX_CONCURRENT_CHUNK_REBUILDS>
-            items;
+        std::array<std::pair<ClipChunk*, int>, MAX_CONCURRENT_CHUNK_REBUILDS> items;
         int count = 0;
-
         bool empty() const noexcept { return count == 0; }
         int size() const noexcept { return count; }
-
         bool wouldAccept(int distSqWeighted) const noexcept {
             return (count < MAX_CONCURRENT_CHUNK_REBUILDS) ||
                    (distSqWeighted < items[count - 1].second);
         }
-
         void insert(ClipChunk* chunk, int distSqWeighted) noexcept {
             int pos = 0;
             while ((pos < count) && (items[pos].second <= distSqWeighted)) {
                 ++pos;
             }
-
             if ((count == MAX_CONCURRENT_CHUNK_REBUILDS) &&
                 (pos >= MAX_CONCURRENT_CHUNK_REBUILDS)) {
                 return;
             }
-
             const int newCount = (count < MAX_CONCURRENT_CHUNK_REBUILDS)
                                      ? (count + 1)
                                      : MAX_CONCURRENT_CHUNK_REBUILDS;
@@ -1754,45 +1754,31 @@ bool LevelRenderer::updateDirtyChunks() {
     } nearestClipChunks;
 #endif
 
-    ClipChunk* nearChunk = nullptr;  // Nearest chunk that is dirty
+    ClipChunk* nearChunk = nullptr;  
     int veryNearCount = 0;
-    int minDistSq = 0x7fffffff;  // Distances to this chunk
-    std::unique_lock<std::recursive_mutex> dirtyChunksLock(m_csDirtyChunks);
+    int minDistSq = 0x7fffffff;
 
-    // Set a flag if we should only rebuild existing chunks, not create anything
-    // new
+    // =================================================================================
+    // CAMBIO FASE B: Usamos shared_lock para el escaneo. 
+    // Esto permite que otros hilos llamen a setDirty() o lean datos simultáneamente.
+    // =================================================================================
+    std::shared_lock<std::shared_mutex> dirtyChunksLock(m_csDirtyChunks);
+
     {
         FRAME_PROFILE_SCOPE(ChunkDirtyScan);
-
         unsigned int memAlloc = PlatformRenderer.CBuffSize(-1);
-        /*
-        static int throttle = 0;
-        if( ( throttle % 100 ) == 0 )
-        {
-        Log::info("CBuffSize: %d\n",memAlloc/(1024*1024));
-        }
-        throttle++;
-        */
         bool onlyRebuild = (memAlloc >= MAX_COMMANDBUFFER_ALLOCATIONS);
 
-        // Move any dirty chunks stored in the lock free stack into global flags
         int index = 0;
-
         do {
-            // See comment on dirtyChunksLockFreeStack.Push() regarding details
-            // of this casting/subtracting -2.
             index = (size_t)dirtyChunksLockFreeStack.Pop();
 #ifdef _CRITICAL_CHUNKS
             int oldIndex = index;
-            index &= 0x0fffffff;  // remove the top bit that marked the chunk as
-                                  // non-critical
+            index &= 0x0fffffff;
 #endif
-            if (index == 1)
-                dirtyChunkPresent =
-                    true;  // 1 is a special value passed to let this thread
-                           // know that a chunk which isn't on this stack has
-                           // been set to dirty
-            else if (index > 1) {
+            if (index == 1) {
+                dirtyChunkPresent = true;
+            } else if (index > 1) {
                 int i2 = index - 2;
                 if (i2 >= DIMENSION_OFFSETS[2]) {
                     i2 -= DIMENSION_OFFSETS[2];
@@ -1803,160 +1789,78 @@ bool LevelRenderer::updateDirtyChunks() {
                     x2 -= MAX_LEVEL_RENDER_SIZE[2] / 2;
                     z2 -= MAX_LEVEL_RENDER_SIZE[2] / 2;
                 }
+                // Estas llamadas son atómicas, NO necesitan unique_lock
                 setGlobalChunkFlag(index - 2, CHUNK_FLAG_DIRTY);
-
 #ifdef _CRITICAL_CHUNKS
-                if (!(oldIndex &
-                      0x10000000))  // was this chunk not marked as
-                                    // non-critical. Ugh double negatives
-                {
+                if (!(oldIndex & 0x10000000)) {
                     setGlobalChunkFlag(index - 2, CHUNK_FLAG_CRITICAL);
                 }
 #endif
-
                 dirtyChunkPresent = true;
             }
         } while (index);
 
-        // Only bother searching round all the chunks if we have some dirty
-        // chunk(s)
         if (dirtyChunkPresent) {
             lastDirtyChunkFound = System::currentTimeMillis();
-
-            // Find nearest chunk that is dirty
             for (int p = 0; p < XUSER_MAX_COUNT; p++) {
-                // It's possible that the localplayers member can be set to
-                // nullptr on the main thread when a player chooses to exit the
-                // game So take a reference to the player object now. As it is a
-                // shared_ptr it should live as long as we need it
                 std::shared_ptr<LocalPlayer> player = mc->localplayers[p];
                 if (player == nullptr) continue;
                 if (chunks[p].empty()) continue;
                 if (level[p] == nullptr) continue;
-                if (chunks[p].size() != xChunks * zChunks * CHUNK_Y_COUNT)
+                if (chunks[p].size() != (size_t)(xChunks * zChunks * CHUNK_Y_COUNT))
                     continue;
+                
                 int px = (int)player->x;
                 int py = (int)player->y;
                 int pz = (int)player->z;
 
-                //			Log::info("!! %d %d %d, %d %d %d
-                //{%d,%d}
-                //",px,py,pz,stackChunkDirty,nonStackChunkDirty,onlyRebuild,
-                // xChunks, zChunks);
-
-                int considered = 0;
-                int wouldBeNearButEmpty = 0;
                 for (int x = 0; x < xChunks; x++) {
                     for (int z = 0; z < zChunks; z++) {
                         for (int y = 0; y < CHUNK_Y_COUNT; y++) {
-                            ClipChunk* pClipChunk =
-                                &chunks[p][(z * yChunks + y) * xChunks + x];
-                            // Get distance to this chunk - deliberately not
-                            // calling the chunk's method of doing this to avoid
-                            // overheads (passing entitie, type conversion etc.)
-                            // that this involves
+                            ClipChunk* pClipChunk = &chunks[p][(z * CHUNK_Y_COUNT + y) * xChunks + x];
                             int xd = pClipChunk->xm - px;
                             int yd = pClipChunk->ym - py;
                             int zd = pClipChunk->zm - pz;
                             int distSq = xd * xd + yd * yd + zd * zd;
-                            int distSqWeighted =
-                                xd * xd + yd * yd * 4 +
-                                zd * zd;  // Weighting against y to prioritise
-                                          // things in same x/z plane as player
-                                          // first
+                            int distSqWeighted = xd * xd + yd * yd * 4 + zd * zd;
 
-                            if (globalChunkFlags[pClipChunk->globalIdx] &
-                                CHUNK_FLAG_DIRTY) {
-                                if ((!onlyRebuild) ||
-                                    globalChunkFlags[pClipChunk->globalIdx] &
-                                        CHUNK_FLAG_COMPILED ||
-                                    (distSq <
-                                     20 * 20))  // Always rebuild really near
-                                                // things or else building (say)
-                                                // at tower up into empty blocks
-                                                // when we are low on memory
-                                                // will not create render data
+                            if (globalChunkFlags[pClipChunk->globalIdx] & CHUNK_FLAG_DIRTY) {
+                                if ((!onlyRebuild) || 
+                                    (globalChunkFlags[pClipChunk->globalIdx] & CHUNK_FLAG_COMPILED) || 
+                                    (distSq < 20 * 20)) 
                                 {
-                                    considered++;
-                                    // Is this chunk nearer than our nearest?
+                                    bool isNearer = 
 #if defined(_LARGE_WORLDS)
-                                    bool isNearer =
-                                        nearestClipChunks.wouldAccept(
-                                            distSqWeighted);
+                                        nearestClipChunks.wouldAccept(distSqWeighted);
 #else
-                                    bool isNearer = distSqWeighted < minDistSq;
+                                        distSqWeighted < minDistSq;
 #endif
-
-#if defined(_CRITICAL_CHUNKS)
-                                    // AP - this will make sure that if a
-                                    // deferred grouping has started, only
-                                    // critical chunks go into that grouping,
-                                    // even if a non-critical chunk is closer.
-                                    if ((!veryNearCount && isNearer) ||
-                                        (distSq < 20 * 20 &&
-                                         (globalChunkFlags[pClipChunk
-                                                               ->globalIdx] &
-                                          CHUNK_FLAG_CRITICAL)))
-#else
-                                    if (isNearer)
-#endif
-                                    {
-                                        // At this point we've got a chunk that
-                                        // we would like to consider for
-                                        // rendering, at least based on its
-                                        // proximity to the player(s). Its
-                                        // *quite* quick to generate empty
-                                        // render data for render chunks, but if
-                                        // we let the rebuilding do that then
-                                        // the after rebuilding we will have to
-                                        // start searching for the next nearest
-                                        // chunk from scratch again. Instead,
-                                        // its better to detect empty chunks at
-                                        // this stage, flag them up as not dirty
-                                        // (and empty), and carry on. The
-                                        // levelchunk's isRenderChunkEmpty
-                                        // method can be quite optimal as it can
-                                        // make use of the chunk's data
-                                        // compression to detect emptiness
-                                        // without actually testing as many data
-                                        // items as uncompressed data would.
+                                    if (isNearer) {
                                         Chunk* chunk = pClipChunk->chunk;
-                                        LevelChunk* lc = level[p]->getChunkAt(
-                                            chunk->x, chunk->z);
+                                        LevelChunk* lc = level[p]->getChunkAt(chunk->x, chunk->z);
                                         if (!lc->isRenderChunkEmpty(y * 16)) {
                                             nearChunk = pClipChunk;
                                             minDistSq = distSqWeighted;
 #if defined(_LARGE_WORLDS)
-                                            nearestClipChunks.insert(nearChunk,
-                                                                     minDistSq);
+                                            nearestClipChunks.insert(nearChunk, minDistSq);
 #endif
                                         } else {
-                                            chunk->clearDirty();
-                                            globalChunkFlags[pClipChunk
-                                                                 ->globalIdx] |=
-                                                CHUNK_FLAG_EMPTYBOTH;
-                                            wouldBeNearButEmpty++;
+                                            chunk->clearDirty(); // Atómico
+                                            globalChunkFlags[pClipChunk->globalIdx] |= CHUNK_FLAG_EMPTYBOTH;
                                         }
                                     }
-
 #if defined(_CRITICAL_CHUNKS)
-                                    // AP - is the chunk near and also critical
-                                    if (distSq < 20 * 20 &&
-                                        ((globalChunkFlags[pClipChunk
-                                                               ->globalIdx] &
-                                          CHUNK_FLAG_CRITICAL)))
+                                    if (distSq < 20 * 20 && (globalChunkFlags[pClipChunk->globalIdx] & CHUNK_FLAG_CRITICAL))
+                                        veryNearCount++;
 #else
                                     if (distSq < 20 * 20)
-#endif
-                                    {
                                         veryNearCount++;
-                                    }
+#endif
                                 }
                             }
                         }
                     }
                 }
-                //			Log::info("[%d,%d,%d]\n",nearestClipChunks.empty(),considered,wouldBeNearButEmpty);
             }
         }
     }
@@ -1969,87 +1873,48 @@ bool LevelRenderer::updateDirtyChunks() {
             FRAME_PROFILE_SCOPE(ChunkRebuildSchedule);
             for (int i = 0; i < nearestClipChunks.size(); ++i) {
                 chunk = nearestClipChunks.items[i].first->chunk;
-                // If this chunk is very near, then move the renderer into a
-                // deferred mode. This won't commit any command buffers for
-                // rendering until we call CBuffDeferredModeEnd(), allowing us
-                // to group any near changes into an atomic unit. This is
-                // essential so we don't temporarily create any holes in the
-                // environment whilst updating one chunk and not the neighbours.
-                // The "ver near" aspect of this is just a cosmetic nicety -
-                // exactly the same thing would happen further away, but we just
-                // don't care about it so much from terms of visual impact.
                 if (veryNearCount > 0) {
                     PlatformRenderer.CBuffDeferredModeStart();
                 }
-                // Build this chunk & return false to continue processing
                 chunk->clearDirty();
-                // Take a copy of the details that are required for chunk
-                // rebuilding, and rebuild That instead of the original chunk
-                // data. This is done within the m_csDirtyChunks lock,
-                // which means that any chunks can't be repositioned
-                // whilst we are doing this copy. The copy will then be
-                // guaranteed to be consistent whilst rebuilding takes place
-                // outside of that lock.
+
+                // =================================================================================
+                // CAMBIO FASE B: Escalado de Lock. 
+                // Soltamos la lectura y tomamos escritura SOLO para la copia.
+                // =================================================================================
+                dirtyChunksLock.unlock(); 
+                std::unique_lock<std::shared_mutex> writeLock(m_csDirtyChunks);
                 permaChunk[index].makeCopyForRebuild(chunk);
+                writeLock.unlock(); 
+                dirtyChunksLock.lock(); // Volvemos a lectura para seguir el ciclo si es necesario
+
                 ++index;
             }
-            dirtyChunksLock.unlock();
+            dirtyChunksLock.unlock(); 
 
-            --index;  // Bring it back into 0 counted range
-
+            --index; 
             for (int i = MAX_CHUNK_REBUILD_THREADS - 1; i >= 0; --i) {
-                // Set the events that won't run
-                if ((i + 1) > index)
-                    s_rebuildCompleteEvents->set(i);
-                else
-                    break;
+                if ((i + 1) > index) s_rebuildCompleteEvents->set(i);
+                else break;
             }
         }
 
         for (; index >= 0; --index) {
-            bool bAtomic = false;
-            if ((veryNearCount > 0))
-                bAtomic = true;  // MGH -  if veryNearCount, then we're trying
-                                 // to rebuild atomically, so do it all on the
-                                 // main thread
-
+            bool bAtomic = (veryNearCount > 0);
             if (bAtomic || (index == 0)) {
-                // M_PIXBeginNamedEvent(0,"Rebuilding near chunk %d %d
-                // %d",chunk->x, chunk->y, chunk->z); 		static int64_t
-                // totalTime =
-                // 0; 		static int64_t countTime = 0;
-                //		int64_t startTime = System::currentTimeMillis();
-
-                // Log::info("Rebuilding permaChunk %d\n", index);
-
                 {
                     FRAME_PROFILE_SCOPE(ChunkRebuildBody);
                     permaChunk[index].rebuild();
                 }
-
                 if (index != 0) {
                     FRAME_PROFILE_SCOPE(ChunkRebuildSchedule);
-                    s_rebuildCompleteEvents->set(
-                        index - 1);  // MGH - this rebuild happening on the main
-                                     // thread instead, mark the thread it
-                                     // should have been running on as complete
+                    s_rebuildCompleteEvents->set(index - 1);
                 }
-
-                //		int64_t endTime = System::currentTimeMillis();
-                //		totalTime += (endTime - startTime);
-                //		countTime++;
-                //		printf("%d : %f\n", countTime, (float)totalTime
-                /// (float)countTime);
-            }
-            // 4J Stu - Ignore this path when in constrained mode on Xbox One
-            else {
-                // Activate thread to rebuild this chunk
+            } else {
                 FRAME_PROFILE_SCOPE(ChunkRebuildSchedule);
                 s_activationEventA[index - 1]->set();
             }
         }
-
-        // Wait for the other threads to be done as well
         {
             FRAME_PROFILE_SCOPE(ChunkRebuildSchedule);
             s_rebuildCompleteEvents->waitForAll(C4JThread::kInfiniteTimeout);
@@ -2061,50 +1926,27 @@ bool LevelRenderer::updateDirtyChunks() {
         static Chunk permaChunk;
         {
             FRAME_PROFILE_SCOPE(ChunkRebuildSchedule);
-            // If this chunk is very near, then move the renderer into a
-            // deferred mode. This won't commit any command buffers for
-            // rendering until we call CBuffDeferredModeEnd(), allowing us to
-            // group any near changes into an atomic unit. This is essential so
-            // we don't temporarily create any holes in the environment whilst
-            // updating one chunk and not the neighbours. The "ver near" aspect
-            // of this is just a cosmetic nicety - exactly the same thing would
-            // happen further away, but we just don't care about it so much from
-            // terms of visual impact.
             if (veryNearCount > 0) {
                 PlatformRenderer.CBuffDeferredModeStart();
             }
-            // Build this chunk & return false to continue processing
             chunk->clearDirty();
-            // Take a copy of the details that are required for chunk
-            // rebuilding, and rebuild That instead of the original chunk data.
-            // This is done within the m_csDirtyChunks lock, which
-            // means that any chunks can't be repositioned whilst we are doing
-            // this copy. The copy will then be guaranteed to be consistent
-            // whilst rebuilding takes place outside of that lock.
-            permaChunk.makeCopyForRebuild(chunk);
+
+            // =================================================================================
+            // CAMBIO FASE B: Escalado de Lock para mundos pequeños.
+            // =================================================================================
             dirtyChunksLock.unlock();
+            std::unique_lock<std::shared_mutex> writeLock(m_csDirtyChunks);
+            permaChunk.makeCopyForRebuild(chunk);
+            writeLock.unlock();
         }
-        //		static int64_t totalTime = 0;
-        //		static int64_t countTime = 0;
-        //		int64_t startTime = System::currentTimeMillis();
         {
             FRAME_PROFILE_SCOPE(ChunkRebuildBody);
             permaChunk.rebuild();
         }
-        //		int64_t endTime = System::currentTimeMillis();
-        //		totalTime += (endTime - startTime);
-        //		countTime++;
-        //		printf("%d : %f\n", countTime, (float)totalTime /
-        //(float)countTime);
-
     }
 #endif
     else {
-        // Nothing to do - clear flags that there are things to process, unless
-        // it's been a while since we found any dirty chunks in which case force
-        // a check next time through
-        if ((System::currentTimeMillis() - lastDirtyChunkFound) >
-            FORCE_DIRTY_CHUNK_CHECK_PERIOD_MS) {
+        if ((System::currentTimeMillis() - lastDirtyChunkFound) > FORCE_DIRTY_CHUNK_CHECK_PERIOD_MS) {
             dirtyChunkPresent = true;
         } else {
             dirtyChunkPresent = false;
@@ -2113,33 +1955,19 @@ bool LevelRenderer::updateDirtyChunks() {
         return false;
     }
 
-    // If there was more than one very near thing found in our initial
-    // assessment, then return true so that we will keep doing the other one(s)
-    // in an atomic unit
     if (veryNearCount > 1) {
-        destroyedTileManager->updatedChunkAt(chunk->level, chunk->x, chunk->y,
-                                             chunk->z, veryNearCount);
+        destroyedTileManager->updatedChunkAt(chunk->level, chunk->x, chunk->y, chunk->z, veryNearCount);
         return true;
     }
-    // If the chunk we've just built was near, and it has been marked dirty at
-    // some point while we are rebuilding, also return true so we can rebuild
-    // the same thing atomically - if its data was changed during creating
-    // render data, it may well be invalid
-    if ((veryNearCount == 1) &&
-        getGlobalChunkFlag(chunk->x, chunk->y, chunk->z, chunk->level,
-                           CHUNK_FLAG_DIRTY)) {
-        destroyedTileManager->updatedChunkAt(chunk->level, chunk->x, chunk->y,
-                                             chunk->z, veryNearCount + 1);
+    if ((veryNearCount == 1) && getGlobalChunkFlag(chunk->x, chunk->y, chunk->z, chunk->level, CHUNK_FLAG_DIRTY)) {
+        destroyedTileManager->updatedChunkAt(chunk->level, chunk->x, chunk->y, chunk->z, veryNearCount + 1);
         return true;
     }
-
     if (nearChunk)
-        destroyedTileManager->updatedChunkAt(chunk->level, chunk->x, chunk->y,
-                                             chunk->z, veryNearCount);
+        destroyedTileManager->updatedChunkAt(chunk->level, chunk->x, chunk->y, chunk->z, veryNearCount);
 
     return false;
 }
-
 void LevelRenderer::renderHit(std::shared_ptr<Player> player, HitResult* h,
                               int mode,
                               std::shared_ptr<ItemInstance> inventoryItem,
@@ -3843,7 +3671,7 @@ void LevelRenderer::retireRenderableTileEntitiesForChunkKey(int key) {
     if (key == -1) return;
 
     {
-        std::lock_guard<std::mutex> lock(m_csRenderableTileEntities);
+        std::unique_lock<std::shared_mutex> lock(m_csRenderableTileEntities);
         renderableTileEntities.erase(key);
         m_renderableTileEntitiesPendingRemoval.erase(key);
     }
@@ -3853,7 +3681,7 @@ void LevelRenderer::retireRenderableTileEntitiesForChunkKey(int key) {
 void LevelRenderer::fullyFlagRenderableTileEntitiesToBeRemoved() {
     FRAME_PROFILE_SCOPE(RenderableTileEntityCleanup);
 
-    std::lock_guard<std::mutex> lock(m_csRenderableTileEntities);
+    std::unique_lock<std::shared_mutex> lock(m_csRenderableTileEntities);
     if (m_renderableTileEntitiesPendingRemoval.empty()) {
         return;
     }

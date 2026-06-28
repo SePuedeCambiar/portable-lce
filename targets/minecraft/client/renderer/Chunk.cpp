@@ -112,7 +112,7 @@ void Chunk::reconcileRenderableTileEntities(
 // TODO - 4J see how input entity vector is set up and decide what way is best
 // to pass this to the function
 Chunk::Chunk(Level* level, LevelRenderer::rteMap& globalRenderableTileEntities,
-             std::mutex& globalRenderableTileEntities_cs, int x, int y, int z,
+             std::shared_mutex& globalRenderableTileEntities_cs, int x, int y, int z,
              ClipChunk* clipChunk)
     : globalRenderableTileEntities(&globalRenderableTileEntities),
       globalRenderableTileEntities_cs(&globalRenderableTileEntities_cs) {
@@ -130,9 +130,17 @@ Chunk::Chunk(Level* level, LevelRenderer::rteMap& globalRenderableTileEntities,
 }
 
 void Chunk::setPos(int x, int y, int z) {
+    // El wrapper público se encarga del LOCK
+    std::unique_lock<std::shared_mutex> lock(levelRenderer->m_csDirtyChunks);
+    setPos_Internal(x, y, z);
+}
+
+void Chunk::setPos_Internal(int x, int y, int z) {
+    // ESTA FUNCIÓN NO BLOQUEA NADA.
     if (assigned && (x == this->x && y == this->y && z == this->z)) return;
 
-    reset();
+    // Llamamos al reset interno (sin lock)
+    reset_Internal();
 
     this->x = x;
     this->y = y;
@@ -144,23 +152,17 @@ void Chunk::setPos(int x, int y, int z) {
     clipChunk->ym = ym;
     clipChunk->zm = zm;
 
-    clipChunk->globalIdx =
-        LevelRenderer::getGlobalIndexForChunk(x, y, z, level);
+    clipChunk->globalIdx = LevelRenderer::getGlobalIndexForChunk(x, y, z, level);
 #ifdef OCCLUSION_MODE_BFS
     levelRenderer->setGlobalChunkConnectivity(clipChunk->globalIdx, ~0ULL);
 #endif
 
-    // 4J - we're not using offsetted renderlists anymore, so just set the full
-    // position of this chunk into x/y/zRenderOffs where it will be used
-    // directly in the renderlist of this chunk
     xRenderOffs = x;
     yRenderOffs = y;
     zRenderOffs = z;
     xRender = 0;
     yRender = 0;
     zRender = 0;
-
-    float g = 6.0f;
 
     clipChunk->aabb[0] = bb.x0 + x;
     clipChunk->aabb[1] = bb.y0 + y;
@@ -171,31 +173,11 @@ void Chunk::setPos(int x, int y, int z) {
 
     assigned = true;
 
-    {
-        std::lock_guard<std::recursive_mutex> lock(
-            levelRenderer->m_csDirtyChunks);
-        unsigned char refCount =
-            levelRenderer->incGlobalChunkRefCount(x, y, z, level);
-        //	printf("\t\t [inc] refcount %d at %d, %d, %d\n",refCount,x,y,z);
-
-        //	int idx = levelRenderer->getGlobalIndexForChunk(x, y, z, level);
-
-        // If we're the first thing to be referencing this, mark it up as dirty
-        // to get rebuilt
-        if (refCount == 1) {
-            //		printf("Setting %d %d %d dirty [%d]\n",x,y,z, idx);
-            // Chunks being made dirty in this way can be very numerous (eg the
-            // full visible area of the world at start up, or a whole edge of
-            // the world when moving). On account of this, don't want to stick
-            // them into our lock free queue that we would normally use for
-            // letting the render update thread know about this chunk. Instead,
-            // just set the flag to say this is dirty, and then pass a special
-            // value of 1 through to the lock free stack which lets that thread
-            // know that at least one chunk other than the ones in the stack
-            // itself have been made dirty.
-            levelRenderer->setGlobalChunkFlag(x, y, z, level,
-                                              LevelRenderer::CHUNK_FLAG_DIRTY);
-        }
+    // El refCount y los flags son ATÓMICOS, no necesitan lock adicional 
+    // pero como ya estamos dentro del lock de m_csDirtyChunks en resortChunks, es seguro.
+    unsigned char refCount = levelRenderer->incGlobalChunkRefCount(x, y, z, level);
+    if (refCount == 1) {
+        levelRenderer->setGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_DIRTY);
     }
 }
 
@@ -791,12 +773,15 @@ void Chunk::rebuild() {
     delete region;
 
     {
-        std::lock_guard<std::mutex> lock(*globalRenderableTileEntities_cs);
+        std::unique_lock<std::shared_mutex> lock(*globalRenderableTileEntities_cs);
         reconcileRenderableTileEntities(renderableTileEntities);
     }
 
-    if (LevelChunk::touchedSky) levelRenderer->clearGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_NOTSKYLIT);
-    else levelRenderer->setGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_NOTSKYLIT);
+    if (LevelChunk::touchedSky) 
+        levelRenderer->clearGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_NOTSKYLIT);
+    else 
+        levelRenderer->setGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_NOTSKYLIT);
+    
     levelRenderer->setGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_COMPILED);
 }
 
@@ -954,40 +939,40 @@ uint64_t Chunk::computeConnectivity(const uint8_t* tileIds) {
 #endif
 
 void Chunk::reset() {
+    // El wrapper público se encarga del LOCK
+    std::unique_lock<std::shared_mutex> lock(levelRenderer->m_csDirtyChunks);
+    
+    int oldKey = -1;
+    bool retireRenderableTileEntities = false;
+
     if (assigned) {
-        int oldKey = -1;
-        bool retireRenderableTileEntities = false;
-
-        {
-            std::lock_guard<std::recursive_mutex> lock(
-                levelRenderer->m_csDirtyChunks);
-            oldKey = levelRenderer->getGlobalIndexForChunk(x, y, z, level);
-            unsigned char refCount =
-                levelRenderer->decGlobalChunkRefCount(x, y, z, level);
-            assigned = false;
-            //		printf("\t\t [dec] refcount %d at %d, %d,
-            //%d\n",refCount,x,y,z);
-            if (refCount == 0 && oldKey != -1) {
-                retireRenderableTileEntities = true;
-                int lists = oldKey * 2;
-                if (lists >= 0) {
-                    lists += levelRenderer->chunkLists;
-                    for (int i = 0; i < 2; i++) {
-                        // 4J - added - clear any renderer data associated with
-                        // this unused list
-                        PlatformRenderer.CBuffClear(lists + i);
-                    }
-                    levelRenderer->setGlobalChunkFlags(x, y, z, level, 0);
-                }
+        oldKey = levelRenderer->getGlobalIndexForChunk(x, y, z, level);
+        
+        // Llamamos a la lógica interna que NO bloquea
+        reset_Internal();
+        
+        // El refCount se maneja aquí para decidir si retiramos entidades
+        unsigned char refCount = levelRenderer->decGlobalChunkRefCount(x, y, z, level);
+        if (refCount == 0 && oldKey != -1) {
+            retireRenderableTileEntities = true;
+            int lists = oldKey * 2 + levelRenderer->chunkLists;
+            for (int i = 0; i < 2; i++) {
+                PlatformRenderer.CBuffClear(lists + i);
             }
-        }
-
-        if (retireRenderableTileEntities) {
-            levelRenderer->retireRenderableTileEntitiesForChunkKey(oldKey);
+            levelRenderer->setGlobalChunkFlags(x, y, z, level, 0);
         }
     }
 
+    if (retireRenderableTileEntities) {
+        levelRenderer->retireRenderableTileEntitiesForChunkKey(oldKey);
+    }
     clipChunk->visible = false;
+}
+
+void Chunk::reset_Internal() {
+    // ESTA FUNCIÓN NO BLOQUEA NADA. 
+    // Se asume que quien la llama ya tiene el lock de m_csDirtyChunks.
+    assigned = false;
 }
 
 void Chunk::_delete() {
