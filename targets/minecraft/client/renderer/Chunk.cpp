@@ -227,22 +227,56 @@ struct FaceInfo {
     }
 };
 
-
-
 void Chunk::rebuild() {
+    // ============================================================================
+    // 1. LUTs DINÁMICAS (Se llenan basadas en las propiedades reales de los Tiles)
+    // ============================================================================
+    static bool isSolidLUT[256];
+    static bool isGreedySafeLUT[256];
+    static bool isInitialized = false;
+    if (!isInitialized) {
+        memset(isSolidLUT, 0, 256);
+        memset(isGreedySafeLUT, 0, 256); // Ahora empezamos con TODO en false
+
+        for (int i = 0; i < 256; i++) {
+            Tile* tile = Tile::tiles[i];
+            if (tile) {
+                // Un bloque es Sólido si llena el cubo y no es transparente
+                // Ajusta 'isSolidRender' o 'isOpaque' según los métodos de tu clase Tile
+                if (tile->isSolidRender()) {
+                    isSolidLUT[i] = true;
+                }
+
+                // Un bloque es Greedy Safe SOLO si es un cubo sólido perfecto
+                // Las losas, escaleras y hierba NO deben ser Greedy Safe.
+                // Aquí definimos que solo es safe si es sólido Y no es uno de los bloques complejos.
+                if (tile->isSolidRender()) {
+                    int id = tile->id;
+                    // Lista de bloques que, aunque sean "sólidos", tienen geometría especial
+                    bool isComplex = (id == 2 || id == 17 || id == 18 || id == 23 || 
+                                      id == 61 || id == 62 || id == 86 || id == 91 || 
+                                      id == 155 || id == 158 || id == 161 || id == 162 || id == 170);
+                    
+                    if (!isComplex) {
+                        isGreedySafeLUT[i] = true;
+                    }
+                }
+            }
+        }
+        // El bloque 255 suele ser el bloque de "ocultar" o aire sólido
+        isSolidLUT[255] = true; 
+        isInitialized = true;
+    }
+
 #if defined(_LARGE_WORLDS)
     Tesselator* t = Tesselator::getInstance();
 #else
-    Chunk::t = Tesselator::getInstance(); 
+    Chunk::t = Tesselator::getInstance();
 #endif
     updates++;
 
-    int x0 = x;
-    int y0 = y;
-    int z0 = z;
-    int x1 = x + XZSIZE;
-    int y1 = y + SIZE;
-    int z1 = z + XZSIZE;
+    int x0 = x, y0 = y, z0 = z;
+    int x1 = x + XZSIZE, y1 = y + SIZE, z1 = z + XZSIZE;
 
     LevelChunk::touchedSky = false;
     std::vector<std::shared_ptr<TileEntity>> renderableTileEntities;
@@ -251,87 +285,52 @@ void Chunk::rebuild() {
     int lists = levelRenderer->getGlobalIndexForChunk(this->x, this->y, this->z, level) * 2;
     lists += levelRenderer->chunkLists;
 
-    // --- FASE 1: Recuperación instantánea del Shadow Buffer ---
-#if defined(_LARGE_WORLDS)
-    unsigned char* tileIds = GetTileIdsStorage();
-#else
-    static unsigned char tileIds[16 * 16 * Level::maxBuildHeight];
-#endif
+    thread_local unsigned char tileIds[16 * 16 * Level::maxBuildHeight];
     std::vector<uint8_t> tileArray(65536);
     level->getChunkAt(x, z)->getBlockData(tileArray);
     memcpy(tileIds, tileArray.data(), 16 * 16 * Level::maxBuildHeight);
 
-    LevelSource* region = new Region(level, x0 - r, y0 - r, z0 - r, x1 + r, y1 + r, z1 + r, r);
+    Region* region = new Region(level, x0 - r, y0 - r, z0 - r, x1 + r, y1 + r, z1 + r, r);
     TileRenderer* tileRenderer = new TileRenderer(region, this->x, this->y, this->z, tileIds);
 
-    // --- FAST CULLING PREPASS ---
+    int offsetBaseY[Level::maxBuildHeight];
+    int indexYBase[Level::maxBuildHeight];
+    for (int yy = 0; yy < Level::maxBuildHeight; yy++) {
+        int idxY = yy;
+        int off = 0;
+        if (idxY >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT) {
+            idxY -= Level::COMPRESSED_CHUNK_SECTION_HEIGHT;
+            off = Level::COMPRESSED_CHUNK_SECTION_TILES;
+        }
+        indexYBase[yy] = idxY;
+        offsetBaseY[yy] = off;
+    }
+
+    // ============================================================================
+    // 5. FAST CULLING PREPASS (Ahora con LUT correcta)
+    // ============================================================================
     bool empty = true;
     {
         FRAME_PROFILE_SCOPE(ChunkPrepass);
         for (int yy = y0; yy < y1; yy++) {
+            int idxY = indexYBase[yy];
+            int offset = offsetBaseY[yy];
+            unsigned char* layerPtr = tileIds + offset;
             for (int zz = 0; zz < 16; zz++) {
+                int zShift = zz << 7;
                 for (int xx = 0; xx < 16; xx++) {
-                    int indexY = yy;
-                    int offset = 0;
-                    if (indexY >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT) {
-                        indexY -= Level::COMPRESSED_CHUNK_SECTION_HEIGHT;
-                        offset = Level::COMPRESSED_CHUNK_SECTION_TILES;
-                    }
-                    unsigned char tileId = tileIds[offset + (((xx + 0) << 11) | ((zz + 0) << 7) | (indexY + 0))];
+                    int xShift = xx << 11;
+                    unsigned char tileId = layerPtr[xShift | zShift | idxY];
                     if (tileId > 0) empty = false;
-                    if (yy == (Level::maxBuildHeight - 1)) continue;
-                    if ((xx == 0) || (xx == 15)) continue;
-                    if ((zz == 0) || (zz == 15)) continue;
-
-                    if (!((tileId == Tile::stone_Id) || (tileId == Tile::dirt_Id) || 
-                          (tileId == Tile::unbreakable_Id) || (tileId == 255)))
-                        continue;
-
-                    tileId = tileIds[offset + (((xx - 1) << 11) | ((zz + 0) << 7) | (indexY + 0))];
-                    if (!((tileId == Tile::stone_Id) || (tileId == Tile::dirt_Id) || 
-                          (tileId == Tile::unbreakable_Id) || (tileId == 255)))
-                        continue;
-
-                    tileId = tileIds[offset + (((xx + 1) << 11) | ((zz + 0) << 7) | (indexY + 0))];
-                    if (!((tileId == Tile::stone_Id) || (tileId == Tile::dirt_Id) || 
-                          (tileId == Tile::unbreakable_Id) || (tileId == 255)))
-                        continue;
-
-                    tileId = tileIds[offset + (((xx + 0) << 11) | ((zz - 1) << 7) | (indexY + 0))];
-                    if (!((tileId == Tile::stone_Id) || (tileId == Tile::dirt_Id) || 
-                          (tileId == Tile::unbreakable_Id) || (tileId == 255)))
-                        continue;
-
-                    tileId = tileIds[offset + (((xx + 0) << 11) | ((zz + 1) << 7) | (indexY + 0))];
-                    if (!((tileId == Tile::stone_Id) || (tileId == Tile::dirt_Id) || 
-                          (tileId == Tile::unbreakable_Id) || (tileId == 255)))
-                        continue;
-
-                    if (yy > 0) {
-                        int indexYMinusOne = yy - 1;
-                        int yMinusOneOffset = 0;
-                        if (indexYMinusOne >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT) {
-                            indexYMinusOne -= Level::COMPRESSED_CHUNK_SECTION_HEIGHT;
-                            yMinusOneOffset = Level::COMPRESSED_CHUNK_SECTION_TILES;
-                        }
-                        tileId = tileIds[yMinusOneOffset + (((xx + 0) << 11) | ((zz + 0) << 7) | indexYMinusOne)];
-                        if (!((tileId == Tile::stone_Id) || (tileId == Tile::dirt_Id) || 
-                              (tileId == Tile::unbreakable_Id) || (tileId == 255)))
-                            continue;
-                    }
-
-                    int indexYPlusOne = yy + 1;
-                    int yPlusOneOffset = 0;
-                    if (indexYPlusOne >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT) {
-                        indexYPlusOne -= Level::COMPRESSED_CHUNK_SECTION_HEIGHT;
-                        yPlusOneOffset = Level::COMPRESSED_CHUNK_SECTION_TILES;
-                    }
-                    tileId = tileIds[yPlusOneOffset + (((xx + 0) << 11) | ((zz + 0) << 7) | indexYPlusOne)];
-                    if (!((tileId == Tile::stone_Id) || (tileId == Tile::dirt_Id) || 
-                          (tileId == Tile::unbreakable_Id) || (tileId == 255)))
-                        continue;
-
-                    tileIds[offset + (((xx + 0) << 11) | ((zz + 0) << 7) | (indexY + 0))] = 0xff;
+                    if (yy == (Level::maxBuildHeight - 1) || (xx == 0) || (xx == 15) || (zz == 0) || (zz == 15)) continue;
+                    if (!isSolidLUT[tileId]) continue;
+                    if (!isSolidLUT[layerPtr[((xx - 1) << 11) | zShift | idxY]]) continue;
+                    if (!isSolidLUT[layerPtr[((xx + 1) << 11) | zShift | idxY]]) continue;
+                    if (!isSolidLUT[layerPtr[xShift | ((zz - 1) << 7) | idxY]]) continue;
+                    if (!isSolidLUT[layerPtr[xShift | ((zz + 1) << 7) | idxY]]) continue;
+                    if (yy > 0 && !isSolidLUT[tileIds[offsetBaseY[yy-1] + (xShift | zShift | indexYBase[yy-1])]]) continue;
+                    if (!isSolidLUT[tileIds[offsetBaseY[yy+1] + (xShift | zShift | indexYBase[yy+1])]]) continue;
+                    layerPtr[xShift | zShift | idxY] = 0xff;
                 }
             }
         }
@@ -342,13 +341,7 @@ void Chunk::rebuild() {
             levelRenderer->setGlobalChunkFlag(this->x, this->y, this->z, level, LevelRenderer::CHUNK_FLAG_EMPTY0, currentLayer);
             PlatformRenderer.CBuffClear(lists + currentLayer);
         }
-#ifdef OCCLUSION_MODE_BFS
-        int globalIdx = levelRenderer->getGlobalIndexForChunk(this->x, this->y, this->z, level);
-        levelRenderer->setGlobalChunkConnectivity(globalIdx, ~0ULL);
-        levelRenderer->setGlobalChunkFlag(this->x, this->y, this->z, level, LevelRenderer::CHUNK_FLAG_COMPILED);
-#endif
-        delete region;
-        delete tileRenderer;
+        delete region; delete tileRenderer;
         return;
     }
 
@@ -359,16 +352,11 @@ void Chunk::rebuild() {
         bounds.boundingBox[3] = XZSIZE + g; bounds.boundingBox[4] = SIZE + g; bounds.boundingBox[5] = XZSIZE + g;
     }
 
-    // Filtro para separar bloques simples de bloques complejos
-    auto isGreedySafe = [](Tile* tile) {
-        if (!tile || !tile->isSolidRender()) return false;
-        int id = tile->id;
-        if (id == 2 || id == 17 || id == 18 || id == 23 || id == 61 || id == 62 || 
-            id == 86 || id == 91 || id == 155 || id == 158 || id == 161 || id == 162 || id == 170) {
-            return false;
-        }
-        return true;
-    };
+    thread_local FaceInfo gridBufferY[256];
+    thread_local std::vector<FaceInfo> gridBufferZ;
+    thread_local std::vector<FaceInfo> gridBufferX;
+    gridBufferZ.assign(16 * (y1 - y0), FaceInfo());
+    gridBufferX.assign(16 * (y1 - y0), FaceInfo());
 
     for (int currentLayer = 0; currentLayer < 2; currentLayer++) {
         bool renderNextLayer = false;
@@ -386,45 +374,39 @@ void Chunk::rebuild() {
             }
         };
 
-        // =================================================================================
-        // PASO 1: GREEDY MESHING (CON NUEVO EMPAQUETADO EXACTO)
-        // =================================================================================
         FRAME_PROFILE_SCOPE(ChunkGreedyMeshing);
 
         for (int face = 0; face < 6; face++) {
-            int axis = (face == 0 || face == 1) ? 0 : ((face == 2 || face == 3) ? 1 : 2); 
-
-            if (axis == 0) { // Eje Y (DOWN / UP)
+            int axis = (face == 0 || face == 1) ? 0 : ((face == 2 || face == 3) ? 1 : 2);
+            if (axis == 0) {
+                int yDir = (face == 1) ? 1 : -1;
                 for (int y = y0; y < y1; y++) {
-                    FaceInfo grid[256];
+                    FaceInfo* grid = gridBufferY;
                     bool hasData = false;
+                    int idxY = indexYBase[y], offset = offsetBaseY[y];
+                    unsigned char* layerPtr = tileIds + offset;
                     for (int z = 0; z < 16; z++) {
+                        int zShift = z << 7;
                         for (int x = 0; x < 16; x++) {
-                            int worldY = y;
-                            int offset = 0;
-                            int indexY = worldY;
-                            if (indexY >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT) {
-                                indexY -= Level::COMPRESSED_CHUNK_SECTION_HEIGHT;
-                                offset = Level::COMPRESSED_CHUNK_SECTION_TILES;
-                            }
-                            unsigned char tileId = tileIds[offset + ((x << 11) | (z << 7) | indexY)];
-                            if (tileId == 0 || tileId == 0xff) continue;
+                            int xShift = x << 11;
+                            unsigned char tileId = layerPtr[xShift | zShift | idxY];
+                            if (tileId == 0 || tileId == 0xff || !isGreedySafeLUT[tileId]) continue;
                             Tile* tile = Tile::tiles[tileId];
-                            if (!isGreedySafe(tile) || tile->getRenderLayer() != currentLayer) continue;
-                            
-                            int nx = x0 + x;
-                            int ny = worldY + (face == 1 ? 1 : -1);
-                            int nz = z0 + z;
-                            if (ny < 0) ny = 0;
-                            if (ny >= Level::maxBuildHeight) ny = Level::maxBuildHeight - 1;
-
-                            if (!tile->shouldRenderFace(region, nx, ny, nz, face)) continue;
-                            
+                            if (!tile || tile->getRenderLayer() != currentLayer) continue;
+                            int ny = y + yDir;
+                            if (ny < 0) ny = 0; if (ny >= Level::maxBuildHeight) ny = Level::maxBuildHeight - 1;
+                            bool renderFace = false;
+                            if (ny >= y0 && ny < y1) {
+                                unsigned char neighborId = tileIds[offsetBaseY[ny] + (xShift | zShift | indexYBase[ny])];
+                                if (neighborId == 0 || neighborId == 0xff || !isSolidLUT[neighborId]) renderFace = true;
+                            } else renderFace = tile->shouldRenderFace(region, x0 + x, ny, z0 + z, face);
+                            if (!renderFace) continue;
                             int gridIdx = z * 16 + x;
                             grid[gridIdx].tileId = tileId;
-                            grid[gridIdx].texture = tileRenderer->getTexture(tile, region, x0 + x, worldY, z0 + z, face);
-                            grid[gridIdx].lightColor = tileRenderer->getLightColor(tile, region, nx, ny, nz);
-                            grid[gridIdx].tileColor = tile->getColor(region, x0 + x, worldY, z0 + z);
+                            grid[gridIdx].texture = tileRenderer->getTexture(tile, region, x0 + x, y, z0 + z, face);
+                            grid[gridIdx].lightColor = tileRenderer->getLightColor(tile, region, x0 + x, ny, z0 + z);
+                            grid[gridIdx].tileColor = tile->getColor(region, x0 + x, y, z0 + z);
+                            grid[gridIdx].merged = false;
                             hasData = true;
                         }
                     }
@@ -439,95 +421,65 @@ void Chunk::rebuild() {
                             int height = 1;
                             bool ok = true;
                             while (v + height < 16) {
-                                for (int curr_u = u; curr_u < u + width; curr_u++) {
-                                    if (grid[(v + height) * 16 + curr_u].merged || !grid[(v + height) * 16 + curr_u].equals(current)) {
+                                for (int cu = u; cu < u + width; cu++) {
+                                    if (grid[(v + height) * 16 + cu].merged || !grid[(v + height) * 16 + cu].equals(current)) {
                                         ok = false; break;
                                     }
                                 }
                                 if (!ok) break;
                                 height++;
                             }
-                            for (int cv = v; cv < v + height; cv++) 
-                                for (int cu = u; cu < u + width; cu++) grid[cv * 16 + cu].merged = true;
-
+                            for (int cv = v; cv < v + height; cv++) for (int cu = u; cu < u + width; cu++) grid[cv * 16 + cu].merged = true;
                             startTesselatorIfNeeded();
                             rendered = true;
-                            float multiplier = (face == 0) ? 0.5f : 1.0f;
-                            
-                            t->color(((current.tileColor >> 16) & 0xff) / 255.0f * multiplier,
-                                     ((current.tileColor >> 8) & 0xff) / 255.0f * multiplier,
-                                     ((current.tileColor) & 0xff) / 255.0f * multiplier);
-
-                            float u0 = current.texture ? current.texture->getU0() : 0.0f;
-                            float v0 = current.texture ? current.texture->getV0() : 0.0f;
-                            float u1 = current.texture ? current.texture->getU1() : 0.0f;
-                            float v1 = current.texture ? current.texture->getV1() : 0.0f;
-
-                            // ===== NUEVO EMPAQUETADO EXACTO (EJE Y) =====
-                            float cellW = u1 - u0;
-                            float cellH = v1 - v0;
-                            float uEnd = u0 + (width * cellW);
-                            float vEnd = v0 + (height * cellH);
-
-                            float packU = std::floor(u0 * 1024.0f + 0.5f) + 1.0f;
-                            float packV = std::floor(v0 * 1024.0f + 0.5f) + 1.0f;
-                            
-                            float offsetU = packU * 10.0f;
-                            float offsetV = packV * 10.0f;
-
-                            float pU0 = u0 + offsetU;
-                            float pV0 = v0 + offsetV;
-                            float pUEnd = uEnd + offsetU;
-                            float pVEnd = vEnd + offsetV;
-
+                            float mult = (face == 0) ? 0.5f : 1.0f;
+                            t->color(((current.tileColor >> 16) & 0xff) / 255.0f * mult, ((current.tileColor >> 8) & 0xff) / 255.0f * mult, ((current.tileColor) & 0xff) / 255.0f * mult);
+                            float u0 = current.texture ? current.texture->getU0() : 0.0f, v0 = current.texture ? current.texture->getV0() : 0.0f;
+                            float u1 = current.texture ? current.texture->getU1() : 0.0f, v1 = current.texture ? current.texture->getV1() : 0.0f;
+                            float cellW = u1 - u0, cellH = v1 - v0, uEnd = u0 + (width * cellW), vEnd = v0 + (height * cellH);
+                            float packU = std::floor(u0 * 1024.0f + 0.5f) + 1.0f, packV = std::floor(v0 * 1024.0f + 0.5f) + 1.0f;
+                            float oU = packU * 10.0f, oV = packV * 10.0f, pU0 = u0 + oU, pV0 = v0 + oV, pUEnd = uEnd + oU, pVEnd = vEnd + oV;
                             t->tex2(current.lightColor);
-
                             float cx = (float)(x0 + u), cz = (float)(z0 + v), cy = (float)y, cw = (float)width, ch = (float)height;
                             if (face == 0) {
-                                t->vertexUV(cx, cy, cz + ch, pU0, pVEnd);
-                                t->vertexUV(cx, cy, cz, pU0, pV0);
-                                t->vertexUV(cx + cw, cy, cz, pUEnd, pV0);
-                                t->vertexUV(cx + cw, cy, cz + ch, pUEnd, pVEnd);
+                                t->vertexUV(cx, cy, cz + ch, pU0, pVEnd); t->vertexUV(cx, cy, cz, pU0, pV0);
+                                t->vertexUV(cx + cw, cy, cz, pUEnd, pV0); t->vertexUV(cx + cw, cy, cz + ch, pUEnd, pVEnd);
                             } else {
-                                t->vertexUV(cx + cw, cy + 1.0f, cz + ch, pUEnd, pVEnd);
-                                t->vertexUV(cx + cw, cy + 1.0f, cz, pUEnd, pV0);
-                                t->vertexUV(cx, cy + 1.0f, cz, pU0, pV0);
-                                t->vertexUV(cx, cy + 1.0f, cz + ch, pU0, pVEnd);
+                                t->vertexUV(cx + cw, cy + 1.0f, cz + ch, pUEnd, pVEnd); t->vertexUV(cx + cw, cy + 1.0f, cz, pUEnd, pV0);
+                                t->vertexUV(cx, cy + 1.0f, cz, pU0, pV0); t->vertexUV(cx, cy + 1.0f, cz + ch, pU0, pVEnd);
                             }
                         }
                     }
                 }
-            } 
-            else if (axis == 1) { // Eje Z (NORTH / SOUTH)
+            } else if (axis == 1) {
+                int zDir = (face == 3) ? 1 : -1;
                 int heightY = y1 - y0;
                 for (int z = 0; z < 16; z++) {
-                    std::vector<FaceInfo> grid(16 * heightY);
+                    FaceInfo* grid = gridBufferZ.data();
                     bool hasData = false;
                     for (int y = 0; y < heightY; y++) {
+                        int worldY = y0 + y, idxY = indexYBase[worldY], offset = offsetBaseY[worldY];
+                        unsigned char* layerPtr = tileIds + offset;
+                        int zShift = z << 7;
                         for (int x = 0; x < 16; x++) {
-                            int worldY = y0 + y;
-                            int offset = 0;
-                            int indexY = worldY;
-                            if (indexY >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT) {
-                                indexY -= Level::COMPRESSED_CHUNK_SECTION_HEIGHT;
-                                offset = Level::COMPRESSED_CHUNK_SECTION_TILES;
-                            }
-                            unsigned char tileId = tileIds[offset + ((x << 11) | (z << 7) | indexY)];
-                            if (tileId == 0 || tileId == 0xff) continue;
+                            int xShift = x << 11;
+                            unsigned char tileId = layerPtr[xShift | zShift | idxY];
+                            if (tileId == 0 || tileId == 0xff || !isGreedySafeLUT[tileId]) continue;
                             Tile* tile = Tile::tiles[tileId];
-                            if (!isGreedySafe(tile) || tile->getRenderLayer() != currentLayer) continue;
-                            
-                            int nx = x0 + x;
-                            int ny = worldY;
-                            int nz = z0 + z + (face == 3 ? 1 : -1);
-
-                            if (!tile->shouldRenderFace(region, nx, ny, nz, face)) continue;
-                            
+                            if (!tile || tile->getRenderLayer() != currentLayer) continue;
+                            int nz = z0 + z + zDir;
+                            bool renderFace = false;
+                            if (nz >= z0 && nz < z1) {
+                                unsigned char neighborId = tileIds[offset + ((nz - z0) << 7 | xShift | idxY)];
+                                if (neighborId == 0 || neighborId == 0xff || !isSolidLUT[neighborId]) renderFace = true;
+                            } else renderFace = tile->shouldRenderFace(region, x0 + x, worldY, nz, face);
+                            if (!renderFace) continue;
                             int gridIdx = y * 16 + x;
                             grid[gridIdx].tileId = tileId;
                             grid[gridIdx].texture = tileRenderer->getTexture(tile, region, x0 + x, worldY, z0 + z, face);
-                            grid[gridIdx].lightColor = tileRenderer->getLightColor(tile, region, nx, ny, nz);
+                            grid[gridIdx].lightColor = tileRenderer->getLightColor(tile, region, x0 + x, worldY, nz);
                             grid[gridIdx].tileColor = tile->getColor(region, x0 + x, worldY, z0 + z);
+                            grid[gridIdx].merged = false;
                             hasData = true;
                         }
                     }
@@ -550,87 +502,57 @@ void Chunk::rebuild() {
                                 if (!ok) break;
                                 height++;
                             }
-                            for (int cv = v; cv < v + height; cv++) 
-                                for (int cu = u; cu < u + width; cu++) grid[cv * 16 + cu].merged = true;
-
+                            for (int cv = v; cv < v + height; cv++) for (int cu = u; cu < u + width; cu++) grid[cv * 16 + cu].merged = true;
                             startTesselatorIfNeeded();
                             rendered = true;
-                            float multiplier = 0.8f;
-                            
-                            t->color(((current.tileColor >> 16) & 0xff) / 255.0f * multiplier,
-                                     ((current.tileColor >> 8) & 0xff) / 255.0f * multiplier,
-                                     ((current.tileColor) & 0xff) / 255.0f * multiplier);
-
-                            float u0 = current.texture ? current.texture->getU0() : 0.0f;
-                            float v0 = current.texture ? current.texture->getV0() : 0.0f;
-                            float u1 = current.texture ? current.texture->getU1() : 0.0f;
-                            float v1 = current.texture ? current.texture->getV1() : 0.0f;
-
-                            // ===== NUEVO EMPAQUETADO EXACTO (EJE Z) =====
-                            float cellW = u1 - u0;
-                            float cellH = v1 - v0;
-                            float uEnd = u0 + (width * cellW);
-                            float vEnd = v0 + (height * cellH);
-
-                            float packU = std::floor(u0 * 1024.0f + 0.5f) + 1.0f;
-                            float packV = std::floor(v0 * 1024.0f + 0.5f) + 1.0f;
-                            
-                            float offsetU = packU * 10.0f;
-                            float offsetV = packV * 10.0f;
-
-                            float pU0 = u0 + offsetU;
-                            float pV0 = v0 + offsetV;
-                            float pUEnd = uEnd + offsetU;
-                            float pVEnd = vEnd + offsetV;
-
+                            float mult = 0.8f;
+                            t->color(((current.tileColor >> 16) & 0xff) / 255.0f * mult, ((current.tileColor >> 8) & 0xff) / 255.0f * mult, ((current.tileColor) & 0xff) / 255.0f * mult);
+                            float u0 = current.texture ? current.texture->getU0() : 0.0f, v0 = current.texture ? current.texture->getV0() : 0.0f;
+                            float u1 = current.texture ? current.texture->getU1() : 0.0f, v1 = current.texture ? current.texture->getV1() : 0.0f;
+                            float cellW = u1 - u0, cellH = v1 - v0, uEnd = u0 + (width * cellW), vEnd = v0 + (height * cellH);
+                            float packU = std::floor(u0 * 1024.0f + 0.5f) + 1.0f, packV = std::floor(v0 * 1024.0f + 0.5f) + 1.0f;
+                            float oU = packU * 10.0f, oV = packV * 10.0f, pU0 = u0 + oU, pV0 = v0 + oV, pUEnd = uEnd + oU, pVEnd = vEnd + oV;
                             t->tex2(current.lightColor);
-
                             float cx = (float)(x0 + u), cy = (float)(y0 + v), cz = (float)(z0 + z), cw = (float)width, ch = (float)height;
                             if (face == 2) {
-                                t->vertexUV(cx, cy + ch, cz, pUEnd, pV0);
-                                t->vertexUV(cx + cw, cy + ch, cz, pU0, pV0);
-                                t->vertexUV(cx + cw, cy, cz, pU0, pVEnd);
-                                t->vertexUV(cx, cy, cz, pUEnd, pVEnd);
+                                t->vertexUV(cx, cy + ch, cz, pUEnd, pV0); t->vertexUV(cx + cw, cy + ch, cz, pU0, pV0);
+                                t->vertexUV(cx + cw, cy, cz, pU0, pVEnd); t->vertexUV(cx, cy, cz, pUEnd, pVEnd);
                             } else {
-                                t->vertexUV(cx, cy + ch, cz + 1.0f, pU0, pV0);
-                                t->vertexUV(cx, cy, cz + 1.0f, pU0, pVEnd);
-                                t->vertexUV(cx + cw, cy, cz + 1.0f, pUEnd, pVEnd);
-                                t->vertexUV(cx + cw, cy + ch, cz + 1.0f, pUEnd, pV0);
+                                t->vertexUV(cx, cy + ch, cz + 1.0f, pU0, pV0); t->vertexUV(cx, cy, cz + 1.0f, pU0, pVEnd);
+                                t->vertexUV(cx + cw, cy, cz + 1.0f, pUEnd, pVEnd); t->vertexUV(cx + cw, cy + ch, cz + 1.0f, pUEnd, pV0);
                             }
                         }
                     }
                 }
-            }
-            else { // Eje X (WEST / EAST)
+            } else {
+                int xDir = (face == 5) ? 1 : -1;
                 int heightY = y1 - y0;
                 for (int x = 0; x < 16; x++) {
-                    std::vector<FaceInfo> grid(16 * heightY);
+                    FaceInfo* grid = gridBufferX.data();
                     bool hasData = false;
+                    int xShift = x << 11;
                     for (int y = 0; y < heightY; y++) {
+                        int worldY = y0 + y, idxY = indexYBase[worldY], offset = offsetBaseY[worldY];
+                        unsigned char* layerPtr = tileIds + offset;
                         for (int z = 0; z < 16; z++) {
-                            int worldY = y0 + y;
-                            int offset = 0;
-                            int indexY = worldY;
-                            if (indexY >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT) {
-                                indexY -= Level::COMPRESSED_CHUNK_SECTION_HEIGHT;
-                                offset = Level::COMPRESSED_CHUNK_SECTION_TILES;
-                            }
-                            unsigned char tileId = tileIds[offset + ((x << 11) | (z << 7) | indexY)];
-                            if (tileId == 0 || tileId == 0xff) continue;
+                            int zShift = z << 7;
+                            unsigned char tileId = layerPtr[xShift | zShift | idxY];
+                            if (tileId == 0 || tileId == 0xff || !isGreedySafeLUT[tileId]) continue;
                             Tile* tile = Tile::tiles[tileId];
-                            if (!isGreedySafe(tile) || tile->getRenderLayer() != currentLayer) continue;
-                            
-                            int nx = x0 + x + (face == 5 ? 1 : -1);
-                            int ny = worldY;
-                            int nz = z0 + z;
-
-                            if (!tile->shouldRenderFace(region, nx, ny, nz, face)) continue;
-                            
+                            if (!tile || tile->getRenderLayer() != currentLayer) continue;
+                            int nx = x0 + x + xDir;
+                            bool renderFace = false;
+                            if (nx >= x0 && nx < x1) {
+                                unsigned char neighborId = tileIds[offset + ((nx - x0) << 11 | zShift | idxY)];
+                                if (neighborId == 0 || neighborId == 0xff || !isSolidLUT[neighborId]) renderFace = true;
+                            } else renderFace = tile->shouldRenderFace(region, nx, worldY, z0 + z, face);
+                            if (!renderFace) continue;
                             int gridIdx = y * 16 + z;
                             grid[gridIdx].tileId = tileId;
                             grid[gridIdx].texture = tileRenderer->getTexture(tile, region, x0 + x, worldY, z0 + z, face);
-                            grid[gridIdx].lightColor = tileRenderer->getLightColor(tile, region, nx, ny, nz);
+                            grid[gridIdx].lightColor = tileRenderer->getLightColor(tile, region, nx, worldY, z0 + z);
                             grid[gridIdx].tileColor = tile->getColor(region, x0 + x, worldY, z0 + z);
+                            grid[gridIdx].merged = false;
                             hasData = true;
                         }
                     }
@@ -653,52 +575,24 @@ void Chunk::rebuild() {
                                 if (!ok) break;
                                 height++;
                             }
-                            for (int cv = v; cv < v + height; cv++) 
-                                for (int cu = u; cu < u + width; cu++) grid[cv * 16 + cu].merged = true;
-
+                            for (int cv = v; cv < v + height; cv++) for (int cu = u; cu < u + width; cu++) grid[cv * 16 + cu].merged = true;
                             startTesselatorIfNeeded();
                             rendered = true;
-                            float multiplier = 0.6f;
-                            
-                            t->color(((current.tileColor >> 16) & 0xff) / 255.0f * multiplier,
-                                     ((current.tileColor >> 8) & 0xff) / 255.0f * multiplier,
-                                     ((current.tileColor) & 0xff) / 255.0f * multiplier);
-
-                            float u0 = current.texture ? current.texture->getU0() : 0.0f;
-                            float v0 = current.texture ? current.texture->getV0() : 0.0f;
-                            float u1 = current.texture ? current.texture->getU1() : 0.0f;
-                            float v1 = current.texture ? current.texture->getV1() : 0.0f;
-
-                            // ===== NUEVO EMPAQUETADO EXACTO (EJE X) =====
-                            float cellW = u1 - u0;
-                            float cellH = v1 - v0;
-                            float uEnd = u0 + (width * cellW);
-                            float vEnd = v0 + (height * cellH);
-
-                            float packU = std::floor(u0 * 1024.0f + 0.5f) + 1.0f;
-                            float packV = std::floor(v0 * 1024.0f + 0.5f) + 1.0f;
-                            
-                            float offsetU = packU * 10.0f;
-                            float offsetV = packV * 10.0f;
-
-                            float pU0 = u0 + offsetU;
-                            float pV0 = v0 + offsetV;
-                            float pUEnd = uEnd + offsetU;
-                            float pVEnd = vEnd + offsetV;
-
+                            float mult = 0.6f;
+                            t->color(((current.tileColor >> 16) & 0xff) / 255.0f * mult, ((current.tileColor >> 8) & 0xff) / 255.0f * mult, ((current.tileColor) & 0xff) / 255.0f * mult);
+                            float u0 = current.texture ? current.texture->getU0() : 0.0f, v0 = current.texture ? current.texture->getV0() : 0.0f;
+                            float u1 = current.texture ? current.texture->getU1() : 0.0f, v1 = current.texture ? current.texture->getV1() : 0.0f;
+                            float cellW = u1 - u0, cellH = v1 - v0, uEnd = u0 + (width * cellW), vEnd = v0 + (height * cellH);
+                            float packU = std::floor(u0 * 1024.0f + 0.5f) + 1.0f, packV = std::floor(v0 * 1024.0f + 0.5f) + 1.0f;
+                            float oU = packU * 10.0f, oV = packV * 10.0f, pU0 = u0 + oU, pV0 = v0 + oV, pUEnd = uEnd + oU, pVEnd = vEnd + oV;
                             t->tex2(current.lightColor);
-
                             float cx = (float)(x0 + x), cy = (float)(y0 + v), cz = (float)(z0 + u), cw = (float)width, ch = (float)height;
                             if (face == 4) {
-                                t->vertexUV(cx, cy + ch, cz + cw, pUEnd, pV0);
-                                t->vertexUV(cx, cy + ch, cz, pU0, pV0);
-                                t->vertexUV(cx, cy, cz, pU0, pVEnd);
-                                t->vertexUV(cx, cy, cz + cw, pUEnd, pVEnd);
+                                t->vertexUV(cx, cy + ch, cz + cw, pUEnd, pV0); t->vertexUV(cx, cy + ch, cz, pU0, pV0);
+                                t->vertexUV(cx, cy, cz, pU0, pVEnd); t->vertexUV(cx, cy, cz + cw, pUEnd, pVEnd);
                             } else {
-                                t->vertexUV(cx + 1.0f, cy, cz + cw, pU0, pVEnd);
-                                t->vertexUV(cx + 1.0f, cy, cz, pUEnd, pVEnd);
-                                t->vertexUV(cx + 1.0f, cy + ch, cz, pUEnd, pV0);
-                                t->vertexUV(cx + 1.0f, cy + ch, cz + cw, pU0, pV0);
+                                t->vertexUV(cx + 1.0f, cy, cz + cw, pU0, pVEnd); t->vertexUV(cx + 1.0f, cy, cz, pUEnd, pVEnd);
+                                t->vertexUV(cx + 1.0f, cy + ch, cz, pUEnd, pV0); t->vertexUV(cx + 1.0f, cy + ch, cz + cw, pU0, pV0);
                             }
                         }
                     }
@@ -706,42 +600,23 @@ void Chunk::rebuild() {
             }
         }
 
-        // =================================================================================
-        // PASO 2: RENDERIZADO ESTÁNDAR (SALTANDO BLOQUES QUE YA DIBUJÓ EL GREEDY)
-        // =================================================================================
         for (int z = z0; z < z1; z++) {
+            int zIdx = z - z0;
             for (int x = x0; x < x1; x++) {
+                int xIdx = x - x0;
                 for (int y = y0; y < y1; y++) {
-                    int indexY = y;
-                    int offset = 0;
-                    if (indexY >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT) {
-                        indexY -= Level::COMPRESSED_CHUNK_SECTION_HEIGHT;
-                        offset = Level::COMPRESSED_CHUNK_SECTION_TILES;
-                    }
-                    unsigned char tileId = tileIds[offset + (((x - x0) << 11) | ((z - z0) << 7) | indexY)];
-                    if (tileId == 0xff) continue; 
-
+                    unsigned char tileId = tileIds[offsetBaseY[y] + ((xIdx << 11) | (zIdx << 7) | indexYBase[y])];
+                    if (tileId == 0xff) continue;
                     if (tileId > 0) {
                         Tile* tile = Tile::tiles[tileId];
                         if (!tile) continue;
-                        if (tile->isSolidRender()) {
-                            if (isGreedySafe(tile)) continue;
-                        }
-
-                        if (!started) {
-                            started = true;
-                            glNewList(lists + currentLayer, GL_COMPILE);
-                            glDepthMask(true);
-                            t->useCompactVertices(false);
-                            t->begin();
-                            t->offset((float)(-this->x), (float)(-this->y), (float)(-this->z));
-                        }
-
+                        // CORRECCIÓN: Ahora isGreedySafeLUT es precisa
+                        if (tile->isSolidRender() && isGreedySafeLUT[tileId]) continue;
+                        if (!started) startTesselatorIfNeeded();
                         if (currentLayer == 0 && tile->isEntityTile()) {
                             std::shared_ptr<TileEntity> et = region->getTileEntity(x, y, z);
                             if (TileEntityRenderDispatcher::instance->hasRenderer(et)) renderableTileEntities.push_back(et);
                         }
-
                         int renderLayer = tile->getRenderLayer();
                         if (renderLayer != currentLayer) renderNextLayer = true;
                         else if (renderLayer == currentLayer) rendered |= tileRenderer->tesselateInWorld(tile, x, y, z);
@@ -756,16 +631,12 @@ void Chunk::rebuild() {
             glEndList();
             t->useCompactVertices(false);
             t->offset(0, 0, 0);
-        } else {
-            rendered = false;
         }
-
         if (rendered) levelRenderer->clearGlobalChunkFlag(this->x, this->y, this->z, level, LevelRenderer::CHUNK_FLAG_EMPTY0, currentLayer);
         else {
             levelRenderer->setGlobalChunkFlag(this->x, this->y, this->z, level, LevelRenderer::CHUNK_FLAG_EMPTY0, currentLayer);
             PlatformRenderer.CBuffClear(lists + currentLayer);
         }
-
         if ((currentLayer == 0) && (!renderNextLayer)) {
             levelRenderer->setGlobalChunkFlag(this->x, this->y, this->z, level, LevelRenderer::CHUNK_FLAG_EMPTY1);
             PlatformRenderer.CBuffClear(lists + 1);
@@ -790,13 +661,11 @@ void Chunk::rebuild() {
         reconcileRenderableTileEntities(renderableTileEntities);
     }
 
-    if (LevelChunk::touchedSky) 
-        levelRenderer->clearGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_NOTSKYLIT);
-    else 
-        levelRenderer->setGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_NOTSKYLIT);
-    
+    if (LevelChunk::touchedSky) levelRenderer->clearGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_NOTSKYLIT);
+    else levelRenderer->setGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_NOTSKYLIT);
     levelRenderer->setGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_COMPILED);
 }
+
 
 
 float Chunk::distanceToSqr(std::shared_ptr<Entity> player) const {
