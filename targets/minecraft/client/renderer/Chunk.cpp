@@ -228,6 +228,7 @@ struct FaceInfo {
 };
 
 
+
 void Chunk::rebuild() {
 #if defined(_LARGE_WORLDS)
     Tesselator* t = Tesselator::getInstance();
@@ -358,11 +359,10 @@ void Chunk::rebuild() {
         bounds.boundingBox[3] = XZSIZE + g; bounds.boundingBox[4] = SIZE + g; bounds.boundingBox[5] = XZSIZE + g;
     }
 
-    // NUEVO: Filtro para separar bloques simples de bloques complejos
+    // Filtro para separar bloques simples de bloques complejos
     auto isGreedySafe = [](Tile* tile) {
         if (!tile || !tile->isSolidRender()) return false;
         int id = tile->id;
-        // Excluimos bloques con rotaciones (troncos, cuarzo), capas extra (hierba) o iluminación compleja (hojas)
         if (id == 2 || id == 17 || id == 18 || id == 23 || id == 61 || id == 62 || 
             id == 86 || id == 91 || id == 155 || id == 158 || id == 161 || id == 162 || id == 170) {
             return false;
@@ -387,7 +387,7 @@ void Chunk::rebuild() {
         };
 
         // =================================================================================
-        // PASO 1: GREEDY MESHING (CORREGIDO CON FILTRO Y EMPAQUETADO UV)
+        // PASO 1: GREEDY MESHING (CON NUEVO EMPAQUETADO EXACTO)
         // =================================================================================
         FRAME_PROFILE_SCOPE(ChunkGreedyMeshing);
 
@@ -463,20 +463,23 @@ void Chunk::rebuild() {
                             float u1 = current.texture ? current.texture->getU1() : 0.0f;
                             float v1 = current.texture ? current.texture->getV1() : 0.0f;
 
-                            // ===== TRUCO DEL UV: Empaquetamos la celda de textura en las coordenadas UV =====
+                            // ===== NUEVO EMPAQUETADO EXACTO (EJE Y) =====
                             float cellW = u1 - u0;
                             float cellH = v1 - v0;
                             float uEnd = u0 + (width * cellW);
                             float vEnd = v0 + (height * cellH);
 
-                            float texCol = std::floor(u0 * 16.0f + 0.5f);
-                            float texRow = std::floor(v0 * 32.0f + 0.5f);
-                            float pU0 = u0 + ((texCol + 1.0f) * 100.0f);
-                            float pV0 = v0 + ((texRow + 1.0f) * 100.0f);
-                            float pUEnd = uEnd + ((texCol + 1.0f) * 100.0f);
-                            float pVEnd = vEnd + ((texRow + 1.0f) * 100.0f);
+                            float packU = std::floor(u0 * 1024.0f + 0.5f) + 1.0f;
+                            float packV = std::floor(v0 * 1024.0f + 0.5f) + 1.0f;
+                            
+                            float offsetU = packU * 10.0f;
+                            float offsetV = packV * 10.0f;
 
-                            // Devolvemos intacto el mapa de luz original
+                            float pU0 = u0 + offsetU;
+                            float pV0 = v0 + offsetV;
+                            float pUEnd = uEnd + offsetU;
+                            float pVEnd = vEnd + offsetV;
+
                             t->tex2(current.lightColor);
 
                             float cx = (float)(x0 + u), cz = (float)(z0 + v), cy = (float)y, cw = (float)width, ch = (float)height;
@@ -563,18 +566,22 @@ void Chunk::rebuild() {
                             float u1 = current.texture ? current.texture->getU1() : 0.0f;
                             float v1 = current.texture ? current.texture->getV1() : 0.0f;
 
-                            // ===== TRUCO DEL UV: Empaquetamos la celda de textura en las coordenadas UV =====
+                            // ===== NUEVO EMPAQUETADO EXACTO (EJE Z) =====
                             float cellW = u1 - u0;
                             float cellH = v1 - v0;
                             float uEnd = u0 + (width * cellW);
                             float vEnd = v0 + (height * cellH);
 
-                            float texCol = std::floor(u0 * 16.0f + 0.5f);
-                            float texRow = std::floor(v0 * 32.0f + 0.5f);
-                            float pU0 = u0 + ((texCol + 1.0f) * 100.0f);
-                            float pV0 = v0 + ((texRow + 1.0f) * 100.0f);
-                            float pUEnd = uEnd + ((texCol + 1.0f) * 100.0f);
-                            float pVEnd = vEnd + ((texRow + 1.0f) * 100.0f);
+                            float packU = std::floor(u0 * 1024.0f + 0.5f) + 1.0f;
+                            float packV = std::floor(v0 * 1024.0f + 0.5f) + 1.0f;
+                            
+                            float offsetU = packU * 10.0f;
+                            float offsetV = packV * 10.0f;
+
+                            float pU0 = u0 + offsetU;
+                            float pV0 = v0 + offsetV;
+                            float pUEnd = uEnd + offsetU;
+                            float pVEnd = vEnd + offsetV;
 
                             t->tex2(current.lightColor);
 
@@ -662,18 +669,22 @@ void Chunk::rebuild() {
                             float u1 = current.texture ? current.texture->getU1() : 0.0f;
                             float v1 = current.texture ? current.texture->getV1() : 0.0f;
 
-                            // ===== TRUCO DEL UV: Empaquetamos la celda de textura en las coordenadas UV =====
+                            // ===== NUEVO EMPAQUETADO EXACTO (EJE X) =====
                             float cellW = u1 - u0;
                             float cellH = v1 - v0;
                             float uEnd = u0 + (width * cellW);
                             float vEnd = v0 + (height * cellH);
 
-                            float texCol = std::floor(u0 * 16.0f + 0.5f);
-                            float texRow = std::floor(v0 * 32.0f + 0.5f);
-                            float pU0 = u0 + ((texCol + 1.0f) * 100.0f);
-                            float pV0 = v0 + ((texRow + 1.0f) * 100.0f);
-                            float pUEnd = uEnd + ((texCol + 1.0f) * 100.0f);
-                            float pVEnd = vEnd + ((texRow + 1.0f) * 100.0f);
+                            float packU = std::floor(u0 * 1024.0f + 0.5f) + 1.0f;
+                            float packV = std::floor(v0 * 1024.0f + 0.5f) + 1.0f;
+                            
+                            float offsetU = packU * 10.0f;
+                            float offsetV = packV * 10.0f;
+
+                            float pU0 = u0 + offsetU;
+                            float pV0 = v0 + offsetV;
+                            float pUEnd = uEnd + offsetU;
+                            float pVEnd = vEnd + offsetV;
 
                             t->tex2(current.lightColor);
 
@@ -786,6 +797,7 @@ void Chunk::rebuild() {
     
     levelRenderer->setGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_COMPILED);
 }
+
 
 float Chunk::distanceToSqr(std::shared_ptr<Entity> player) const {
     float xd = (float)(player->x - xm);

@@ -35,18 +35,19 @@ void main() {
     vec4 eyePos  = uMV  * aPos4;
     gl_Position  = uMVP * aPos4;
     
-    // Extraemos la información empaquetada de Greedy Mesh de aUV0
-    float packU = floor(aUV0.x / 100.0);
-    float packV = floor(aUV0.y / 100.0);
+    // Extracción segura del empaquetado Greedy
+    float packU = floor((aUV0.x + 0.001) / 10.0);
+    float packV = floor((aUV0.y + 0.001) / 10.0);
     
-    // Recuperamos los UV reales limpios
-    vec2 actualUV = vec2(mod(aUV0.x, 100.0), mod(aUV0.y, 100.0));
-    vec2 transformedUV = (uTexMat0 * vec4(actualUV, 0.0, 1.0)).xy;
-    
-    // Reempaquetamos para que el Fragment Shader lo reciba interpolado
-    vUV0 = transformedUV + vec2(packU * 100.0, packV * 100.0);
+    if (packU > 0.0 && packV > 0.0) {
+        // Bloque Greedy: Pasamos el UV directo para no corromperlo con uTexMat0
+        vUV0 = aUV0; 
+    } else {
+        // Bloque Normal o Entidad (Inventario): Aplica animaciones y rotaciones estándar
+        vUV0 = (uTexMat0 * vec4(aUV0, 0.0, 1.0)).xy; 
+    }
 
-    // Mapa de Luz Intacto Original
+    // Mapa de luz estándar 100% nativo
     vec2 aLMrawF = vec2(aLMraw);
     vec2 normalizedLM = (aLMrawF.x > 2.0 || aLMrawF.y > 2.0) ? (aLMrawF / 65535.0) : aLMrawF;
     vec2 lm = (aLMrawF.x < -0.5) ? uGlobalLM : normalizedLM;
@@ -69,5 +70,4 @@ void main() {
     else if (uFogMode == 3) { float d = uFogDensity * eDist; vFogFactor = clamp(exp(-d*d), 0.0, 1.0); }
     else                    vFogFactor = 1.0;
 }
-
 )GLSL"

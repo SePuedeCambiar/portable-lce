@@ -53,6 +53,7 @@ void PreStitchedTextureMap::stitch() {
     loadUVs();
 
     if (iconType == Icon::TYPE_TERRAIN) {
+        // for (Tile tile : Tile.tiles)
         for (unsigned int i = 0; i < Tile::TILE_NUM_COUNT; ++i) {
             if (Tile::tiles[i] != nullptr) {
                 Tile::tiles[i]->registerIcons(this);
@@ -63,6 +64,7 @@ void PreStitchedTextureMap::stitch() {
         EntityRenderDispatcher::instance->registerTerrainTextures(this);
     }
 
+    // for (Item item : Item.items)
     for (unsigned int i = 0; i < Item::ITEM_NUM_COUNT; ++i) {
         Item* item = Item::items[i];
         if (item != nullptr && item->getIconType() == iconType) {
@@ -70,21 +72,29 @@ void PreStitchedTextureMap::stitch() {
         }
     }
 
-    std::unordered_map<TextureHolder*, std::vector<Texture*>*> textures;
+    // Collection bucket for multiple frames per texture
+    std::unordered_map<TextureHolder*, std::vector<Texture*>*>
+        textures;  // = new HashMap<TextureHolder, List<Texture>>();
 
     Stitcher* stitcher = TextureManager::getInstance()->createStitcher(name);
+
     animatedTextures.clear();
 
+    // Create the final image
     std::string filename = name + extension;
+
     TexturePack* texturePack = Minecraft::GetInstance()->skins->getSelected();
-    
+    // try {
     int mode = Texture::TM_DYNAMIC;
-    int clamp = Texture::WM_WRAP;
+    int clamp = Texture::WM_WRAP;  // 4J Stu - Don't clamp as it causes issues
+                                   // with how we signal non-mipmmapped textures
+                                   // to the pixel shader //Texture::WM_CLAMP;
     int minFilter = Texture::TFLT_NEAREST;
     int magFilter = Texture::TFLT_NEAREST;
 
     std::string drive = "";
 
+    // 4J-PB - need to check for BD patched files
     if (texturePack->hasFile("res/" + filename, false)) {
         drive = texturePack->getPath(true);
     } else {
@@ -92,7 +102,11 @@ void PreStitchedTextureMap::stitch() {
         texturePack = Minecraft::GetInstance()->skins->getDefault();
     }
 
-    BufferedImage* image = texturePack->getImageResource(filename, false, true, drive);
+    // BufferedImage *image = new BufferedImage(texturePack->getResource("/" +
+    // filename),false,true,drive);
+    // //ImageIO::read(texturePack->getResource("/" + filename));
+    BufferedImage* image =
+        texturePack->getImageResource(filename, false, true, drive);
     int height = image->getHeight();
     int width = image->getWidth();
 
@@ -105,36 +119,30 @@ void PreStitchedTextureMap::stitch() {
     stitchResult->transferFromImage(image);
     delete image;
     TextureManager::getInstance()->registerName(name, stitchResult);
+    // stitchResult = stitcher->constructTexture(m_mipMap);
 
     for (auto it = texturesByName.begin(); it != texturesByName.end(); ++it) {
         StitchedTexture* preStitched = (StitchedTexture*)it->second;
 
         int x = preStitched->getU0() * stitchResult->getWidth();
         int y = preStitched->getV0() * stitchResult->getHeight();
-        int w = (preStitched->getU1() * stitchResult->getWidth()) - x;
-        int h = (preStitched->getV1() * stitchResult->getHeight()) - y;
+        int width = (preStitched->getU1() * stitchResult->getWidth()) - x;
+        int height = (preStitched->getV1() * stitchResult->getHeight()) - y;
 
-        preStitched->init(stitchResult, nullptr, x, y, w, h, false);
+        preStitched->init(stitchResult, nullptr, x, y, width, height, false);
     }
 
     for (auto it = texturesByName.begin(); it != texturesByName.end(); ++it) {
         StitchedTexture* preStitched = (StitchedTexture*)(it->second);
+
         makeTextureAnimated(texturePack, preStitched);
     }
+    // missingPosition = (StitchedTexture
+    // *)texturesByName.find(NAME_MISSING_TEXTURE)->second;
 
     stitchResult->writeAsPNG("debug.stitched_" + name + ".png");
-
-    // =================================================================================
-    // NUEVO: Sincronización del tamaño del Atlas con el Shader
-    // =================================================================================
-    // Informamos al renderer el tamaño real del Atlas para que el uCellSize sea exacto.
-    // Esto elimina el estiramiento y los saltos de material en el Greedy Meshing.
-    PlatformRenderer.SetAtlasSize(stitchResult->getWidth(), stitchResult->getHeight());
-    // =================================================================================
-
     stitchResult->updateOnGPU();
 }
-
 
 void PreStitchedTextureMap::makeTextureAnimated(TexturePack* texturePack,
                                                 StitchedTexture* tex) {

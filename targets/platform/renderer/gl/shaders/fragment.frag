@@ -8,7 +8,7 @@ uniform float uAlphaRef;
 uniform vec4  uFogColor;
 uniform int   uFogEnable;
 uniform float uInvGamma;
-uniform vec2  uCellSize; 
+uniform vec2  uCellSize;   // Debe ser (256, 256) en tu caso
 
 in  vec2  vUV0;
 in  vec2  vUV1;
@@ -17,29 +17,27 @@ in  float vFogFactor;
 out vec4  oColor;
 
 void main() {
-    // Decodificación
-    float packU = floor(vUV0.x / 100.0);
-    float packV = floor(vUV0.y / 100.0);
-    vec2 actualUV = vec2(mod(vUV0.x, 100.0), mod(vUV0.y, 100.0));
+    float packU = floor((vUV0.x + 0.001) / 10.0);
+    float packV = floor((vUV0.y + 0.001) / 10.0);
+    
+    vec2 actualUV = vec2(mod(vUV0.x, 10.0), mod(vUV0.y, 10.0));
     vec2 finalUV = actualUV;
     
-    // Obtenemos derivadas antes del tiling para no romper el mipmapping
     vec2 dx = dFdx(actualUV);
     vec2 dy = dFdy(actualUV);
 
-    // Si packU y packV son > 0, indica que la celda es Greedy
-    if (packU > 0.0 || packV > 0.0) {
-        vec2 offset = vec2((packU - 1.0) / 16.0, (packV - 1.0) / 32.0);
+    if (packU > 0.0 && packV > 0.0) {
+        vec2 offset = vec2((packU - 1.0) / 1024.0, (packV - 1.0) / 1024.0);
         
+        // Tamaño de celda para atlas 16×32
         vec2 uvCellSize = vec2(1.0 / 16.0, 1.0 / 32.0);
         if (uCellSize.x > 0.0) {
-            uvCellSize = vec2(1.0 / 16.0, (uCellSize.x / 16.0) / uCellSize.y);
+            uvCellSize = vec2(16.0 / uCellSize.x, 32.0 / uCellSize.y);
         }
         
         vec2 localUV = actualUV - offset;
         vec2 fracUV = fract(localUV / uvCellSize);
-        fracUV = clamp(fracUV, 0.0001, 0.9999);
-        
+        fracUV = clamp(fracUV, 0.001, 0.999);
         finalUV = offset + (fracUV * uvCellSize);
     }
 
