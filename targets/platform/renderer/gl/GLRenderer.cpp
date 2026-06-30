@@ -204,6 +204,9 @@ struct ShaderUniforms {
     GLint uUseTexture = -1;
     GLint uInvGamma = -1;
     GLint uChunkOffset = -1;
+    GLint uCellSize = -1;   // <--- IMPORTANTE
+    GLint uGreedyMode = -1; // <--- IMPORTANTE
+
     void build(const char* vs, const char* fs) {
         GLuint v = compileShader(GL_VERTEX_SHADER, vs);
         GLuint f = compileShader(GL_FRAGMENT_SHADER, fs);
@@ -211,39 +214,22 @@ struct ShaderUniforms {
         glDeleteShader(v);
         glDeleteShader(f);
         if (!prog) return;
+
 #define L(x) x = glGetUniformLocation(prog, #x)
-        L(uMVP);
-        L(uMV);
-        L(uNormalMatrix);
-        L(uNormalSign);
-        L(uTexMat0);
-        L(uBaseColor);
-        L(uLighting);
-        L(uLight0Dir);
-        L(uLight1Dir);
-        L(uLightDiffuse);
-        L(uLightAmbient);
-        L(uFogMode);
-        L(uFogStart);
-        L(uFogEnd);
-        L(uFogDensity);
-        L(uFogColor);
-        L(uFogEnable);
-        L(uLMTransform);
-        L(uUseLightmap);
-        L(uAlphaRef);
-        L(uTex0);
-        L(uTex1);
-        L(uGlobalLM);
-        L(uUseTexture);
-        L(uInvGamma);
-        L(uChunkOffset);
+        L(uMVP); L(uMV); L(uNormalMatrix); L(uNormalSign); L(uTexMat0);
+        L(uBaseColor); L(uLighting); L(uLight0Dir); L(uLight1Dir);
+        L(uLightDiffuse); L(uLightAmbient); L(uFogMode); L(uFogStart);
+        L(uFogEnd); L(uFogDensity); L(uFogColor); L(uFogEnable);
+        L(uLMTransform); L(uUseLightmap); L(uAlphaRef); L(uTex0);
+        L(uTex1); L(uGlobalLM); L(uUseTexture); L(uInvGamma);
+        L(uChunkOffset); L(uCellSize); L(uGreedyMode); 
 #undef L
         glUseProgram(prog);
         glUniform1i(uTex0, 0);
         glUniform1i(uTex1, 1);
     }
 } s_shader;
+
 
 // Matrix stacks
 static const int STACK_DEPTH = 64;
@@ -514,7 +500,7 @@ static void bindStdAttribs() {
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 32, (void*)12);
     glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, 32, (void*)20);
     glVertexAttribPointer(3, 3, GL_BYTE, GL_TRUE, 32, (void*)24);
-    glVertexAttribIPointer(4, 2, GL_SHORT, 32, (void*)28);
+    glVertexAttribPointer(4, 2, GL_UNSIGNED_SHORT, GL_FALSE, 32, (void*)28);
 }
 static void initStreamingVAOs() {
     glGenVertexArrays(1, &s_sVAO_std);
@@ -791,7 +777,7 @@ void GLRenderer::GetFramebufferSize(int& w, int& h) {
     h = s_windowHeight;
 }
 void GLRenderer::Close() { s_window = nullptr; }
-void GLRenderer::Shutdown() {
+void GLRenderer::Shutdown()  {
     {
         std::lock_guard<std::mutex> lk(s_glCallMtx);
         for (auto& kv : s_chunkPool) kv.second.destroy();
@@ -815,6 +801,7 @@ void GLRenderer::Shutdown() {
     SDL_Quit();
 }
 // PIPELINE DE DIBUJO ORIGINAL INTEGRAL (Garantiza entidades visibles)
+
 void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVertexType vType, ePixelShaderType psType) {
     if (count <= 0 || !dataIn) return;
     bool wasQuad = isQuadPrim((int)ptype);
@@ -897,8 +884,14 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         glMode = GL_TRIANGLES;
         bytes = (size_t)count * stride;
     }
+
     std::lock_guard<std::mutex> lk(s_glCallMtx);
     pushRenderState();
+
+    // ELIMINADO: glUniform1i(s_shader.uGreedyMode, 0); 
+    // Ya no es necesario porque el shader es inteligente.
+    glUniform1i(s_shader.uGreedyMode, 0); 
+
     glBindVertexArray(s_sVAO_std);
     glBindBuffer(GL_ARRAY_BUFFER, s_sVBO_std);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)bytes, nullptr, GL_STREAM_DRAW);
@@ -908,6 +901,10 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
+
+
+
+
 void GLRenderer::ReadPixels(int x, int y, int w, int h, void* buf) {
     if (!buf) return;
     std::lock_guard<std::mutex> lk(s_glCallMtx);
@@ -981,6 +978,7 @@ void GLRenderer::CBuffClear(int index) {
         s_chunkPool.erase(it);
     }
 }
+
 bool GLRenderer::CBuffCall(int index, bool) {
     std::lock_guard<std::mutex> lk(s_glCallMtx);
     auto it = s_chunkPool.find(index);
@@ -995,7 +993,7 @@ bool GLRenderer::CBuffCall(int index, bool) {
         }
         glGenVertexArrays(1, &cb.vao);
         glGenBuffers(1, &cb.vbo);
-        g_vaoCount++;
+        g_vboCount++;
         g_vboCount++;
         glBindVertexArray(cb.vao);
         glBindBuffer(GL_ARRAY_BUFFER, cb.vbo);
@@ -1008,8 +1006,18 @@ bool GLRenderer::CBuffCall(int index, bool) {
         cb.rawVerts.shrink_to_fit();
         cb.vboReady = true;
     }
+
     pushRenderState();
+    
+    // --- SOLUCIÓN AL BUG DE TEXTURAS ESTIRADAS ---
+    // Activamos el modo Greedy porque estamos dibujando los Chunks del mundo.
+    // Esto le indica al shader que debe aplicar la fórmula de Tiling (repetición)
+    // al Atlas y usar la luz simplificada para evitar el ennegrecido.
+    //glUniform1i(s_shader.uGreedyMode, 1); 
+    glUniform1i(s_shader.uGreedyMode, 1); 
+
     glBindVertexArray(cb.vao);
+
     // =================================================================================
     // NUEVA ESTRATEGIA DE RENDERIZADO:
     // Hacemos el binding del EBO (Buffer de Índices) si el primitivo es un Quad/Triángulo.
@@ -1018,7 +1026,7 @@ bool GLRenderer::CBuffCall(int index, bool) {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_globalEBO);
     for (const auto& dc : cb.draws) {
         if (dc.wasQuad) {
-            // El número de triángulos a dIbujar es (Vértices / 4) * 6
+            // El número de triángulos a dibujar es (Vértices / 4) * 6
             GLsizei indexCount = (dc.count / 4) * 6;
             // Usamos glDrawElementsBaseVertex para no tener que regenerar índices locales
             glDrawElementsBaseVertex(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, (void*)0, dc.first);
@@ -1032,6 +1040,8 @@ bool GLRenderer::CBuffCall(int index, bool) {
     glBindVertexArray(0);
     return true;
 }
+
+
 void GLRenderer::MatrixMode(int t) {
     if (t == GL_PROJECTION)
         s_matMode = 1;
@@ -1267,9 +1277,7 @@ void GLRenderer::StateSetTextureEnable(bool e) {
         markDirty(DIRTY_TEXTURE);
     }
 }
-void GLRenderer::StateSetActiveTexture(int tex) {
-    s_rs.activeTexture = (tex == 0x84C1 /*GL_TEXTURE1*/) ? 1 : 0;
-}
+
 // TEXTURE TRACKING IN STANDARD CREATOR
 int GLRenderer::TextureCreate() {
     GLuint id;
@@ -1342,7 +1350,7 @@ void GLRenderer::TextureDataUpdate(int xo, int yo, int w, int h, void* d,
 void GLRenderer::TextureSetParam(int p, int v) {
     glTexParameteri(GL_TEXTURE_2D, p, v);
 }
-static int stbLoad(unsigned char* data, int w, int h, D3DXIMAGE_INFO* info,
+static int stbLoad(unsigned char* data, int w, int h, ImageInfo* info,
                    int** out) {
     int* px = new int[w * h];
     for (int i = 0; i < w * h; i++) {
@@ -1357,23 +1365,34 @@ static int stbLoad(unsigned char* data, int w, int h, D3DXIMAGE_INFO* info,
     *out = px;
     return 0;  // Success
 }
-int GLRenderer::LoadTextureData(const char* fn, D3DXIMAGE_INFO* i, int** o) {
+
+int GLRenderer::LoadTextureData(const char* szFilename, D3DXIMAGE_INFO* pSrcInfo, int** ppDataOut) {
     int w, h, c;
-    unsigned char* d = stbi_load(fn, &w, &h, &c, 4);
-    if (!d) return -1;  // Failure
-    int hr = stbLoad(d, w, h, i, o);
+    unsigned char* d = stbi_load(szFilename, &w, &h, &c, 4);
+    if (!d) return -1;
+    
+    // Usamos la función helper stbLoad que ya tienes definida
+    // OJO: Si stbLoad usa ImageInfo, cámbialo a D3DXIMAGE_INFO
+    int hr = stbLoad(d, w, h, pSrcInfo, ppDataOut);
     stbi_image_free(d);
     return hr;
 }
-int GLRenderer::LoadTextureData(uint8_t* pb, uint32_t nb, D3DXIMAGE_INFO* i,
-                                int** o) {
+
+
+int GLRenderer::LoadTextureData(std::uint8_t* pbData, std::uint32_t byteCount, D3DXIMAGE_INFO* pSrcInfo, int** ppDataOut) {
     int w, h, c;
-    unsigned char* d = stbi_load_from_memory(pb, (int)nb, &w, &h, &c, 4);
-    if (!d) return -1;  // Failure
-    int hr = stbLoad(d, w, h, i, o);
+    unsigned char* d = stbi_load_from_memory(pbData, byteCount, &w, &h, &c, 4);
+    if (!d) return -1;
+    int hr = stbLoad(d, w, h, pSrcInfo, ppDataOut);
     stbi_image_free(d);
     return hr;
 }
+
+
+int GLRenderer::SaveTextureData(const char* szFilename, D3DXIMAGE_INFO* pSrcInfo, int* ppDataOut) {
+    return 0; // Stub
+}
+
 // TODO: TO REMOVE SOON.
 void GLRenderer::UpdateGamma(unsigned short usGamma) {
     constexpr unsigned short GAMMA_MAX = 32768;
@@ -1494,4 +1513,29 @@ void GLRenderer::flushIggyCache() {
     // Llamamos al puente de Iggy para limpiar la caché de texturas de la UI
     Iggy_FlushCache();
     Log::info("RenderRenderer: Iggy Cache flushed via Bridge.\n");
+}
+
+
+void GLRenderer::SetAtlasSize(int width, int height) {
+    if (width <= 0 || height <= 0) return;
+    float cellW = 16.0f / (float)width;
+    float cellH = 16.0f / (float)height;
+    glUseProgram(s_shader.prog);
+    glUniform2f(s_shader.uCellSize, cellW, cellH);
+}
+
+
+
+void GLRenderer::CBuffDeferredModeEnd() {
+    // Implementación vacía para satisfacer la interfaz
+}
+
+
+void GLRenderer::StateSetActiveTexture(int tex) {
+    glActiveTexture(GL_TEXTURE0 + (tex % 8));
+}
+
+void GLRenderer::CaptureScreen(ImageFileBuffer* jpgOut, void* previewOut) {
+    (void)jpgOut;
+    (void)previewOut;
 }

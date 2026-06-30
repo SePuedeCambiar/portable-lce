@@ -34,16 +34,28 @@ void main() {
     vec4 aPos4   = vec4(aPos + uChunkOffset, 1.0);
     vec4 eyePos  = uMV  * aPos4;
     gl_Position  = uMVP * aPos4;
-    vUV0 = (uTexMat0 * vec4(aUV0, 0.0, 1.0)).xy; 
+    
+    // Extraemos la información empaquetada de Greedy Mesh de aUV0
+    float packU = floor(aUV0.x / 100.0);
+    float packV = floor(aUV0.y / 100.0);
+    
+    // Recuperamos los UV reales limpios
+    vec2 actualUV = vec2(mod(aUV0.x, 100.0), mod(aUV0.y, 100.0));
+    vec2 transformedUV = (uTexMat0 * vec4(actualUV, 0.0, 1.0)).xy;
+    
+    // Reempaquetamos para que el Fragment Shader lo reciba interpolado
+    vUV0 = transformedUV + vec2(packU * 100.0, packV * 100.0);
 
-    vec2 lm = (aLMraw.x <= -500) ? uGlobalLM : vec2(aLMraw);
-    vUV1 = (lm / 256.0) * uLMTransform.xy + uLMTransform.zw;
+    // Mapa de Luz Intacto Original
+    vec2 aLMrawF = vec2(aLMraw);
+    vec2 normalizedLM = (aLMrawF.x > 2.0 || aLMrawF.y > 2.0) ? (aLMrawF / 65535.0) : aLMrawF;
+    vec2 lm = (aLMrawF.x < -0.5) ? uGlobalLM : normalizedLM;
+    vUV1 = lm * uLMTransform.xy + uLMTransform.zw;
 
     bool sentinel = (aColor == vec4(0.0));
     vec4 col = sentinel ? uBaseColor : aColor.abgr;
     if (uLighting == 1) {
         vec3 n = normalize(uNormalMatrix * aNormal) * uNormalSign;
-
         float d0 = max(dot(n, uLight0Dir), 0.0);
         float d1 = max(dot(n, uLight1Dir), 0.0);
         vColor = vec4(col.rgb * (uLightAmbient + uLightDiffuse * clamp(d0 + d1, 0.0, 1.0)), col.a);
@@ -57,4 +69,5 @@ void main() {
     else if (uFogMode == 3) { float d = uFogDensity * eDist; vFogFactor = clamp(exp(-d*d), 0.0, 1.0); }
     else                    vFogFactor = 1.0;
 }
-)GLSL";
+
+)GLSL"

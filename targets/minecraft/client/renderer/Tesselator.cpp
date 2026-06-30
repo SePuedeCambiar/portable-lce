@@ -624,3 +624,60 @@ void Tesselator::addOffset(float x, float y, float z) {
 }
 
 bool Tesselator::hasMaxVertices() { return false; }
+
+// --- AÑADIR ESTA FUNCIÓN AL FINAL DE Tesselator.cpp ---
+
+void Tesselator::vertexGreedy(float x, float y, float z, float u, float v, float uOffset, float vOffset) {
+    // 1. Actualizar límites y contador
+    bounds.addVert(x + xo, y + yo, z + zo);
+    count++;
+
+    // 2. Manejo de Mipmapping (siguiendo la lógica original)
+    float uu = mipmapEnable ? u : (u + 1.0f);
+
+    if (useCompactFormat360) {
+        // El formato compactado no soporta Greedy Meshing fácilmente, 
+        // así que forzamos al formato estándar para evitar crashes.
+        vertex(x, y, z); 
+        return;
+    }
+
+    // --- LÓGICA DE EMPAQUETADO PF3_TF2_CB4_NB4_XW1 (32 bytes) ---
+    
+    // El índice 'p' avanza de 8 en 8 (porque _array es de int, 8*4 = 32 bytes)
+    
+    // [0, 1, 2] -> Posición (3 floats)
+    float* fdata = (float*)(_array.data() + p);
+    *fdata++ = (x + xo);
+    *fdata++ = (y + yo);
+    *fdata++ = (z + zo);
+
+    // [3, 4] -> UVs (2 floats)
+    *fdata++ = uu;
+    *fdata++ = v;
+
+    // [5] -> Color (1 int)
+    _array.data()[p + 5] = col;
+
+    // [6] -> Normal (1 int)
+    _array.data()[p + 6] = _normal;
+
+    // [7] -> XW1: Aquí ocurre la magia del Greedy Meshing
+    // En lugar de luz, guardamos el Offset UV empaquetado en dos shorts (16 bits cada uno)
+    // multiplicamos por 65535 para convertir el float (0.0-1.0) a un rango entero.
+    unsigned short packedU = (unsigned short)(uOffset * 65535.0f);
+    unsigned short packedV = (unsigned short)(vOffset * 65535.0f);
+    unsigned int packedOffset = (packedU << 16) | packedV;
+    
+    _array.data()[p + 7] = packedOffset;
+
+    p += 8; // Avanzamos 32 bytes
+    vertices++;
+
+    // Control de desbordamiento del buffer
+    if (vertices % 4 == 0 && p >= size - 8 * 4) {
+        end();
+        tesselating = true;
+    }
+}
+

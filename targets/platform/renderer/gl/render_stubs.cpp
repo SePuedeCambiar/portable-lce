@@ -5,7 +5,7 @@ void GLRenderer::CBuffLockStaticCreations() {}
 int GLRenderer::CBuffSize(int) { return 0; }
 void GLRenderer::CBuffTick() {}
 void GLRenderer::CBuffDeferredModeStart() {}
-void GLRenderer::CBuffDeferredModeEnd() {}
+// CBuffDeferredModeEnd ELIMINADO porque ya existe en GLRenderer.cpp
 
 // Render States
 void GLRenderer::StateSetLightEnable(int, bool) {}
@@ -19,9 +19,7 @@ void GLRenderer::TextureDynamicUpdateEnd() {}
 void GLRenderer::TextureGetStats() {}
 void* GLRenderer::TextureGetTexture(int) { return nullptr; }
 
-int GLRenderer::SaveTextureData(const char*, D3DXIMAGE_INFO*, int*) {
-    return 0;
-}
+// SaveTextureData ELIMINADO porque ya existe en GLRenderer.cpp
 int GLRenderer::SaveTextureDataToMemory(void*, int, int*, int, int, int*) {
     return 0;
 }
@@ -29,7 +27,7 @@ int GLRenderer::SaveTextureDataToMemory(void*, int, int*, int, int, int*) {
 // Screen/Image Capturing
 void GLRenderer::DoScreenGrabOnNextPresent() {}
 void GLRenderer::CaptureThumbnail(ImageFileBuffer*) {}
-void GLRenderer::CaptureScreen(ImageFileBuffer*, XSOCIAL_PREVIEWIMAGE*) {}
+// CaptureScreen ELIMINADO porque ya existe en GLRenderer.cpp
 
 // Conditional Rendering & Events
 void GLRenderer::BeginConditionalSurvey(int) {}

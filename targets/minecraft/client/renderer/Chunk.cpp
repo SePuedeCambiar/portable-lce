@@ -2,6 +2,7 @@
 #include "minecraft/world/Icon.h"  
 
 #include <string.h>
+#include <cmath>
 
 #include <mutex>
 #include <unordered_map>
@@ -28,7 +29,7 @@
 
 
 
-#define GREEDY_MESH_TILING 1
+#define GREEDY_MESH_TILING 0
 
 int Chunk::updates = 0;
 
@@ -209,9 +210,6 @@ void Chunk::makeCopyForRebuild(Chunk* source) {
         source->globalRenderableTileEntities_cs;
 }
 
-// Activar (1) para evitar estiramiento en Atlas de texturas, desactivar (0) si se usa shader de wrapping
-// Activar (1) para evitar estiramiento en Atlas de texturas, desactivar (0) si se usa shader de wrapping.
-#define GREEDY_MESH_TILING 1
 
 struct FaceInfo {
     uint8_t tileId = 0;
@@ -228,6 +226,7 @@ struct FaceInfo {
                tileId != 0;
     }
 };
+
 
 void Chunk::rebuild() {
 #if defined(_LARGE_WORLDS)
@@ -359,6 +358,18 @@ void Chunk::rebuild() {
         bounds.boundingBox[3] = XZSIZE + g; bounds.boundingBox[4] = SIZE + g; bounds.boundingBox[5] = XZSIZE + g;
     }
 
+    // NUEVO: Filtro para separar bloques simples de bloques complejos
+    auto isGreedySafe = [](Tile* tile) {
+        if (!tile || !tile->isSolidRender()) return false;
+        int id = tile->id;
+        // Excluimos bloques con rotaciones (troncos, cuarzo), capas extra (hierba) o iluminación compleja (hojas)
+        if (id == 2 || id == 17 || id == 18 || id == 23 || id == 61 || id == 62 || 
+            id == 86 || id == 91 || id == 155 || id == 158 || id == 161 || id == 162 || id == 170) {
+            return false;
+        }
+        return true;
+    };
+
     for (int currentLayer = 0; currentLayer < 2; currentLayer++) {
         bool renderNextLayer = false;
         bool rendered = false;
@@ -376,7 +387,7 @@ void Chunk::rebuild() {
         };
 
         // =================================================================================
-        // PASO 1: GREEDY MESHING
+        // PASO 1: GREEDY MESHING (CORREGIDO CON FILTRO Y EMPAQUETADO UV)
         // =================================================================================
         FRAME_PROFILE_SCOPE(ChunkGreedyMeshing);
 
@@ -399,7 +410,7 @@ void Chunk::rebuild() {
                             unsigned char tileId = tileIds[offset + ((x << 11) | (z << 7) | indexY)];
                             if (tileId == 0 || tileId == 0xff) continue;
                             Tile* tile = Tile::tiles[tileId];
-                            if (!tile || !tile->isSolidRender() || tile->getRenderLayer() != currentLayer) continue;
+                            if (!isGreedySafe(tile) || tile->getRenderLayer() != currentLayer) continue;
                             
                             int nx = x0 + x;
                             int ny = worldY + (face == 1 ? 1 : -1);
@@ -412,7 +423,7 @@ void Chunk::rebuild() {
                             int gridIdx = z * 16 + x;
                             grid[gridIdx].tileId = tileId;
                             grid[gridIdx].texture = tileRenderer->getTexture(tile, region, x0 + x, worldY, z0 + z, face);
-                            grid[gridIdx].lightColor = tileRenderer->getLightColor(tile, region, nx, ny, nz); // Luz vecina
+                            grid[gridIdx].lightColor = tileRenderer->getLightColor(tile, region, nx, ny, nz);
                             grid[gridIdx].tileColor = tile->getColor(region, x0 + x, worldY, z0 + z);
                             hasData = true;
                         }
@@ -442,7 +453,7 @@ void Chunk::rebuild() {
                             startTesselatorIfNeeded();
                             rendered = true;
                             float multiplier = (face == 0) ? 0.5f : 1.0f;
-                            t->tex2(current.lightColor);
+                            
                             t->color(((current.tileColor >> 16) & 0xff) / 255.0f * multiplier,
                                      ((current.tileColor >> 8) & 0xff) / 255.0f * multiplier,
                                      ((current.tileColor) & 0xff) / 255.0f * multiplier);
@@ -452,37 +463,34 @@ void Chunk::rebuild() {
                             float u1 = current.texture ? current.texture->getU1() : 0.0f;
                             float v1 = current.texture ? current.texture->getV1() : 0.0f;
 
-#if GREEDY_MESH_TILING
-                            for (int dv = 0; dv < height; dv++) {
-                                for (int du = 0; du < width; du++) {
-                                    float cx = (float)(x0 + u + du), cz = (float)(z0 + v + dv), cy = (float)y;
-                                    if (face == 0) { 
-                                        t->vertexUV(cx, cy, cz + 1.0f, u0, v1);
-                                        t->vertexUV(cx, cy, cz, u0, v0);
-                                        t->vertexUV(cx + 1.0f, cy, cz, u1, v0);
-                                        t->vertexUV(cx + 1.0f, cy, cz + 1.0f, u1, v1);
-                                    } else { 
-                                        t->vertexUV(cx, cy + 1.0f, cz, u0, v0);
-                                        t->vertexUV(cx, cy + 1.0f, cz + 1.0f, u0, v1);
-                                        t->vertexUV(cx + 1.0f, cy + 1.0f, cz + 1.0f, u1, v1);
-                                        t->vertexUV(cx + 1.0f, cy + 1.0f, cz, u1, v0);
-                                    }
-                                }
-                            }
-#else
+                            // ===== TRUCO DEL UV: Empaquetamos la celda de textura en las coordenadas UV =====
+                            float cellW = u1 - u0;
+                            float cellH = v1 - v0;
+                            float uEnd = u0 + (width * cellW);
+                            float vEnd = v0 + (height * cellH);
+
+                            float texCol = std::floor(u0 * 16.0f + 0.5f);
+                            float texRow = std::floor(v0 * 32.0f + 0.5f);
+                            float pU0 = u0 + ((texCol + 1.0f) * 100.0f);
+                            float pV0 = v0 + ((texRow + 1.0f) * 100.0f);
+                            float pUEnd = uEnd + ((texCol + 1.0f) * 100.0f);
+                            float pVEnd = vEnd + ((texRow + 1.0f) * 100.0f);
+
+                            // Devolvemos intacto el mapa de luz original
+                            t->tex2(current.lightColor);
+
                             float cx = (float)(x0 + u), cz = (float)(z0 + v), cy = (float)y, cw = (float)width, ch = (float)height;
                             if (face == 0) {
-                                t->vertexUV(cx, cy, cz + ch, u0, v1);
-                                t->vertexUV(cx, cy, cz, u0, v0);
-                                t->vertexUV(cx + cw, cy, cz, u1, v0);
-                                t->vertexUV(cx + cw, cy, cz + ch, u1, v1);
+                                t->vertexUV(cx, cy, cz + ch, pU0, pVEnd);
+                                t->vertexUV(cx, cy, cz, pU0, pV0);
+                                t->vertexUV(cx + cw, cy, cz, pUEnd, pV0);
+                                t->vertexUV(cx + cw, cy, cz + ch, pUEnd, pVEnd);
                             } else {
-                                t->vertexUV(cx, cy + 1.0f, cz, u0, v0);
-                                t->vertexUV(cx, cy + 1.0f, cz + ch, u0, v1);
-                                t->vertexUV(cx + cw, cy + 1.0f, cz + ch, u1, v1);
-                                t->vertexUV(cx + cw, cy + 1.0f, cz, u1, v0);
+                                t->vertexUV(cx + cw, cy + 1.0f, cz + ch, pUEnd, pVEnd);
+                                t->vertexUV(cx + cw, cy + 1.0f, cz, pUEnd, pV0);
+                                t->vertexUV(cx, cy + 1.0f, cz, pU0, pV0);
+                                t->vertexUV(cx, cy + 1.0f, cz + ch, pU0, pVEnd);
                             }
-#endif
                         }
                     }
                 }
@@ -504,7 +512,7 @@ void Chunk::rebuild() {
                             unsigned char tileId = tileIds[offset + ((x << 11) | (z << 7) | indexY)];
                             if (tileId == 0 || tileId == 0xff) continue;
                             Tile* tile = Tile::tiles[tileId];
-                            if (!tile || !tile->isSolidRender() || tile->getRenderLayer() != currentLayer) continue;
+                            if (!isGreedySafe(tile) || tile->getRenderLayer() != currentLayer) continue;
                             
                             int nx = x0 + x;
                             int ny = worldY;
@@ -515,7 +523,7 @@ void Chunk::rebuild() {
                             int gridIdx = y * 16 + x;
                             grid[gridIdx].tileId = tileId;
                             grid[gridIdx].texture = tileRenderer->getTexture(tile, region, x0 + x, worldY, z0 + z, face);
-                            grid[gridIdx].lightColor = tileRenderer->getLightColor(tile, region, nx, ny, nz); // Luz vecina
+                            grid[gridIdx].lightColor = tileRenderer->getLightColor(tile, region, nx, ny, nz);
                             grid[gridIdx].tileColor = tile->getColor(region, x0 + x, worldY, z0 + z);
                             hasData = true;
                         }
@@ -545,7 +553,7 @@ void Chunk::rebuild() {
                             startTesselatorIfNeeded();
                             rendered = true;
                             float multiplier = 0.8f;
-                            t->tex2(current.lightColor);
+                            
                             t->color(((current.tileColor >> 16) & 0xff) / 255.0f * multiplier,
                                      ((current.tileColor >> 8) & 0xff) / 255.0f * multiplier,
                                      ((current.tileColor) & 0xff) / 255.0f * multiplier);
@@ -555,37 +563,33 @@ void Chunk::rebuild() {
                             float u1 = current.texture ? current.texture->getU1() : 0.0f;
                             float v1 = current.texture ? current.texture->getV1() : 0.0f;
 
-#if GREEDY_MESH_TILING
-                            for (int dv = 0; dv < height; dv++) {
-                                for (int du = 0; du < width; du++) {
-                                    float cx = (float)(x0 + u + du), cy = (float)(y0 + v + dv), cz = (float)(z0 + z);
-                                    if (face == 2) { 
-                                        t->vertexUV(cx, cy + 1.0f, cz, u1, v0);
-                                        t->vertexUV(cx + 1.0f, cy + 1.0f, cz, u0, v0);
-                                        t->vertexUV(cx + 1.0f, cy, cz, u0, v1);
-                                        t->vertexUV(cx, cy, cz, u1, v1);
-                                    } else { 
-                                        t->vertexUV(cx, cy + 1.0f, cz + 1.0f, u0, v0);
-                                        t->vertexUV(cx, cy, cz + 1.0f, u0, v1);
-                                        t->vertexUV(cx + 1.0f, cy, cz + 1.0f, u1, v1);
-                                        t->vertexUV(cx + 1.0f, cy + 1.0f, cz + 1.0f, u1, v0);
-                                    }
-                                }
-                            }
-#else
+                            // ===== TRUCO DEL UV: Empaquetamos la celda de textura en las coordenadas UV =====
+                            float cellW = u1 - u0;
+                            float cellH = v1 - v0;
+                            float uEnd = u0 + (width * cellW);
+                            float vEnd = v0 + (height * cellH);
+
+                            float texCol = std::floor(u0 * 16.0f + 0.5f);
+                            float texRow = std::floor(v0 * 32.0f + 0.5f);
+                            float pU0 = u0 + ((texCol + 1.0f) * 100.0f);
+                            float pV0 = v0 + ((texRow + 1.0f) * 100.0f);
+                            float pUEnd = uEnd + ((texCol + 1.0f) * 100.0f);
+                            float pVEnd = vEnd + ((texRow + 1.0f) * 100.0f);
+
+                            t->tex2(current.lightColor);
+
                             float cx = (float)(x0 + u), cy = (float)(y0 + v), cz = (float)(z0 + z), cw = (float)width, ch = (float)height;
                             if (face == 2) {
-                                t->vertexUV(cx, cy + ch, cz, u1, v0);
-                                t->vertexUV(cx + cw, cy + ch, cz, u0, v0);
-                                t->vertexUV(cx + cw, cy, cz, u0, v1);
-                                t->vertexUV(cx, cy, cz, u1, v1);
+                                t->vertexUV(cx, cy + ch, cz, pUEnd, pV0);
+                                t->vertexUV(cx + cw, cy + ch, cz, pU0, pV0);
+                                t->vertexUV(cx + cw, cy, cz, pU0, pVEnd);
+                                t->vertexUV(cx, cy, cz, pUEnd, pVEnd);
                             } else {
-                                t->vertexUV(cx, cy + ch, cz + 1.0f, u0, v0);
-                                t->vertexUV(cx, cy, cz + 1.0f, u0, v1);
-                                t->vertexUV(cx + cw, cy, cz + 1.0f, u1, v1);
-                                t->vertexUV(cx + cw, cy + ch, cz + 1.0f, u1, v0);
+                                t->vertexUV(cx, cy + ch, cz + 1.0f, pU0, pV0);
+                                t->vertexUV(cx, cy, cz + 1.0f, pU0, pVEnd);
+                                t->vertexUV(cx + cw, cy, cz + 1.0f, pUEnd, pVEnd);
+                                t->vertexUV(cx + cw, cy + ch, cz + 1.0f, pUEnd, pV0);
                             }
-#endif
                         }
                     }
                 }
@@ -607,7 +611,7 @@ void Chunk::rebuild() {
                             unsigned char tileId = tileIds[offset + ((x << 11) | (z << 7) | indexY)];
                             if (tileId == 0 || tileId == 0xff) continue;
                             Tile* tile = Tile::tiles[tileId];
-                            if (!tile || !tile->isSolidRender() || tile->getRenderLayer() != currentLayer) continue;
+                            if (!isGreedySafe(tile) || tile->getRenderLayer() != currentLayer) continue;
                             
                             int nx = x0 + x + (face == 5 ? 1 : -1);
                             int ny = worldY;
@@ -618,7 +622,7 @@ void Chunk::rebuild() {
                             int gridIdx = y * 16 + z;
                             grid[gridIdx].tileId = tileId;
                             grid[gridIdx].texture = tileRenderer->getTexture(tile, region, x0 + x, worldY, z0 + z, face);
-                            grid[gridIdx].lightColor = tileRenderer->getLightColor(tile, region, nx, ny, nz); // Luz vecina
+                            grid[gridIdx].lightColor = tileRenderer->getLightColor(tile, region, nx, ny, nz);
                             grid[gridIdx].tileColor = tile->getColor(region, x0 + x, worldY, z0 + z);
                             hasData = true;
                         }
@@ -648,7 +652,7 @@ void Chunk::rebuild() {
                             startTesselatorIfNeeded();
                             rendered = true;
                             float multiplier = 0.6f;
-                            t->tex2(current.lightColor);
+                            
                             t->color(((current.tileColor >> 16) & 0xff) / 255.0f * multiplier,
                                      ((current.tileColor >> 8) & 0xff) / 255.0f * multiplier,
                                      ((current.tileColor) & 0xff) / 255.0f * multiplier);
@@ -658,37 +662,33 @@ void Chunk::rebuild() {
                             float u1 = current.texture ? current.texture->getU1() : 0.0f;
                             float v1 = current.texture ? current.texture->getV1() : 0.0f;
 
-#if GREEDY_MESH_TILING
-                            for (int dv = 0; dv < height; dv++) {
-                                for (int du = 0; du < width; du++) {
-                                    float cx = (float)(x0 + x), cy = (float)(y0 + v + dv), cz = (float)(z0 + u + du);
-                                    if (face == 4) { 
-                                        t->vertexUV(cx, cy + 1.0f, cz + 1.0f, u0, v0);
-                                        t->vertexUV(cx, cy + 1.0f, cz, u1, v0);
-                                        t->vertexUV(cx, cy, cz, u1, v1);
-                                        t->vertexUV(cx, cy, cz + 1.0f, u0, v1);
-                                    } else { 
-                                        t->vertexUV(cx + 1.0f, cy, cz + 1.0f, u1, v1);
-                                        t->vertexUV(cx + 1.0f, cy, cz, u0, v1);
-                                        t->vertexUV(cx + 1.0f, cy + 1.0f, cz, u0, v0);
-                                        t->vertexUV(cx + 1.0f, cy + 1.0f, cz + 1.0f, u1, v0);
-                                    }
-                                }
-                            }
-#else
+                            // ===== TRUCO DEL UV: Empaquetamos la celda de textura en las coordenadas UV =====
+                            float cellW = u1 - u0;
+                            float cellH = v1 - v0;
+                            float uEnd = u0 + (width * cellW);
+                            float vEnd = v0 + (height * cellH);
+
+                            float texCol = std::floor(u0 * 16.0f + 0.5f);
+                            float texRow = std::floor(v0 * 32.0f + 0.5f);
+                            float pU0 = u0 + ((texCol + 1.0f) * 100.0f);
+                            float pV0 = v0 + ((texRow + 1.0f) * 100.0f);
+                            float pUEnd = uEnd + ((texCol + 1.0f) * 100.0f);
+                            float pVEnd = vEnd + ((texRow + 1.0f) * 100.0f);
+
+                            t->tex2(current.lightColor);
+
                             float cx = (float)(x0 + x), cy = (float)(y0 + v), cz = (float)(z0 + u), cw = (float)width, ch = (float)height;
                             if (face == 4) {
-                                t->vertexUV(cx, cy + ch, cz + cw, u0, v0);
-                                t->vertexUV(cx, cy + ch, cz, u1, v0);
-                                t->vertexUV(cx, cy, cz, u1, v1);
-                                t->vertexUV(cx, cy, cz + cw, u0, v1);
+                                t->vertexUV(cx, cy + ch, cz + cw, pUEnd, pV0);
+                                t->vertexUV(cx, cy + ch, cz, pU0, pV0);
+                                t->vertexUV(cx, cy, cz, pU0, pVEnd);
+                                t->vertexUV(cx, cy, cz + cw, pUEnd, pVEnd);
                             } else {
-                                t->vertexUV(cx + 1.0f, cy, cz + cw, u1, v1);
-                                t->vertexUV(cx + 1.0f, cy, cz, u0, v1);
-                                t->vertexUV(cx + 1.0f, cy + ch, cz, u0, v0);
-                                t->vertexUV(cx + 1.0f, cy + ch, cz + cw, u1, v0);
+                                t->vertexUV(cx + 1.0f, cy, cz + cw, pU0, pVEnd);
+                                t->vertexUV(cx + 1.0f, cy, cz, pUEnd, pVEnd);
+                                t->vertexUV(cx + 1.0f, cy + ch, cz, pUEnd, pV0);
+                                t->vertexUV(cx + 1.0f, cy + ch, cz + cw, pU0, pV0);
                             }
-#endif
                         }
                     }
                 }
@@ -696,7 +696,7 @@ void Chunk::rebuild() {
         }
 
         // =================================================================================
-        // PASO 2: RENDERIZADO ESTÁNDAR
+        // PASO 2: RENDERIZADO ESTÁNDAR (SALTANDO BLOQUES QUE YA DIBUJÓ EL GREEDY)
         // =================================================================================
         for (int z = z0; z < z1; z++) {
             for (int x = x0; x < x1; x++) {
@@ -713,7 +713,9 @@ void Chunk::rebuild() {
                     if (tileId > 0) {
                         Tile* tile = Tile::tiles[tileId];
                         if (!tile) continue;
-                        if (tile->isSolidRender()) continue;
+                        if (tile->isSolidRender()) {
+                            if (isGreedySafe(tile)) continue;
+                        }
 
                         if (!started) {
                             started = true;

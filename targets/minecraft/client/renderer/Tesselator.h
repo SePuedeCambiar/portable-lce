@@ -66,7 +66,7 @@ private:
     Tesselator(int size);
 
 public:
-    ~Tesselator(); // <--- AÑADE ESTA LÍNEA AQUÍ
+    ~Tesselator(); 
     Tesselator* getUniqueInstance(int size);
     void end();
 
@@ -133,8 +133,14 @@ public:
     void color(int r, int g, int b);
     void color(int r, int g, int b, int a);
     void color(std::uint8_t r, std::uint8_t g, std::uint8_t b);
+    
     void vertexUV(float x, float y, float z, float u, float v);
     void vertex(float x, float y, float z);
+    
+    // --- NUEVA FUNCIÓN PARA GREEDY MESHING ---
+    void vertexGreedy(float x, float y, float z, float u, float v, float uOffset, float vOffset);
+    // -----------------------------------------
+
     void color(int c);
     void color(int c, int alpha);
     void noColor();
