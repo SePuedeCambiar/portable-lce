@@ -500,8 +500,10 @@ static void bindStdAttribs() {
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 32, (void*)12);
     glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, 32, (void*)20);
     glVertexAttribPointer(3, 3, GL_BYTE, GL_TRUE, 32, (void*)24);
-    glVertexAttribPointer(4, 2, GL_UNSIGNED_SHORT, GL_FALSE, 32, (void*)28);
+    glVertexAttribIPointer(4, 2, GL_SHORT, 32, (void*)28); 
 }
+
+
 static void initStreamingVAOs() {
     glGenVertexArrays(1, &s_sVAO_std);
     glGenBuffers(1, &s_sVBO_std);

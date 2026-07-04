@@ -49,7 +49,7 @@ void main() {
 
     // Mapa de luz estándar 100% nativo
     vec2 aLMrawF = vec2(aLMraw);
-    vec2 normalizedLM = (aLMrawF.x > 2.0 || aLMrawF.y > 2.0) ? (aLMrawF / 65535.0) : aLMrawF;
+    vec2 normalizedLM = (aLMrawF.x > 2.0 || aLMrawF.y > 2.0) ? (aLMrawF / 255.0) : aLMrawF;
     vec2 lm = (aLMrawF.x < -0.5) ? uGlobalLM : normalizedLM;
     vUV1 = lm * uLMTransform.xy + uLMTransform.zw;
 
