@@ -236,23 +236,17 @@ void Chunk::rebuild() {
     static bool isInitialized = false;
     if (!isInitialized) {
         memset(isSolidLUT, 0, 256);
-        memset(isGreedySafeLUT, 0, 256); // Ahora empezamos con TODO en false
+        memset(isGreedySafeLUT, 0, 256);
 
         for (int i = 0; i < 256; i++) {
             Tile* tile = Tile::tiles[i];
             if (tile) {
-                // Un bloque es Sólido si llena el cubo y no es transparente
-                // Ajusta 'isSolidRender' o 'isOpaque' según los métodos de tu clase Tile
                 if (tile->isSolidRender()) {
                     isSolidLUT[i] = true;
                 }
 
-                // Un bloque es Greedy Safe SOLO si es un cubo sólido perfecto
-                // Las losas, escaleras y hierba NO deben ser Greedy Safe.
-                // Aquí definimos que solo es safe si es sólido Y no es uno de los bloques complejos.
                 if (tile->isSolidRender()) {
                     int id = tile->id;
-                    // Lista de bloques que, aunque sean "sólidos", tienen geometría especial
                     bool isComplex = (id == 2 || id == 17 || id == 18 || id == 23 || 
                                       id == 61 || id == 62 || id == 86 || id == 91 || 
                                       id == 155 || id == 158 || id == 161 || id == 162 || id == 170);
@@ -263,7 +257,6 @@ void Chunk::rebuild() {
                 }
             }
         }
-        // El bloque 255 suele ser el bloque de "ocultar" o aire sólido
         isSolidLUT[255] = true; 
         isInitialized = true;
     }
@@ -290,8 +283,9 @@ void Chunk::rebuild() {
     level->getChunkAt(x, z)->getBlockData(tileArray);
     memcpy(tileIds, tileArray.data(), 16 * 16 * Level::maxBuildHeight);
 
-    Region* region = new Region(level, x0 - r, y0 - r, z0 - r, x1 + r, y1 + r, z1 + r, r);
-    TileRenderer* tileRenderer = new TileRenderer(region, this->x, this->y, this->z, tileIds);
+    // ✅ CAMBIO: Region y TileRenderer ahora están en el STACK (no en heap)
+    Region region(level, x0 - r, y0 - r, z0 - r, x1 + r, y1 + r, z1 + r, r);
+    TileRenderer tileRenderer(&region, this->x, this->y, this->z, tileIds);
 
     int offsetBaseY[Level::maxBuildHeight];
     int indexYBase[Level::maxBuildHeight];
@@ -307,7 +301,7 @@ void Chunk::rebuild() {
     }
 
     // ============================================================================
-    // 5. FAST CULLING PREPASS (Ahora con LUT correcta)
+    // 5. FAST CULLING PREPASS
     // ============================================================================
     bool empty = true;
     {
@@ -341,7 +335,7 @@ void Chunk::rebuild() {
             levelRenderer->setGlobalChunkFlag(this->x, this->y, this->z, level, LevelRenderer::CHUNK_FLAG_EMPTY0, currentLayer);
             PlatformRenderer.CBuffClear(lists + currentLayer);
         }
-        delete region; delete tileRenderer;
+        // ✅ ELIMINADO: delete region; delete tileRenderer;
         return;
     }
 
@@ -399,13 +393,13 @@ void Chunk::rebuild() {
                             if (ny >= y0 && ny < y1) {
                                 unsigned char neighborId = tileIds[offsetBaseY[ny] + (xShift | zShift | indexYBase[ny])];
                                 if (neighborId == 0 || neighborId == 0xff || !isSolidLUT[neighborId]) renderFace = true;
-                            } else renderFace = tile->shouldRenderFace(region, x0 + x, ny, z0 + z, face);
+                            } else renderFace = tile->shouldRenderFace(&region, x0 + x, ny, z0 + z, face);
                             if (!renderFace) continue;
                             int gridIdx = z * 16 + x;
                             grid[gridIdx].tileId = tileId;
-                            grid[gridIdx].texture = tileRenderer->getTexture(tile, region, x0 + x, y, z0 + z, face);
-                            grid[gridIdx].lightColor = tileRenderer->getLightColor(tile, region, x0 + x, ny, z0 + z);
-                            grid[gridIdx].tileColor = tile->getColor(region, x0 + x, y, z0 + z);
+                            grid[gridIdx].texture = tileRenderer.getTexture(tile, &region, x0 + x, y, z0 + z, face);
+                            grid[gridIdx].lightColor = tileRenderer.getLightColor(tile, &region, x0 + x, ny, z0 + z);
+                            grid[gridIdx].tileColor = tile->getColor(&region, x0 + x, y, z0 + z);
                             grid[gridIdx].merged = false;
                             hasData = true;
                         }
@@ -472,13 +466,13 @@ void Chunk::rebuild() {
                             if (nz >= z0 && nz < z1) {
                                 unsigned char neighborId = tileIds[offset + ((nz - z0) << 7 | xShift | idxY)];
                                 if (neighborId == 0 || neighborId == 0xff || !isSolidLUT[neighborId]) renderFace = true;
-                            } else renderFace = tile->shouldRenderFace(region, x0 + x, worldY, nz, face);
+                            } else renderFace = tile->shouldRenderFace(&region, x0 + x, worldY, nz, face);
                             if (!renderFace) continue;
                             int gridIdx = y * 16 + x;
                             grid[gridIdx].tileId = tileId;
-                            grid[gridIdx].texture = tileRenderer->getTexture(tile, region, x0 + x, worldY, z0 + z, face);
-                            grid[gridIdx].lightColor = tileRenderer->getLightColor(tile, region, x0 + x, worldY, nz);
-                            grid[gridIdx].tileColor = tile->getColor(region, x0 + x, worldY, z0 + z);
+                            grid[gridIdx].texture = tileRenderer.getTexture(tile, &region, x0 + x, worldY, z0 + z, face);
+                            grid[gridIdx].lightColor = tileRenderer.getLightColor(tile, &region, x0 + x, worldY, nz);
+                            grid[gridIdx].tileColor = tile->getColor(&region, x0 + x, worldY, z0 + z);
                             grid[gridIdx].merged = false;
                             hasData = true;
                         }
@@ -545,13 +539,13 @@ void Chunk::rebuild() {
                             if (nx >= x0 && nx < x1) {
                                 unsigned char neighborId = tileIds[offset + ((nx - x0) << 11 | zShift | idxY)];
                                 if (neighborId == 0 || neighborId == 0xff || !isSolidLUT[neighborId]) renderFace = true;
-                            } else renderFace = tile->shouldRenderFace(region, nx, worldY, z0 + z, face);
+                            } else renderFace = tile->shouldRenderFace(&region, nx, worldY, z0 + z, face);
                             if (!renderFace) continue;
                             int gridIdx = y * 16 + z;
                             grid[gridIdx].tileId = tileId;
-                            grid[gridIdx].texture = tileRenderer->getTexture(tile, region, x0 + x, worldY, z0 + z, face);
-                            grid[gridIdx].lightColor = tileRenderer->getLightColor(tile, region, nx, worldY, z0 + z);
-                            grid[gridIdx].tileColor = tile->getColor(region, x0 + x, worldY, z0 + z);
+                            grid[gridIdx].texture = tileRenderer.getTexture(tile, &region, x0 + x, worldY, z0 + z, face);
+                            grid[gridIdx].lightColor = tileRenderer.getLightColor(tile, &region, nx, worldY, z0 + z);
+                            grid[gridIdx].tileColor = tile->getColor(&region, x0 + x, worldY, z0 + z);
                             grid[gridIdx].merged = false;
                             hasData = true;
                         }
@@ -610,16 +604,15 @@ void Chunk::rebuild() {
                     if (tileId > 0) {
                         Tile* tile = Tile::tiles[tileId];
                         if (!tile) continue;
-                        // CORRECCIÓN: Ahora isGreedySafeLUT es precisa
                         if (tile->isSolidRender() && isGreedySafeLUT[tileId]) continue;
                         if (!started) startTesselatorIfNeeded();
                         if (currentLayer == 0 && tile->isEntityTile()) {
-                            std::shared_ptr<TileEntity> et = region->getTileEntity(x, y, z);
+                            std::shared_ptr<TileEntity> et = region.getTileEntity(x, y, z);
                             if (TileEntityRenderDispatcher::instance->hasRenderer(et)) renderableTileEntities.push_back(et);
                         }
                         int renderLayer = tile->getRenderLayer();
                         if (renderLayer != currentLayer) renderNextLayer = true;
-                        else if (renderLayer == currentLayer) rendered |= tileRenderer->tesselateInWorld(tile, x, y, z);
+                        else if (renderLayer == currentLayer) rendered |= tileRenderer.tesselateInWorld(tile, x, y, z);
                     }
                 }
             }
@@ -653,8 +646,8 @@ void Chunk::rebuild() {
     levelRenderer->setGlobalChunkConnectivity(globalIdx, conn);
 #endif
 
-    delete tileRenderer;
-    delete region;
+    // ✅ ELIMINADO: delete tileRenderer;
+    // ✅ ELIMINADO: delete region;
 
     {
         std::unique_lock<std::shared_mutex> lock(*globalRenderableTileEntities_cs);
@@ -665,7 +658,6 @@ void Chunk::rebuild() {
     else levelRenderer->setGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_NOTSKYLIT);
     levelRenderer->setGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_COMPILED);
 }
-
 
 
 float Chunk::distanceToSqr(std::shared_ptr<Entity> player) const {

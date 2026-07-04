@@ -528,10 +528,60 @@ struct ChunkBuffer {
     std::vector<uint8_t> rawVerts;
     bool valid = false;
     bool vboReady = false;
-    Uint32 lastUsedFrame = 0; // Registro temporal para la Válvula de Seguridad
+    Uint32 lastUsedFrame = 0;
+
     ChunkBuffer() {
         lastUsedFrame = SDL_GetTicks();
     }
+
+    // --- EL CORAZÓN DEL ARREGLO: Gestión de Recursos ---
+
+    // 1. Borramos la posibilidad de COPIAR el buffer (evita duplicar IDs de GPU)
+    ChunkBuffer(const ChunkBuffer&) = delete;
+    ChunkBuffer& operator=(const ChunkBuffer&) = delete;
+
+    // 2. Implementamos el MOVIMIENTO (Transfiere la propiedad del VBO/VAO)
+    ChunkBuffer(ChunkBuffer&& other) noexcept {
+        this->vbo = other.vbo;
+        this->vao = other.vao;
+        this->draws = std::move(other.draws);
+        this->rawVerts = std::move(other.rawVerts);
+        this->valid = other.valid;
+        this->vboReady = other.vboReady;
+        this->lastUsedFrame = other.lastUsedFrame;
+
+        // IMPORTANTE: Ponemos los IDs del origen en 0 para que 
+        // el destructor del objeto temporal no borre la GPU memory.
+        other.vbo = 0;
+        other.vao = 0;
+    }
+
+    ChunkBuffer& operator=(ChunkBuffer&& other) noexcept {
+        if (this != &other) {
+            // PRIMERO: Borramos lo que ya teníamos en la GPU para evitar fugas
+            destroy();
+
+            // SEGUNDO: Robamos los recursos del otro objeto
+            this->vbo = other.vbo;
+            this->vao = other.vao;
+            this->draws = std::move(other.draws);
+            this->rawVerts = std::move(other.rawVerts);
+            this->valid = other.valid;
+            this->vboReady = other.vboReady;
+            this->lastUsedFrame = other.lastUsedFrame;
+
+            // TERCERO: Dejamos el objeto origen vacío
+            other.vbo = 0;
+            other.vao = 0;
+        }
+        return *this;
+    }
+
+    // Destructor para asegurar que si el objeto muere, la GPU se limpie
+    ~ChunkBuffer() {
+        destroy();
+    }
+
     void destroy() {
         if (vbo) {
             glDeleteBuffers(1, &vbo);
@@ -549,6 +599,8 @@ struct ChunkBuffer {
         vboReady = false;
     }
 };
+
+
 static std::unordered_map<int, ChunkBuffer> s_chunkPool;
 static int s_nextListBase = 1;
 // Cola segura para liberar memoria OpenGL diferida en el hilo principal
@@ -995,7 +1047,7 @@ bool GLRenderer::CBuffCall(int index, bool) {
         }
         glGenVertexArrays(1, &cb.vao);
         glGenBuffers(1, &cb.vbo);
-        g_vboCount++;
+        g_vaoCount++;
         g_vboCount++;
         glBindVertexArray(cb.vao);
         glBindBuffer(GL_ARRAY_BUFFER, cb.vbo);

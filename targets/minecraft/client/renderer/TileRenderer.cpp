@@ -100,105 +100,45 @@ void TileRenderer::_init() {
 }
 
 bool TileRenderer::isTranslucentAt(LevelSource* level, int x, int y, int z) {
-    if (cache) {
-        int id = ((x - xMin2) << 10) + ((y - yMin2) << 5) + (z - zMin2);
-        if ((id & 0xffff8000) == 0)  // Check 0 <= id <= 32767
-        {
-            assert(id >= 0);
-            assert(id <= 32 * 32 * 32);
-            if (cache[id] & cache_isTranslucentAt_valid)
-                return ((cache[id] & cache_isTranslucentAt_flag) ==
-                        cache_isTranslucentAt_flag);
-
-            bool ret = Tile::transculent[level->getTile(x, y, z)];
-
-            if (ret) {
-                cache[id] |=
-                    cache_isTranslucentAt_valid | cache_isTranslucentAt_flag;
-            } else {
-                cache[id] |= cache_isTranslucentAt_valid;
-            }
-            return ret;
-        }
-    }
+    // Eliminamos completamente el bloque 'if (cache)'
+    // Solo mantenemos la llamada directa al nivel
     return Tile::transculent[level->getTile(x, y, z)];
 }
 
+
+
 float TileRenderer::getShadeBrightness(Tile* tt, LevelSource* level, int x,
                                        int y, int z) {
-    if (cache) {
-        int id = ((x - xMin2) << 10) + ((y - yMin2) << 5) + (z - zMin2);
-        if ((id & 0xffff8000) == 0)  // Check 0 <= id <= 32767
-        {
-            if (cache[id] & cache_isSolidBlockingTile_valid)
-                return ((cache[id] & cache_isSolidBlockingTile_flag) ? 0.2f
-                                                                     : 1.0f);
-
-            bool isSolidBlocking = level->isSolidBlockingTile(x, y, z);
-
-            if (isSolidBlocking) {
-                cache[id] |= cache_isSolidBlockingTile_valid |
-                             cache_isSolidBlockingTile_flag;
-            } else {
-                cache[id] |= cache_isSolidBlockingTile_valid;
-            }
-            return (isSolidBlocking ? 0.2f : 1.0f);
-        }
-    }
+    // Eliminamos completamente el bloque 'if (cache)'
+    // Solo mantenemos la llamada directa al Tile
     return tt->getShadeBrightness(level, x, y, z);
 }
 
-int TileRenderer::getLightColor(Tile* tt, LevelSource* level, int x, int y,
-                                int z) {
-    if (cache) {
-        int id = ((x - xMin2) << 10) + ((y - yMin2) << 5) + (z - zMin2);
-        if ((id & 0xffff8000) == 0)  // Check 0 <= id <= 32767
-        {
-            // Don't use the cache for liquid tiles, as they are the only type
-            // that seem to have their own implementation of getLightColor that
-            // actually is important. Without this we get patches of dark water
-            // where their lighting value is 0, it needs to pull in light from
-            // the tile above to work
-            if ((tt->id >= Tile::water_Id) && (tt->id <= Tile::calmLava_Id))
-                return tt->getLightColor(level, x, y, z);
 
-            if (cache[id] & cache_getLightColor_valid)
-                return cache[id] & cache_getLightColor_mask;
-
-            // Not in cache. Have we got the tile type cached? We can pass this
-            // as a parameter to Tile::getLightColor( or -1 if we don't) so that
-            // underlying things don't have to get the tile again.
-            int tileId = -1;
-            int xx = x - xMin;
-            int zz = z - zMin;
-            if ((xx >= 0) && (xx <= 15) && (zz >= 0) && (zz <= 15) &&
-                (y >= 0) && (y < Level::maxBuildHeight)) {
-                int indexY = y;
-                int offset = 0;
-                if (indexY >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT) {
-                    indexY -= Level::COMPRESSED_CHUNK_SECTION_HEIGHT;
-                    offset = Level::COMPRESSED_CHUNK_SECTION_TILES;
-                }
-
-                unsigned char ucTileId =
-                    tileIds[offset + (((xx + 0) << 11) | ((zz + 0) << 7) |
-                                      (indexY + 0))];
-                // Tiles that were determined to be invisible (by being
-                // surrounded by solid stuff) will be set to 255 rather than
-                // their actual ID
-                if (ucTileId != 255) {
-                    tileId = (int)ucTileId;
-                }
-            }
-            int ret = tt->getLightColor(level, x, y, z, tileId);
-            cache[id] |=
-                ((ret & cache_getLightColor_mask) | cache_getLightColor_valid);
-            return ret;
+// ✅ AQUÍ VA LA FUNCIÓN COMPLETA (No solo el nombre)
+int TileRenderer::getLightColor(Tile* tt, LevelSource* level, int x, int y, int z) {
+    int tileId = -1;
+    int xx = x - xMin;
+    int zz = z - zMin;
+    if ((xx >= 0) && (xx <= 15) && (zz >= 0) && (zz <= 15) &&
+        (y >= 0) && (y < Level::maxBuildHeight)) {
+        int indexY = y;
+        int offset = 0;
+        if (indexY >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT) {
+            indexY -= Level::COMPRESSED_CHUNK_SECTION_HEIGHT;
+            offset = Level::COMPRESSED_CHUNK_SECTION_TILES;
+        }
+        unsigned char ucTileId = tileIds[offset + ((xx << 11) | (zz << 7) | indexY)];
+        if (ucTileId != 255) {
+            tileId = (int)ucTileId;
         }
     }
-    return tt->getLightColor(level, x, y, z);
+    return tt->getLightColor(level, x, y, z, tileId);
 }
 
+
+
+// Ahora sí, el constructor
 TileRenderer::TileRenderer(LevelSource* level, int xMin, int yMin, int zMin,
                            unsigned char* tileIds) {
     this->level = level;
@@ -210,12 +150,12 @@ TileRenderer::TileRenderer(LevelSource* level, int xMin, int yMin, int zMin,
     this->yMin2 = yMin - 2;
     this->zMin2 = zMin - 2;
     this->tileIds = tileIds;
-    cache = new unsigned int[32 * 32 * 32];
-    memset(cache, 0, 32 * 32 * 32 * sizeof(unsigned int));
+    this->cache = nullptr; 
 }
 
+
 TileRenderer::~TileRenderer() {
-    delete[] cache;  // 4jcraft, changed to []
+    // ✅ Limpio: Ya no hay delete[] cache;
 }
 
 TileRenderer::TileRenderer(LevelSource* level) {
