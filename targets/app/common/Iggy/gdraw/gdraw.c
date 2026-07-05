@@ -409,9 +409,9 @@ static void error_msg_platform_specific(const char* msg) {
 #undef RR_BREAK
 #endif
 #define RR_BREAK()                                                          \
-    do {                                                                    \
-        fprintf(stderr, "[GDraw] GL error at %s:%d\n", __FILE__, __LINE__); \
-    } while (0)
+//    do {                                                                    \
+//        fprintf(stderr, "[GDraw] GL error at %s:%d\n", __FILE__, __LINE__); \
+//    } while (0)
 
 // the magic number that tropical told me
 #define GDRAW_MAX_SHADERS 64

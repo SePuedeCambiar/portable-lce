@@ -786,7 +786,9 @@ void GLRenderer::StartFrame() {
 }
 // NUEVA FUNCIÓN PRESENT DE ALTA SEGURIDAD
 void GLRenderer::Present() {
-    // 1. Procesar la cola diferida de destrucciones en el hilo de renderizado principal (Thread-safe)
+    // ============================================================
+    // 1. FASE DE DESTRUCCIÓN SINCRONIZADA (Thread-Safe)
+    // ============================================================
     std::vector<ChunkBuffer> toDestroy;
     {
         std::lock_guard<std::mutex> lk_del(s_destructionMtx);
@@ -801,9 +803,32 @@ void GLRenderer::Present() {
             cb.destroy();
         }
     }
-    // [VÁLVULA DE SEGURIDAD ELIMINADA]
-    // Dejamos que el motor del juego gestione el ciclo de vida de los chunks.
-    // Esto soluciona el bug de los chunks transparentes de forma definitiva.
+
+    // ============================================================
+    // 2. GARBAGE COLLECTOR SINCRONIZADO POR TICKS (Tick-Based GC)
+    // ============================================================
+    // Ahora usamos un umbral más realista (1200 chunks) y timeout de 30 segundos
+    // para ser más agresivos con la limpieza.
+    Uint32 now = SDL_GetTicks();
+    if (s_chunkPool.size() > 1200) {  // Cambiado de 1500 a 1200
+        std::lock_guard<std::mutex> lk_pool(s_glCallMtx);
+        for (auto it = s_chunkPool.begin(); it != s_chunkPool.end(); ) {
+            // 30000 ms = 30 segundos (más agresivo para liberar GPU antes)
+            if (now - it->second.lastUsedFrame > 30000) {
+                {
+                    std::lock_guard<std::mutex> lk_del(s_destructionMtx);
+                    s_pendingDestructions.push_back(std::move(it->second));
+                }
+                it = s_chunkPool.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // ============================================================
+    // 3. PROCESAMIENTO DE EVENTOS SDL
+    // ============================================================
     if (!s_window) return;
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
@@ -814,12 +839,25 @@ void GLRenderer::Present() {
         else if (ev.window.event == SDL_WINDOWEVENT_RESIZED)
             onFramebufferResize(ev.window.data1, ev.window.data2);
     }
-    glFlush();
-    // Imprimir el uso real de recursos para monitorear
-    printf("GPU Resources -> VBOs: %d | VAOs: %d | Texs: %d | Pool: %zu\n",
-           g_vboCount.load(), g_vaoCount.load(), g_texCount.load(), s_chunkPool.size());
+
+    // ============================================================
+    // 4. DIAGNÓSTICO Y MONITOREO (Opcional, puedes desactivarlo)
+    // ============================================================
+    // Solo mostramos diagnóstico cada 60 frames para no saturar la consola
+    static int frameCounter = 0;
+    if (++frameCounter % 60 == 0) {
+        printf("GPU Resources -> VBOs: %d | VAOs: %d | Texs: %d | Pool: %zu\n",
+               g_vboCount.load(), g_vaoCount.load(), g_texCount.load(), s_chunkPool.size());
+    }
+
+    // ============================================================
+    // 5. SWAP DE BUFFERS Y SINCRONIZACIÓN FINAL
+    // ============================================================
+    glFlush();  // Asegura que todos los comandos se envíen a la GPU
     SDL_GL_SwapWindow(s_window);
 }
+
+
 void GLRenderer::SetWindowSize(int w, int h) {
     s_reqWidth = w;
     s_reqHeight = h;
@@ -901,8 +939,7 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     }
 
     // ------------------------------------------------------------------------
-    // NUEVO: Grabador diferido (Hilo de reconstrucción de Chunks de fondo)
-    // Guardamos los Quads directos sin duplicar en RAM del CPU.
+    // GRABADOR DIFERIDO (Hilo de reconstrucción de Chunks de fondo)
     // ------------------------------------------------------------------------
     if (s_recListId >= 0) {
         int first = (int)(s_recVerts.size() / stride);
@@ -912,8 +949,11 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         return;
     }
 
-    // --- PIPELINE INMEDIATO (Menus, HUD, Entidades, Mobs) ---
-    std::vector<uint8_t> triData;
+    // --- PIPELINE INMEDIATO OPTIMIZADO (Menus, HUD, Entidades, Mobs, Nubes) ---
+    // Usamos static thread_local para evitar crear y destruir el vector en cada frame
+    static thread_local std::vector<uint8_t> triData;
+    triData.clear();
+    
     if (wasQuad) {
         int numQuads = count / 4;
         int triVerts = numQuads * 6;
@@ -942,8 +982,6 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     std::lock_guard<std::mutex> lk(s_glCallMtx);
     pushRenderState();
 
-    // ELIMINADO: glUniform1i(s_shader.uGreedyMode, 0); 
-    // Ya no es necesario porque el shader es inteligente.
     glUniform1i(s_shader.uGreedyMode, 0); 
 
     glBindVertexArray(s_sVAO_std);
@@ -952,8 +990,15 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)bytes, dataIn);
     s_streamVBOSize = (GLsizeiptr)bytes;
     glDrawArrays(glMode, 0, count);
-    glBindVertexArray(0);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    
+    // ================================================================
+    // 🧹 HIGIENE TOTAL DE OPENGL - ELIMINA EL ERROR [GDraw]
+    // ================================================================
+    // Desvinculamos TODO lo que pudiera haber quedado "pegado" en la GPU
+    glBindVertexArray(0);              // Desvincula el VAO
+    glBindBuffer(GL_ARRAY_BUFFER, 0);  // Desvincula el VBO
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0); // Desvincula el EBO (por si acaso)
+    // ================================================================
 }
 
 
@@ -1041,6 +1086,7 @@ bool GLRenderer::CBuffCall(int index, bool) {
     }
     ChunkBuffer& cb = it->second;
     cb.lastUsedFrame = SDL_GetTicks();
+    
     if (!cb.vboReady) {
         if (cb.rawVerts.empty()) {
             return false;
@@ -1067,7 +1113,6 @@ bool GLRenderer::CBuffCall(int index, bool) {
     // Activamos el modo Greedy porque estamos dibujando los Chunks del mundo.
     // Esto le indica al shader que debe aplicar la fórmula de Tiling (repetición)
     // al Atlas y usar la luz simplificada para evitar el ennegrecido.
-    //glUniform1i(s_shader.uGreedyMode, 1); 
     glUniform1i(s_shader.uGreedyMode, 1); 
 
     glBindVertexArray(cb.vao);
@@ -1078,6 +1123,7 @@ bool GLRenderer::CBuffCall(int index, bool) {
     // Esto es procesado a nivel de hardware puro directamente en la GPU.
     // =================================================================================
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_globalEBO);
+    
     for (const auto& dc : cb.draws) {
         if (dc.wasQuad) {
             // El número de triángulos a dibujar es (Vértices / 4) * 6
@@ -1088,10 +1134,16 @@ bool GLRenderer::CBuffCall(int index, bool) {
             glDrawArrays(dc.prim, dc.first, dc.count);
         }
     }
+    
+    // =================================================================================
     // HIGIENE DE ESTADO CRÍTICA PARA IGGY / GDRAW:
-    // Desvincular el EBO dentro de nuestro VAO para que no contamine el VAO 0
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-    glBindVertexArray(0);
+    // Esto elimina el error [GDraw] que estabas viendo.
+    // Desvinculamos TODO antes de salir para dejar la GPU en estado "neutro".
+    // =================================================================================
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);  // Desvincula el EBO
+    glBindVertexArray(0);                      // Desvincula el VAO
+    glBindBuffer(GL_ARRAY_BUFFER, 0);          // Desvincula el VBO (por si acaso)
+    
     return true;
 }
 
@@ -1404,9 +1456,14 @@ void GLRenderer::TextureDataUpdate(int xo, int yo, int w, int h, void* d,
 void GLRenderer::TextureSetParam(int p, int v) {
     glTexParameteri(GL_TEXTURE_2D, p, v);
 }
-static int stbLoad(unsigned char* data, int w, int h, ImageInfo* info,
-                   int** out) {
-    int* px = new int[w * h];
+
+// stbLoad unificado mediante plantillas para evitar conflictos de estructuras (D3DXIMAGE_INFO vs ImageInfo)
+// Además, reserva memoria usando malloc para evitar corrupción de Heap con el free() del cliente.
+template <typename T>
+static int stbLoad(unsigned char* data, int w, int h, T* info, int** out) {
+    int* px = (int*)malloc(w * h * sizeof(int));
+    if (!px) return -1;
+    
     for (int i = 0; i < w * h; i++) {
         unsigned char r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2],
                       a = data[i * 4 + 3];
@@ -1417,8 +1474,10 @@ static int stbLoad(unsigned char* data, int w, int h, ImageInfo* info,
         info->Height = h;
     }
     *out = px;
-    return 0;  // Success
+    return 0;  // Éxito
 }
+
+
 
 int GLRenderer::LoadTextureData(const char* szFilename, D3DXIMAGE_INFO* pSrcInfo, int** ppDataOut) {
     int w, h, c;

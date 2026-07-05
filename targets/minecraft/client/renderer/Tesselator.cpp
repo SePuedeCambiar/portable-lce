@@ -79,23 +79,22 @@ Tesselator::Tesselator(int size) {
     }
 }
 
-// --- ESTO ES LO QUE DEBES AÑADIR ---
 Tesselator::~Tesselator() {
-    // 1. Limpiar los buffers de la GPU (vboIds es el array de 10 IDs)
-    if (this->vboIds != nullptr) {
-        // Borramos los 'vboCounts' (10) buffers que creamos en el constructor
-        glDeleteBuffers(this->vboCounts, (GLuint*)this->vboIds);
+    // Liberar los VBOs de la GPU si están activos
+    if (vboMode && vboIds != nullptr) {
+        // Usamos la función ESTÁNDAR global de OpenGL (sin prefijos ni namespaces)
+        // Esto evita que GLEW rompa el compilador con sus macros de extensión.
+        glDeleteBuffers(vboCounts, (GLuint*)vboIds);
         
-        // Cambiamos MemoryTracker por delete[] que es el estándar de C++
-        // para liberar arrays de enteros.
-        delete[] this->vboIds; 
-        this->vboIds = nullptr;
+        // Liberamos la memoria del puntero de forma segura.
+        free(vboIds); 
+        vboIds = nullptr;
     }
 
-    // Borramos vboId singular por si acaso
-    if (this->vboId != 0) {
-        glDeleteBuffers(1, (GLuint*)&this->vboId);
-        this->vboId = 0;
+    // Liberamos el VBO individual si se generó
+    if (vboId != 0) {
+        glDeleteBuffers(1, (GLuint*)&vboId);
+        vboId = 0;
     }
 }
 

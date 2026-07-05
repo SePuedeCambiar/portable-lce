@@ -1877,6 +1877,8 @@ int LevelChunk::setBlocksAndData(std::vector<uint8_t>& data, int x0, int y0,
         compressBlocks();
         compressData();
     }
+    level->setTilesDirty(this->x * 16, 0, this->z * 16, (this->x + 1) * 16, Level::maxBuildHeight, (this->z + 1) * 16);
+    
 
     return p;
 }

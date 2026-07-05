@@ -385,9 +385,16 @@ C4JThread::EventArray::EventArray(int size, Mode mode)
 void C4JThread::EventArray::set(int index) {
     assert(index >= 0 && index < m_size);
     const std::uint32_t bit = 1U << static_cast<std::uint32_t>(index);
-    m_signaledMask.fetch_or(bit, std::memory_order_release);
-    m_signaledMask.notify_all();
+    
+    // fetch_or devuelve el valor ANTES de la operación.
+    // Solo notificamos si el bit NO estaba ya puesto.
+    std::uint32_t oldMask = m_signaledMask.fetch_or(bit, std::memory_order_acq_rel);
+    
+    if (!(oldMask & bit)) {
+        m_signaledMask.notify_all();
+    }
 }
+
 
 void C4JThread::EventArray::clear(int index) {
     assert(index >= 0 && index < m_size);
@@ -537,11 +544,22 @@ void C4JThread::EventQueue::init() {
 void C4JThread::EventQueue::sendEvent(Level* pLevel) {
     init();
     if (m_stopRequested.load(std::memory_order_acquire)) return;
+
+    bool wasEmpty = false;
     {
         std::lock_guard lock(m_mutex);
+        if (m_queue.empty()) {
+            wasEmpty = true;
+        }
         m_queue.push(pLevel);
     }
-    m_queueCondition.notify_one();
+    
+    // SOLO notificamos si la cola estaba vacía.
+    // Si ya había elementos, el hilo trabajador ya está despierto 
+    // y procesando la cola, no hace falta volver a despertarlo.
+    if (wasEmpty) {
+        m_queueCondition.notify_one();
+    }
 }
 
 void C4JThread::EventQueue::waitForFinish() {
