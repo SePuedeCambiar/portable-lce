@@ -15,15 +15,13 @@
 
 Region::~Region() {
     delete chunks;
-
-    // AP - added a caching system for Chunk::rebuild to take advantage of
+    // Liberamos solo el buffer legacy (tal y como lo hacía el juego original)
     if (CachedTiles) {
         free(CachedTiles);
     }
 }
 
-Region::Region(Level* level, int x1, int y1, int z1, int x2, int y2, int z2,
-               int r) {
+Region::Region(Level* level, int x1, int y1, int z1, int x2, int y2, int z2, int r) {
     this->level = level;
 
     xc1 = (x1 - r) >> 4;
@@ -54,36 +52,82 @@ Region::Region(Level* level, int x1, int y1, int z1, int x2, int y2, int z2,
         }
     }
 
-    // AP - added a caching system for Chunk::rebuild to take advantage of
+    // Inicialización del canal Legacy de Xbox 360
     xcCached = -1;
     zcCached = -1;
     CachedTiles = nullptr;
+
+    // Inicialización del canal rápido de PC
+    m_pcOriginX = -1;
+    m_pcOriginZ = -1;
+    m_pcTiles = nullptr;
+    m_pcData = nullptr;
+    m_pcBlockLight = nullptr;
+    m_pcSkyLight = nullptr;
+    m_pcCacheActive = false;
 }
 
-bool Region::isAllEmpty() { return allEmpty; }
+void Region::enableCache(int chunkX, int chunkZ) {
+    // CORREGIDO: Son coordenadas de bloque directas, no multiplicamos por 16!
+    m_pcOriginX = chunkX - 1;
+    m_pcOriginZ = chunkZ - 1;
+    int maxH = Level::maxBuildHeight;
 
-int Region::getTile(int x, int y, int z) {
-    if (y < 0) return 0;
-    if (y >= Level::maxBuildHeight) return 0;
+    // Buffers estáticos por hilo para rendimiento óptimo sin garbage collection
+    static thread_local unsigned char* tl_Tiles = nullptr;
+    static thread_local unsigned char* tl_Data = nullptr;
+    static thread_local unsigned char* tl_BlockLight = nullptr;
+    static thread_local unsigned char* tl_SkyLight = nullptr;
 
-    int xc = (x >> 4);
-    int zc = (z >> 4);
-
-    xc -= xc1;
-    zc -= zc1;
-
-    if (xc < 0 || xc >= (int)chunks->size() || zc < 0 ||
-        zc >= (int)(*chunks)[xc].size()) {
-        return 0;
+    if (!tl_Tiles) {
+        tl_Tiles = (unsigned char*)malloc(18 * 18 * maxH);
+        tl_Data = (unsigned char*)malloc(18 * 18 * maxH);
+        tl_BlockLight = (unsigned char*)malloc(18 * 18 * maxH);
+        tl_SkyLight = (unsigned char*)malloc(18 * 18 * maxH);
     }
 
-    LevelChunk* lc = (*chunks)[xc][zc];
-    if (lc == nullptr) return 0;
+    m_pcTiles = tl_Tiles;
+    m_pcData = tl_Data;
+    m_pcBlockLight = tl_BlockLight;
+    m_pcSkyLight = tl_SkyLight;
 
-    return lc->getTile(x & 15, y, z & 15);
+    // Pre-descompresión del área 18x18
+    for (int lx = 0; lx < 18; lx++) {
+        int worldX = m_pcOriginX + lx;
+        int xc = (worldX >> 4) - xc1;
+
+        for (int lz = 0; lz < 18; lz++) {
+            int worldZ = m_pcOriginZ + lz;
+            int zc = (worldZ >> 4) - zc1;
+
+            LevelChunk* lc = nullptr;
+            if (xc >= 0 && xc < (int)chunks->size() && zc >= 0 && zc < (int)(*chunks)[xc].size()) {
+                lc = (*chunks)[xc][zc];
+            }
+
+            int destOffset = (lx * 18 + lz) * maxH;
+
+            if (lc != nullptr) {
+                int localX = worldX & 15;
+                int localZ = worldZ & 15;
+                for (int y = 0; y < maxH; y++) {
+                    m_pcTiles[destOffset + y] = lc->getTile(localX, y, localZ);
+                    m_pcData[destOffset + y] = lc->getData(localX, y, localZ);
+                    m_pcBlockLight[destOffset + y] = lc->getBrightness(LightLayer::Block, localX, y, localZ);
+                    m_pcSkyLight[destOffset + y] = lc->getBrightness(LightLayer::Sky, localX, y, localZ);
+                }
+            } else {
+                memset(m_pcTiles + destOffset, 0, maxH);
+                memset(m_pcData + destOffset, 0, maxH);
+                memset(m_pcBlockLight + destOffset, 0, maxH);
+                memset(m_pcSkyLight + destOffset, 0, maxH);
+            }
+        }
+    }
+    m_pcCacheActive = true;
 }
 
-// AP - added a caching system for Chunk::rebuild to take advantage of
+// Canal Legacy de Xbox 360 (Mantenido intacto para Steve y físicas)
 void Region::setCachedTiles(unsigned char* tiles, int xc, int zc) {
     xcCached = xc;
     zcCached = zc;
@@ -94,30 +138,127 @@ void Region::setCachedTiles(unsigned char* tiles, int xc, int zc) {
     memcpy(CachedTiles, tiles, size);
 }
 
-LevelChunk* Region::getLevelChunk(int x, int y, int z) {
+bool Region::isAllEmpty() { return allEmpty; }
+
+int Region::getTile(int x, int y, int z) {
+    if (m_pcCacheActive && y >= 0 && y < Level::maxBuildHeight) {
+        int lx = x - m_pcOriginX;
+        int lz = z - m_pcOriginZ;
+        if (lx >= 0 && lx < 18 && lz >= 0 && lz < 18) {
+            return m_pcTiles[(lx * 18 + lz) * Level::maxBuildHeight + y];
+        }
+    }
+
     if (y < 0) return 0;
-    if (y >= Level::maxBuildHeight) return nullptr;
+    if (y >= Level::maxBuildHeight) return 0;
 
     int xc = (x >> 4) - xc1;
     int zc = (z >> 4) - zc1;
 
-    if (xc < 0 || xc >= (int)chunks->size() || zc < 0 ||
-        zc >= (int)(*chunks)[xc].size()) {
-        return nullptr;
+    if (xc < 0 || xc >= (int)chunks->size() || zc < 0 || zc >= (int)(*chunks)[xc].size()) {
+        return 0;
     }
 
     LevelChunk* lc = (*chunks)[xc][zc];
-    return lc;
+    if (lc == nullptr) return 0;
+
+    return lc->getTile(x & 15, y, z & 15);
+}
+
+int Region::getData(int x, int y, int z) {
+    if (m_pcCacheActive && y >= 0 && y < Level::maxBuildHeight) {
+        int lx = x - m_pcOriginX;
+        int lz = z - m_pcOriginZ;
+        if (lx >= 0 && lx < 18 && lz >= 0 && lz < 18) {
+            return m_pcData[(lx * 18 + lz) * Level::maxBuildHeight + y];
+        }
+    }
+
+    if (y < 0) return 0;
+    if (y >= Level::maxBuildHeight) return 0;
+    int xc = (x >> 4) - xc1;
+    int zc = (z >> 4) - zc1;
+
+    if (xc < 0 || xc >= (int)chunks->size() || zc < 0 || zc >= (int)(*chunks)[xc].size()) {
+        return 0;
+    }
+
+    LevelChunk* lc = (*chunks)[xc][zc];
+    if (lc == nullptr) return 0;
+
+    return lc->getData(x & 15, y, z & 15);
+}
+
+int Region::getBrightness(LightLayer::variety layer, int x, int y, int z) {
+    if (m_pcCacheActive && y >= 0 && y < Level::maxBuildHeight) {
+        int lx = x - m_pcOriginX;
+        int lz = z - m_pcOriginZ;
+        if (lx >= 0 && lx < 18 && lz >= 0 && lz < 18) {
+            int index = (lx * 18 + lz) * Level::maxBuildHeight + y;
+            return (layer == LightLayer::Block) ? m_pcBlockLight[index] : m_pcSkyLight[index];
+        }
+    }
+
+    if (y < 0) y = 0;
+    if (y >= Level::maxBuildHeight) y = Level::maxBuildHeight - 1;
+    if (y < 0 || y >= Level::maxBuildHeight || x < -Level::MAX_LEVEL_SIZE ||
+        z < -Level::MAX_LEVEL_SIZE || x >= Level::MAX_LEVEL_SIZE || z > Level::MAX_LEVEL_SIZE) {
+        return (int)layer;
+    }
+    int xc = (x >> 4) - xc1;
+    int zc = (z >> 4) - zc1;
+
+    return (*chunks)[xc][zc]->getBrightness(layer, x & 15, y, z & 15);
+}
+
+int Region::getBrightnessPropagate(LightLayer::variety layer, int x, int y, int z, int tileId) {
+    if (y < 0) y = 0;
+    if (y >= Level::maxBuildHeight) y = Level::maxBuildHeight - 1;
+    if (x < -Level::MAX_LEVEL_SIZE || z < -Level::MAX_LEVEL_SIZE ||
+        x >= Level::MAX_LEVEL_SIZE || z > Level::MAX_LEVEL_SIZE) {
+        return (int)layer;
+    }
+    if (layer == LightLayer::Sky && level->dimension->hasCeiling) {
+        return 0;
+    }
+
+    int id = tileId > -1 ? tileId : getTile(x, y, z);
+    if (Tile::propagate[id]) {
+        int br = getBrightness(layer, x, y + 1, z);
+        if (br == 15) return 15;
+        int br1 = getBrightness(layer, x + 1, y, z);
+        if (br1 == 15) return 15;
+        int br2 = getBrightness(layer, x - 1, y, z);
+        if (br2 == 15) return 15;
+        int br3 = getBrightness(layer, x, y, z + 1);
+        if (br3 == 15) return 15;
+        int br4 = getBrightness(layer, x, y, z - 1);
+        if (br4 == 15) return 15;
+        if (br1 > br) br = br1;
+        if (br2 > br) br = br2;
+        if (br3 > br) br = br3;
+        if (br4 > br) br = br4;
+        return br;
+    }
+
+    return getBrightness(layer, x, y, z);
+}
+
+LevelChunk* Region::getLevelChunk(int x, int y, int z) {
+    if (y < 0 || y >= Level::maxBuildHeight) return nullptr;
+    int xc = (x >> 4) - xc1;
+    int zc = (z >> 4) - zc1;
+    if (xc < 0 || xc >= (int)chunks->size() || zc < 0 || zc >= (int)(*chunks)[xc].size()) return nullptr;
+    return (*chunks)[xc][zc];
 }
 
 std::shared_ptr<TileEntity> Region::getTileEntity(int x, int y, int z) {
     int xc = (x >> 4) - xc1;
     int zc = (z >> 4) - zc1;
-
     return (*chunks)[xc][zc]->getTileEntity(x & 15, y, z & 15);
 }
 
-int Region::getLightColor(int x, int y, int z, int emitt, int tileId /*=-1*/) {
+int Region::getLightColor(int x, int y, int z, int emitt, int tileId) {
     int s = getBrightnessPropagate(LightLayer::Sky, x, y, z, tileId);
     int b = getBrightnessPropagate(LightLayer::Block, x, y, z, tileId);
     if (b < emitt) b = emitt;
@@ -166,27 +307,7 @@ int Region::getRawBrightness(int x, int y, int z, bool propagate) {
         }
     }
 
-    if (y < 0) return 0;
-    if (y >= Level::maxBuildHeight) {
-        int br = Level::MAX_BRIGHTNESS - level->skyDarken;
-        if (br < 0) br = 0;
-        return br;
-    }
-
-    int xc = (x >> 4) - xc1;
-    int zc = (z >> 4) - zc1;
-
-    return (*chunks)[xc][zc]->getRawBrightness(x & 15, y, z & 15,
-                                               level->skyDarken);
-}
-
-int Region::getData(int x, int y, int z) {
-    if (y < 0) return 0;
-    if (y >= Level::maxBuildHeight) return 0;
-    int xc = (x >> 4) - xc1;
-    int zc = (z >> 4) - zc1;
-
-    return (*chunks)[xc][zc]->getData(x & 15, y, z & 15);
+    return getBrightness(LightLayer::Block, x, y, z);
 }
 
 Material* Region::getMaterial(int x, int y, int z) {
@@ -196,38 +317,23 @@ Material* Region::getMaterial(int x, int y, int z) {
 }
 
 BiomeSource* Region::getBiomeSource() { return level->getBiomeSource(); }
-
 Biome* Region::getBiome(int x, int z) { return level->getBiome(x, z); }
 
 bool Region::isSolidRenderTile(int x, int y, int z) {
     Tile* tile = Tile::tiles[getTile(x, y, z)];
     if (tile == nullptr) return false;
-
-    // 4J - addition here to make rendering big blocks of leaves more efficient.
-    // Normally leaves never consider themselves as solid, so blocks of leaves
-    // will have all sides of each block completely visible. Changing to
-    // consider as solid if this block is surrounded by other leaves (or solid
-    // things). This is paired with another change in Tile::getTexture which
-    // makes such solid tiles actually visibly solid (these textures exist
-    // already for non-fancy graphics). Note: this tile-specific code is here
-    // rather than making some new virtual method in the tiles, for the sake of
-    // efficiency - I don't imagine we'll be doing much more of this sort of
-    // thing
     if (tile->id == Tile::leaves_Id) {
         int axo[6] = {1, -1, 0, 0, 0, 0};
         int ayo[6] = {0, 0, 1, -1, 0, 0};
         int azo[6] = {0, 0, 0, 0, 1, -1};
         for (int i = 0; i < 6; i++) {
             int t = getTile(x + axo[i], y + ayo[i], z + azo[i]);
-            if ((t != Tile::leaves_Id) && ((Tile::tiles[t] == nullptr) ||
-                                           !Tile::tiles[t]->isSolidRender())) {
+            if ((t != Tile::leaves_Id) && ((Tile::tiles[t] == nullptr) || !Tile::tiles[t]->isSolidRender())) {
                 return false;
             }
         }
-
         return true;
     }
-
     return tile->isSolidRender();
 }
 
@@ -245,68 +351,6 @@ bool Region::isTopSolidBlocking(int x, int y, int z) {
 bool Region::isEmptyTile(int x, int y, int z) {
     Tile* tile = Tile::tiles[getTile(x, y, z)];
     return (tile == nullptr);
-}
-
-// 4J - brought forward from 1.8.2
-int Region::getBrightnessPropagate(LightLayer::variety layer, int x, int y,
-                                   int z, int tileId) {
-    if (y < 0) y = 0;
-    if (y >= Level::maxBuildHeight) y = Level::maxBuildHeight - 1;
-    if (y < 0 || y >= Level::maxBuildHeight || x < -Level::MAX_LEVEL_SIZE ||
-        z < -Level::MAX_LEVEL_SIZE || x >= Level::MAX_LEVEL_SIZE ||
-        z > Level::MAX_LEVEL_SIZE) {
-        // 4J Stu - The java LightLayer was an enum class type with a member
-        // "surrounding" which is what we were returning here. Surrounding has
-        // the same value as the enum value in our C++ code, so just cast it to
-        // an int
-        return (int)layer;
-    }
-    if (layer == LightLayer::Sky && level->dimension->hasCeiling) {
-        return 0;
-    }
-
-    int id = tileId > -1 ? tileId : getTile(x, y, z);
-    if (Tile::propagate[id]) {
-        int br = getBrightness(layer, x, y + 1, z);
-        if (br == 15) return 15;
-        int br1 = getBrightness(layer, x + 1, y, z);
-        if (br1 == 15) return 15;
-        int br2 = getBrightness(layer, x - 1, y, z);
-        if (br2 == 15) return 15;
-        int br3 = getBrightness(layer, x, y, z + 1);
-        if (br3 == 15) return 15;
-        int br4 = getBrightness(layer, x, y, z - 1);
-        if (br4 == 15) return 15;
-        if (br1 > br) br = br1;
-        if (br2 > br) br = br2;
-        if (br3 > br) br = br3;
-        if (br4 > br) br = br4;
-        return br;
-    }
-
-    int xc = (x >> 4) - xc1;
-    int zc = (z >> 4) - zc1;
-
-    return (*chunks)[xc][zc]->getBrightness(layer, x & 15, y, z & 15);
-}
-
-// 4J - brought forward from 1.8.2
-int Region::getBrightness(LightLayer::variety layer, int x, int y, int z) {
-    if (y < 0) y = 0;
-    if (y >= Level::maxBuildHeight) y = Level::maxBuildHeight - 1;
-    if (y < 0 || y >= Level::maxBuildHeight || x < -Level::MAX_LEVEL_SIZE ||
-        z < -Level::MAX_LEVEL_SIZE || x >= Level::MAX_LEVEL_SIZE ||
-        z > Level::MAX_LEVEL_SIZE) {
-        // 4J Stu - The java LightLayer was an enum class type with a member
-        // "surrounding" which is what we were returning here. Surrounding has
-        // the same value as the enum value in our C++ code, so just cast it to
-        // an int
-        return (int)layer;
-    }
-    int xc = (x >> 4) - xc1;
-    int zc = (z >> 4) - zc1;
-
-    return (*chunks)[xc][zc]->getBrightness(layer, x & 15, y, z & 15);
 }
 
 int Region::getMaxBuildHeight() { return Level::maxBuildHeight; }

@@ -283,8 +283,10 @@ void Chunk::rebuild() {
     level->getChunkAt(x, z)->getBlockData(tileArray);
     memcpy(tileIds, tileArray.data(), 16 * 16 * Level::maxBuildHeight);
 
-    // ✅ CAMBIO: Region y TileRenderer ahora están en el STACK (no en heap)
+    // ✅ OPTIMIZACIÓN L1 CACHE: Creamos la Region y activamos su pre-descompresión
     Region region(level, x0 - r, y0 - r, z0 - r, x1 + r, y1 + r, z1 + r, r);
+    region.enableCache(this->x, this->z); // Descomprime en una sola ráfaga lineal
+
     TileRenderer tileRenderer(&region, this->x, this->y, this->z, tileIds);
 
     int offsetBaseY[Level::maxBuildHeight];
@@ -335,7 +337,6 @@ void Chunk::rebuild() {
             levelRenderer->setGlobalChunkFlag(this->x, this->y, this->z, level, LevelRenderer::CHUNK_FLAG_EMPTY0, currentLayer);
             PlatformRenderer.CBuffClear(lists + currentLayer);
         }
-        // ✅ ELIMINADO: delete region; delete tileRenderer;
         return;
     }
 
@@ -512,9 +513,10 @@ void Chunk::rebuild() {
                                 t->vertexUV(cx, cy + ch, cz, pUEnd, pV0); t->vertexUV(cx + cw, cy + ch, cz, pU0, pV0);
                                 t->vertexUV(cx + cw, cy, cz, pU0, pVEnd); t->vertexUV(cx, cy, cz, pUEnd, pVEnd);
                             } else {
-                                t->vertexUV(cx, cy + ch, cz + 1.0f, pU0, pV0); t->vertexUV(cx, cy, cz + 1.0f, pU0, pVEnd);
-                                t->vertexUV(cx + cw, cy, cz + 1.0f, pUEnd, pVEnd); t->vertexUV(cx + cw, cy + ch, cz + 1.0f, pUEnd, pV0);
-                            }
+    t->vertexUV(cx, cy + ch, cz + 1.0f, pU0, pV0); t->vertexUV(cx, cy, cz + 1.0f, pU0, pVEnd);
+    t->vertexUV(cx + cw, cy, cz + 1.0f, pUEnd, pVEnd); t->vertexUV(cx + cw, cy + ch, cz + 1.0f, pUEnd, pV0); //  Corregido a "cy + ch"
+}
+
                         }
                     }
                 }
@@ -645,9 +647,6 @@ void Chunk::rebuild() {
     int globalIdx = levelRenderer->getGlobalIndexForChunk(this->x, this->y, this->z, level);
     levelRenderer->setGlobalChunkConnectivity(globalIdx, conn);
 #endif
-
-    // ✅ ELIMINADO: delete tileRenderer;
-    // ✅ ELIMINADO: delete region;
 
     {
         std::unique_lock<std::shared_mutex> lock(*globalRenderableTileEntities_cs);
