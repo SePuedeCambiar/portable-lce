@@ -606,6 +606,7 @@ static int s_nextListBase = 1;
 // Cola segura para liberar memoria OpenGL diferida en el hilo principal
 static std::vector<ChunkBuffer> s_pendingDestructions;
 static std::mutex s_destructionMtx;
+static std::mutex s_poolMtx; 
 // Per-thread recording state
 static thread_local int s_recListId = -1;
 static thread_local std::vector<uint8_t> s_recVerts;
@@ -987,15 +988,17 @@ void GLRenderer::ReadPixels(int x, int y, int w, int h, void* buf) {
     std::lock_guard<std::mutex> lk(s_glCallMtx);
     glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf);
 }
+
 int GLRenderer::CBuffCreate(int count) {
-    std::lock_guard<std::mutex> lk(s_glCallMtx);
+    std::lock_guard<std::mutex> lk(s_poolMtx); // Modificado
     int b = s_nextListBase;
     s_nextListBase += count;
     return b;
 }
-// BORRADO DIFERIDO THREAD-SAFE
+
+
 void GLRenderer::CBuffDelete(int first, int count) {
-    std::lock_guard<std::mutex> lk(s_glCallMtx);
+    std::lock_guard<std::mutex> lk(s_poolMtx); // Modificado
     for (int i = first; i < first + count; i++) {
         auto it = s_chunkPool.find(i);
         if (it != s_chunkPool.end()) {
@@ -1007,8 +1010,10 @@ void GLRenderer::CBuffDelete(int first, int count) {
         }
     }
 }
+
+
 void GLRenderer::CBuffDeleteAll() {
-    std::lock_guard<std::mutex> lk(s_glCallMtx);
+    std::lock_guard<std::mutex> lk(s_poolMtx); // Modificado
     for (auto& kv : s_chunkPool) {
         std::lock_guard<std::mutex> lk_del(s_destructionMtx);
         s_pendingDestructions.push_back(std::move(kv.second));
@@ -1016,6 +1021,7 @@ void GLRenderer::CBuffDeleteAll() {
     s_chunkPool.clear();
     s_nextListBase = 1;
 }
+
 void GLRenderer::CBuffStart(int index, bool) {
     s_recListId = index;
     s_recVerts.clear();
@@ -1023,36 +1029,36 @@ void GLRenderer::CBuffStart(int index, bool) {
 }
 
 
+
 void GLRenderer::CBuffEnd() {
     if (s_recListId < 0) return;
-    std::lock_guard<std::mutex> lk(s_glCallMtx);
-    ChunkBuffer& cb = s_chunkPool[s_recListId];
-    {
-        std::lock_guard<std::mutex> lk_del(s_destructionMtx);
-        s_pendingDestructions.push_back(std::move(cb));
-    }
-    if (s_recVerts.empty()) {
-        s_chunkPool.erase(s_recListId);
-        s_recListId = -1;
-        return;
-    }
     
+    // Generar el buffer localmente SIN bloquear ningún hilo
     ChunkBuffer newCb;
-    // Copiamos los datos en lugar de moverlos para mantener la capacidad en s_recVerts.
     newCb.rawVerts = s_recVerts; 
     newCb.draws = std::move(s_recDraws);
     newCb.valid = true;
     newCb.vboReady = false;
     newCb.lastUsedFrame = SDL_GetTicks();
-    s_chunkPool[s_recListId] = std::move(newCb);
+
+    // Bloqueamos ÚNICAMENTE la inserción rápida en el mapa global usando el candado ligero
+    {
+        std::lock_guard<std::mutex> lk_pool(s_poolMtx); // Modificado
+        ChunkBuffer& cb = s_chunkPool[s_recListId];
+        {
+            std::lock_guard<std::mutex> lk_del(s_destructionMtx);
+            s_pendingDestructions.push_back(std::move(cb));
+        }
+        s_chunkPool[s_recListId] = std::move(newCb);
+    }
     
-    // Limpiamos el vector para el siguiente chunk, pero MANTENIENDO la memoria ya reservada.
     s_recVerts.clear(); 
     s_recListId = -1;
 }
-// BORRADO DIFERIDO THREAD-SAFE EN CLEAR
+
+
 void GLRenderer::CBuffClear(int index) {
-    std::lock_guard<std::mutex> lk(s_glCallMtx);
+    std::lock_guard<std::mutex> lk(s_poolMtx); // Modificado
     auto it = s_chunkPool.find(index);
     if (it != s_chunkPool.end()) {
         {
@@ -1063,75 +1069,65 @@ void GLRenderer::CBuffClear(int index) {
     }
 }
 
+
 bool GLRenderer::CBuffCall(int index, bool) {
-    std::lock_guard<std::mutex> lk(s_glCallMtx);
-    auto it = s_chunkPool.find(index);
-    if (it == s_chunkPool.end() || !it->second.valid) {
-        return false;
-    }
-    ChunkBuffer& cb = it->second;
-    cb.lastUsedFrame = SDL_GetTicks();
-    
-    if (!cb.vboReady) {
-        if (cb.rawVerts.empty()) {
+    // 1. Buscamos el chunk de forma rápida bloqueando únicamente el pool
+    ChunkBuffer* pCb = nullptr;
+    {
+        std::lock_guard<std::mutex> lk_pool(s_poolMtx);
+        auto it = s_chunkPool.find(index);
+        if (it == s_chunkPool.end() || !it->second.valid) {
             return false;
         }
-        glGenVertexArrays(1, &cb.vao);
-        glGenBuffers(1, &cb.vbo);
+        pCb = &it->second;
+        pCb->lastUsedFrame = SDL_GetTicks();
+    }
+    
+    // 2. Bloqueamos el renderizado OpenGL tradicional para dibujar
+    std::lock_guard<std::mutex> lk(s_glCallMtx);
+    
+    if (!pCb->vboReady) {
+        if (pCb->rawVerts.empty()) {
+            return false;
+        }
+        glGenVertexArrays(1, &pCb->vao);
+        glGenBuffers(1, &pCb->vbo);
         g_vaoCount++;
         g_vboCount++;
-        glBindVertexArray(cb.vao);
-        glBindBuffer(GL_ARRAY_BUFFER, cb.vbo);
-        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)cb.rawVerts.size(),
-                     cb.rawVerts.data(), GL_STATIC_DRAW);
+        glBindVertexArray(pCb->vao);
+        glBindBuffer(GL_ARRAY_BUFFER, pCb->vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)pCb->rawVerts.size(),
+                     pCb->rawVerts.data(), GL_STATIC_DRAW);
         bindStdAttribs();
         glBindVertexArray(0);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
-        cb.rawVerts.clear();
-        cb.rawVerts.shrink_to_fit();
-        cb.vboReady = true;
+        pCb->rawVerts.clear();
+        pCb->rawVerts.shrink_to_fit();
+        pCb->vboReady = true;
     }
 
     pushRenderState();
     
-    // --- SOLUCIÓN AL BUG DE TEXTURAS ESTIRADAS ---
-    // Activamos el modo Greedy porque estamos dibujando los Chunks del mundo.
-    // Esto le indica al shader que debe aplicar la fórmula de Tiling (repetición)
-    // al Atlas y usar la luz simplificada para evitar el ennegrecido.
     glUniform1i(s_shader.uGreedyMode, 1); 
 
-    glBindVertexArray(cb.vao);
-
-    // =================================================================================
-    // NUEVA ESTRATEGIA DE RENDERIZADO:
-    // Hacemos el binding del EBO (Buffer de Índices) si el primitivo es un Quad/Triángulo.
-    // Esto es procesado a nivel de hardware puro directamente en la GPU.
-    // =================================================================================
+    glBindVertexArray(pCb->vao);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_globalEBO);
     
-    for (const auto& dc : cb.draws) {
+    for (const auto& dc : pCb->draws) {
         if (dc.wasQuad) {
-            // El número de triángulos a dibujar es (Vértices / 4) * 6
             GLsizei indexCount = (dc.count / 4) * 6;
-            // Usamos glDrawElementsBaseVertex para no tener que regenerar índices locales
             glDrawElementsBaseVertex(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, (void*)0, dc.first);
         } else {
             glDrawArrays(dc.prim, dc.first, dc.count);
         }
     }
     
-    // =================================================================================
-    // HIGIENE DE ESTADO CRÍTICA PARA IGGY / GDRAW:
-    // Esto elimina el error [GDraw] que estabas viendo.
-    // Desvinculamos TODO antes de salir para dejar la GPU en estado "neutro".
-    // =================================================================================
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);  // Desvincula el EBO
-    glBindVertexArray(0);                      // Desvincula el VAO
-    glBindBuffer(GL_ARRAY_BUFFER, 0);          // Desvincula el VBO (por si acaso)
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
     
     return true;
 }
-
 
 void GLRenderer::MatrixMode(int t) {
     if (t == GL_PROJECTION)

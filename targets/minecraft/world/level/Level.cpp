@@ -2628,9 +2628,20 @@ std::shared_ptr<TileEntity> Level::getTileEntity(int x, int y, int z) {
     if (y < minBuildHeight || y >= maxBuildHeight) {
         return nullptr;
     }
+
+    // =================================================================================
+    // ⚡ OPTIMIZACIÓN SUPREMA (Filtro de Bloque Común)
+    // Si el bloque es aire (0) o piedra/tierra (bloques que no tienen datos de TileEntity),
+    // salimos de inmediato con un coste de CPU nulo, evitando miles de búsquedas pesadas.
+    // =================================================================================
+    int tileId = getTile(x, y, z);
+    if (tileId == 0 || Tile::tiles[tileId] == nullptr || !Tile::tiles[tileId]->isEntityTile()) {
+        return nullptr;
+    }
+
     std::shared_ptr<TileEntity> tileEntity = nullptr;
 
-    // 1. Buscar en pending sólo si no está vacío y estamos actualizando las entidades en el hilo principal
+    // 1. Buscar en pending sólo si no está vacío y estamos actualizando las entidades
     if (updatingTileEntities && !pendingTileEntities.empty()) {
         std::lock_guard<std::recursive_mutex> lock(m_tileEntityListCS);
         for (size_t i = 0; i < pendingTileEntities.size(); i++) {
@@ -2642,14 +2653,13 @@ std::shared_ptr<TileEntity> Level::getTileEntity(int x, int y, int z) {
         }
     }
 
-    // 2. Buscar en el chunk (el camino rápido, local y más común)
+    // 2. Buscar en el chunk (usando la caché directa de acceso rápido)
     if (tileEntity == nullptr) {
         int xc = x >> 4;
         int zc = z >> 4;
         int ix = xc + (chunkSourceXZSize / 2);
         int iz = zc + (chunkSourceXZSize / 2);
 
-        // Usamos la caché rápida de chunks para evitar buscar en el mapa si está disponible
         if (ix >= 0 && ix < chunkSourceXZSize && iz >= 0 && iz < chunkSourceXZSize) {
             int idx = ix * chunkSourceXZSize + iz;
             LevelChunk* lc = chunkSourceCache[idx];
@@ -2664,9 +2674,7 @@ std::shared_ptr<TileEntity> Level::getTileEntity(int x, int y, int z) {
         }
     }
 
-    // 3. Buscar de nuevo en pending SÓLO si no se encontró en el chunk,
-    // NO estamos en fase de actualización (ya que si lo estuviéramos, ya se habría buscado en el paso 1),
-    // y la lista de pendientes realmente contiene elementos.
+    // 3. Buscar de nuevo en pending sólo si no se encontró en el chunk y no estamos actualizando
     if (tileEntity == nullptr && !updatingTileEntities && !pendingTileEntities.empty()) {
         std::lock_guard<std::recursive_mutex> lock(m_tileEntityListCS);
         for (auto it = pendingTileEntities.begin(); it != pendingTileEntities.end(); it++) {
