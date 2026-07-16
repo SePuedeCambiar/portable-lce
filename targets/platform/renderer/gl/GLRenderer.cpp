@@ -9,7 +9,7 @@
 #include "java/IntBuffer.h"
 #include "platform/PlatformTypes.h"
 #include "platform/renderer/renderer.h"
-
+#include <dlfcn.h> /
 // undefine macros from header to avoid argument mismatch
 #undef glGenTextures
 #undef glDeleteTextures
@@ -660,8 +660,10 @@ void GLRenderer::Initialise() {
 #else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    // CAMBIO CRÍTICO: Reemplazar SDL_GL_CONTEXT_PROFILE_CORE por COMPATIBILITY
+    // Esto habilitará los formatos de textura heredados que requiere la interfaz de Iggy
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
-                        SDL_GL_CONTEXT_PROFILE_CORE);
+                        SDL_GL_CONTEXT_PROFILE_COMPATIBILITY); 
 #endif
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
@@ -785,9 +787,12 @@ void GLRenderer::StartFrame() {
     s_windowHeight = h > 0 ? h : 1;
     glViewport(0, 0, s_windowWidth, s_windowHeight);
 }
-// NUEVA FUNCIÓN PRESENT DE ALTA SEGURIDAD
-// NUEVA FUNCIÓN PRESENT DE ALTA SEGURIDAD (Sin GC temporal agresivo)
+
 void GLRenderer::Present() {
+    GLenum err;
+    while ((err = glGetError()) != GL_NO_ERROR) {
+        printf("[DIAGNOSTICO_IGGY] OpenGL Error detectado en el frame: 0x%04x\n", err);
+    }
     // ============================================================
     // 1. FASE DE DESTRUCCIÓN SINCRONIZADA (Thread-Safe)
     // ============================================================
@@ -1632,4 +1637,26 @@ void GLRenderer::StateSetActiveTexture(int tex) {
 void GLRenderer::CaptureScreen(ImageFileBuffer* jpgOut, void* previewOut) {
     (void)jpgOut;
     (void)previewOut;
+}
+
+
+extern "C" {
+// Declaramos la firma real de la función de OpenGL
+typedef void (*PFNGLTEXIMAGE2DPROC)(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels);
+
+// INTERCEPTOR GLOBAL DE OPENGL: Captura todas las llamadas a glTexImage2D del proceso (incluido Iggy)
+void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels) {
+    // Obtenemos un puntero hacia la función real de OpenGL del controlador de video (Mesa/Nvidia)
+    static PFNGLTEXIMAGE2DPROC real_glTexImage2D = (PFNGLTEXIMAGE2DPROC)dlsym(RTLD_NEXT, "glTexImage2D");
+    
+    // Ejecutamos la carga real de la textura en la GPU
+    real_glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+    
+    // Capturamos si la GPU la rechazó y con qué parámetros
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        printf("[DEBUG_GL_HOOK] ERROR en glTexImage2D: 0x%04x | target: 0x%04x | internalformat: 0x%04x | format: 0x%04x | type: 0x%04x | size: %dx%d\n", 
+               err, target, internalformat, format, type, width, height);
+    }
+}
 }

@@ -465,11 +465,17 @@ void CompressedTileStorage::staticCtor() {
 
 void CompressedTileStorage::queueForDelete(unsigned char* data) {
     if (data) {
+        static int pushCount = 0;
+        pushCount++;
+        if (pushCount % 100 == 0) {
+            printf("[DIAGNOSTICO_RAM] Chunks encolados para borrar: %d\n", pushCount);
+        }
         deleteQueue[deleteQueueIndex].Push(data);
     }
 }
 
 void CompressedTileStorage::tick() {
+    printf("[DIAGNOSTICO_RAM] ¡Metodo tick() ejecutado! Liberando cola de descarte...\n");
     int freeIndex = (deleteQueueIndex + 1) % 3;
     unsigned char* toFree = nullptr;
     do {
