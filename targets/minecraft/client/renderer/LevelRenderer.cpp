@@ -1759,11 +1759,9 @@ bool LevelRenderer::updateDirtyChunks() {
     int minDistSq = 0x7fffffff;
 
     // =================================================================================
-    // CAMBIO FASE B: Usamos shared_lock para el escaneo. 
-    // Esto permite que otros hilos llamen a setDirty() o lean datos simultáneamente.
+    // 1. PASO LIBRE DE BLOQUEOS (Lock-Free Prepass)
+    // Procesamos la pila de chunks sucios de forma atómica SIN bloquear m_csDirtyChunks.
     // =================================================================================
-    std::shared_lock<std::shared_mutex> dirtyChunksLock(m_csDirtyChunks);
-
     {
         FRAME_PROFILE_SCOPE(ChunkDirtyScan);
         unsigned int memAlloc = PlatformRenderer.CBuffSize(-1);
@@ -1779,17 +1777,7 @@ bool LevelRenderer::updateDirtyChunks() {
             if (index == 1) {
                 dirtyChunkPresent = true;
             } else if (index > 1) {
-                int i2 = index - 2;
-                if (i2 >= DIMENSION_OFFSETS[2]) {
-                    i2 -= DIMENSION_OFFSETS[2];
-                    int y2 = i2 & (CHUNK_Y_COUNT - 1);
-                    i2 /= CHUNK_Y_COUNT;
-                    int z2 = i2 / MAX_LEVEL_RENDER_SIZE[2];
-                    int x2 = i2 - z2 * MAX_LEVEL_RENDER_SIZE[2];
-                    x2 -= MAX_LEVEL_RENDER_SIZE[2] / 2;
-                    z2 -= MAX_LEVEL_RENDER_SIZE[2] / 2;
-                }
-                // Estas llamadas son atómicas, NO necesitan unique_lock
+                // Estas operaciones internas de flags son atómicas y seguras en paralelo
                 setGlobalChunkFlag(index - 2, CHUNK_FLAG_DIRTY);
 #ifdef _CRITICAL_CHUNKS
                 if (!(oldIndex & 0x10000000)) {
@@ -1800,174 +1788,195 @@ bool LevelRenderer::updateDirtyChunks() {
             }
         } while (index);
 
-        if (dirtyChunkPresent) {
-            lastDirtyChunkFound = System::currentTimeMillis();
-            for (int p = 0; p < XUSER_MAX_COUNT; p++) {
-                std::shared_ptr<LocalPlayer> player = mc->localplayers[p];
-                if (player == nullptr) continue;
-                if (chunks[p].empty()) continue;
-                if (level[p] == nullptr) continue;
-                if (chunks[p].size() != (size_t)(xChunks * zChunks * CHUNK_Y_COUNT))
-                    continue;
-                
-                int px = (int)player->x;
-                int py = (int)player->y;
-                int pz = (int)player->z;
+        // Si la pila no reportó nada, revisamos el temporizador periódico de fuerza
+        if (!dirtyChunkPresent) {
+            if ((System::currentTimeMillis() - lastDirtyChunkFound) > FORCE_DIRTY_CHUNK_CHECK_PERIOD_MS) {
+                dirtyChunkPresent = true;
+            }
+        }
+    }
 
-                for (int x = 0; x < xChunks; x++) {
-                    for (int z = 0; z < zChunks; z++) {
-                        for (int y = 0; y < CHUNK_Y_COUNT; y++) {
-                            ClipChunk* pClipChunk = &chunks[p][(z * CHUNK_Y_COUNT + y) * xChunks + x];
-                            int xd = pClipChunk->xm - px;
-                            int yd = pClipChunk->ym - py;
-                            int zd = pClipChunk->zm - pz;
-                            int distSq = xd * xd + yd * yd + zd * zd;
-                            int distSqWeighted = xd * xd + yd * yd * 4 + zd * zd;
+    // =================================================================================
+    // 2. ESCANEO CON BLOQUEO BAJO DEMANDA
+    // Adquirimos el candado únicamente si realmente hay trabajo que procesar.
+    // =================================================================================
+    if (dirtyChunkPresent) {
+        lastDirtyChunkFound = System::currentTimeMillis();
 
-                            if (globalChunkFlags[pClipChunk->globalIdx] & CHUNK_FLAG_DIRTY) {
-                                if ((!onlyRebuild) || 
-                                    (globalChunkFlags[pClipChunk->globalIdx] & CHUNK_FLAG_COMPILED) || 
-                                    (distSq < 20 * 20)) 
-                                {
-                                    bool isNearer = 
+        // Adquirimos el candado de lectura justo aquí (sólo si hay chunks sucios)
+        std::shared_lock<std::shared_mutex> dirtyChunksLock(m_csDirtyChunks);
+
+        unsigned int memAlloc = PlatformRenderer.CBuffSize(-1);
+        bool onlyRebuild = (memAlloc >= MAX_COMMANDBUFFER_ALLOCATIONS);
+
+        for (int p = 0; p < XUSER_MAX_COUNT; p++) {
+            std::shared_ptr<LocalPlayer> player = mc->localplayers[p];
+            if (player == nullptr) continue;
+            if (chunks[p].empty()) continue;
+            if (level[p] == nullptr) continue;
+            if (chunks[p].size() != (size_t)(xChunks * zChunks * CHUNK_Y_COUNT))
+                continue;
+            
+            int px = (int)player->x;
+            int py = (int)player->y;
+            int pz = (int)player->z;
+
+            for (int x = 0; x < xChunks; x++) {
+                for (int z = 0; z < zChunks; z++) {
+                    for (int y = 0; y < CHUNK_Y_COUNT; y++) {
+                        ClipChunk* pClipChunk = &chunks[p][(z * CHUNK_Y_COUNT + y) * xChunks + x];
+                        int xd = pClipChunk->xm - px;
+                        int yd = pClipChunk->ym - py;
+                        int zd = pClipChunk->zm - pz;
+                        int distSq = xd * xd + yd * yd + zd * zd;
+                        int distSqWeighted = xd * xd + yd * yd * 4 + zd * zd;
+
+                        if (globalChunkFlags[pClipChunk->globalIdx] & CHUNK_FLAG_DIRTY) {
+                            if ((!onlyRebuild) || 
+                                (globalChunkFlags[pClipChunk->globalIdx] & CHUNK_FLAG_COMPILED) || 
+                                (distSq < 20 * 20)) 
+                            {
+                                bool isNearer = 
 #if defined(_LARGE_WORLDS)
-                                        nearestClipChunks.wouldAccept(distSqWeighted);
+                                    nearestClipChunks.wouldAccept(distSqWeighted);
 #else
-                                        distSqWeighted < minDistSq;
+                                    distSqWeighted < minDistSq;
 #endif
-                                    if (isNearer) {
-                                        Chunk* chunk = pClipChunk->chunk;
-                                        LevelChunk* lc = level[p]->getChunkAt(chunk->x, chunk->z);
-                                        if (!lc->isRenderChunkEmpty(y * 16)) {
-                                            nearChunk = pClipChunk;
-                                            minDistSq = distSqWeighted;
+                                if (isNearer) {
+                                    Chunk* chunk = pClipChunk->chunk;
+                                    LevelChunk* lc = level[p]->getChunkAt(chunk->x, chunk->z);
+                                    if (!lc->isRenderChunkEmpty(y * 16)) {
+                                        nearChunk = pClipChunk;
+                                        minDistSq = distSqWeighted;
 #if defined(_LARGE_WORLDS)
-                                            nearestClipChunks.insert(nearChunk, minDistSq);
+                                        nearestClipChunks.insert(nearChunk, minDistSq);
 #endif
-                                        } else {
-                                            chunk->clearDirty(); // Atómico
-                                            globalChunkFlags[pClipChunk->globalIdx] |= CHUNK_FLAG_EMPTYBOTH;
-                                        }
+                                    } else {
+                                        chunk->clearDirty(); 
+                                        globalChunkFlags[pClipChunk->globalIdx] |= CHUNK_FLAG_EMPTYBOTH;
                                     }
-#if defined(_CRITICAL_CHUNKS)
-                                    if (distSq < 20 * 20 && (globalChunkFlags[pClipChunk->globalIdx] & CHUNK_FLAG_CRITICAL))
-                                        veryNearCount++;
-#else
-                                    if (distSq < 20 * 20)
-                                        veryNearCount++;
-#endif
                                 }
+#if defined(_CRITICAL_CHUNKS)
+                                if (distSq < 20 * 20 && (globalChunkFlags[pClipChunk->globalIdx] & CHUNK_FLAG_CRITICAL))
+                                    veryNearCount++;
+#else
+                                if (distSq < 20 * 20)
+                                    veryNearCount++;
+#endif
                             }
                         }
                     }
                 }
             }
         }
-    }
 
-    Chunk* chunk = nullptr;
+        // =================================================================================
+        // 3. FASE DE COPIA Y RECONSTRUCCIÓN
+        // =================================================================================
+        Chunk* chunk = nullptr;
 #if defined(_LARGE_WORLDS)
-    if (!nearestClipChunks.empty()) {
-        int index = 0;
-        {
-            FRAME_PROFILE_SCOPE(ChunkRebuildSchedule);
-            for (int i = 0; i < nearestClipChunks.size(); ++i) {
-                chunk = nearestClipChunks.items[i].first->chunk;
+        if (!nearestClipChunks.empty()) {
+            int index = 0;
+            {
+                FRAME_PROFILE_SCOPE(ChunkRebuildSchedule);
+                for (int i = 0; i < nearestClipChunks.size(); ++i) {
+                    chunk = nearestClipChunks.items[i].first->chunk;
+                    if (veryNearCount > 0) {
+                        PlatformRenderer.CBuffDeferredModeStart();
+                    }
+                    chunk->clearDirty();
+
+                    // Soltamos lectura y tomamos escritura sólo para la duplicación
+                    dirtyChunksLock.unlock(); 
+                    {
+                        std::unique_lock<std::shared_mutex> writeLock(m_csDirtyChunks);
+                        permaChunk[index].makeCopyForRebuild(chunk);
+                    }
+                    
+                    // Si quedan elementos en el bucle, re-adquirimos lectura para continuar con seguridad
+                    if (i + 1 < nearestClipChunks.size()) {
+                        dirtyChunksLock.lock();
+                    }
+
+                    ++index;
+                }
+                
+                // Si ya se liberó lectura en la última iteración, no es necesario llamar a unlock() de nuevo.
+                // Sin embargo, para evitar estados inconsistentes con s_rebuildCompleteEvents:
+                --index; 
+                for (int i = MAX_CHUNK_REBUILD_THREADS - 1; i >= 0; --i) {
+                    if ((i + 1) > index) s_rebuildCompleteEvents->set(i);
+                    else break;
+                }
+            }
+
+            for (; index >= 0; --index) {
+                bool bAtomic = (veryNearCount > 0);
+                if (bAtomic || (index == 0)) {
+                    {
+                        FRAME_PROFILE_SCOPE(ChunkRebuildBody);
+                        permaChunk[index].rebuild();
+                    }
+                    if (index != 0) {
+                        FRAME_PROFILE_SCOPE(ChunkRebuildSchedule);
+                        s_rebuildCompleteEvents->set(index - 1);
+                    }
+                } else {
+                    FRAME_PROFILE_SCOPE(ChunkRebuildSchedule);
+                    s_activationEventA[index - 1]->set();
+                }
+            }
+            {
+                FRAME_PROFILE_SCOPE(ChunkRebuildSchedule);
+                s_rebuildCompleteEvents->waitForAll(C4JThread::kInfiniteTimeout);
+            }
+        }
+#else
+        if (nearChunk) {
+            chunk = nearChunk->chunk;
+            static Chunk permaChunk;
+            {
+                FRAME_PROFILE_SCOPE(ChunkRebuildSchedule);
                 if (veryNearCount > 0) {
                     PlatformRenderer.CBuffDeferredModeStart();
                 }
                 chunk->clearDirty();
 
-                // =================================================================================
-                // CAMBIO FASE B: Escalado de Lock. 
-                // Soltamos la lectura y tomamos escritura SOLO para la copia.
-                // =================================================================================
-                dirtyChunksLock.unlock(); 
-                std::unique_lock<std::shared_mutex> writeLock(m_csDirtyChunks);
-                permaChunk[index].makeCopyForRebuild(chunk);
-                writeLock.unlock(); 
-                dirtyChunksLock.lock(); // Volvemos a lectura para seguir el ciclo si es necesario
-
-                ++index;
-            }
-            dirtyChunksLock.unlock(); 
-
-            --index; 
-            for (int i = MAX_CHUNK_REBUILD_THREADS - 1; i >= 0; --i) {
-                if ((i + 1) > index) s_rebuildCompleteEvents->set(i);
-                else break;
-            }
-        }
-
-        for (; index >= 0; --index) {
-            bool bAtomic = (veryNearCount > 0);
-            if (bAtomic || (index == 0)) {
+                // Soltamos el candado de lectura y tomamos el de escritura temporal para copiar el chunk
+                dirtyChunksLock.unlock();
                 {
-                    FRAME_PROFILE_SCOPE(ChunkRebuildBody);
-                    permaChunk[index].rebuild();
+                    std::unique_lock<std::shared_mutex> writeLock(m_csDirtyChunks);
+                    permaChunk.makeCopyForRebuild(chunk);
                 }
-                if (index != 0) {
-                    FRAME_PROFILE_SCOPE(ChunkRebuildSchedule);
-                    s_rebuildCompleteEvents->set(index - 1);
-                }
-            } else {
-                FRAME_PROFILE_SCOPE(ChunkRebuildSchedule);
-                s_activationEventA[index - 1]->set();
+            }
+            {
+                FRAME_PROFILE_SCOPE(ChunkRebuildBody);
+                permaChunk.rebuild();
             }
         }
-        {
-            FRAME_PROFILE_SCOPE(ChunkRebuildSchedule);
-            s_rebuildCompleteEvents->waitForAll(C4JThread::kInfiniteTimeout);
-        }
-    }
-#else
-    if (nearChunk) {
-        chunk = nearChunk->chunk;
-        static Chunk permaChunk;
-        {
-            FRAME_PROFILE_SCOPE(ChunkRebuildSchedule);
-            if (veryNearCount > 0) {
-                PlatformRenderer.CBuffDeferredModeStart();
-            }
-            chunk->clearDirty();
-
-            // =================================================================================
-            // CAMBIO FASE B: Escalado de Lock para mundos pequeños.
-            // =================================================================================
-            dirtyChunksLock.unlock();
-            std::unique_lock<std::shared_mutex> writeLock(m_csDirtyChunks);
-            permaChunk.makeCopyForRebuild(chunk);
-            writeLock.unlock();
-        }
-        {
-            FRAME_PROFILE_SCOPE(ChunkRebuildBody);
-            permaChunk.rebuild();
-        }
-    }
 #endif
-    else {
-        if ((System::currentTimeMillis() - lastDirtyChunkFound) > FORCE_DIRTY_CHUNK_CHECK_PERIOD_MS) {
-            dirtyChunkPresent = true;
-        } else {
+        else {
+            // No encontramos ningún chunk sucio que contenga bloques reales
             dirtyChunkPresent = false;
         }
-        dirtyChunksLock.unlock();
-        return false;
-    }
 
-    if (veryNearCount > 1) {
-        destroyedTileManager->updatedChunkAt(chunk->level, chunk->x, chunk->y, chunk->z, veryNearCount);
-        return true;
+        // Retornamos el estado según las condiciones de vecindad de chunks
+        if (chunk) {
+            if (veryNearCount > 1) {
+                destroyedTileManager->updatedChunkAt(chunk->level, chunk->x, chunk->y, chunk->z, veryNearCount);
+                return true;
+            }
+            if ((veryNearCount == 1) && getGlobalChunkFlag(chunk->x, chunk->y, chunk->z, chunk->level, CHUNK_FLAG_DIRTY)) {
+                destroyedTileManager->updatedChunkAt(chunk->level, chunk->x, chunk->y, chunk->z, veryNearCount + 1);
+                return true;
+            }
+            destroyedTileManager->updatedChunkAt(chunk->level, chunk->x, chunk->y, chunk->z, veryNearCount);
+        }
     }
-    if ((veryNearCount == 1) && getGlobalChunkFlag(chunk->x, chunk->y, chunk->z, chunk->level, CHUNK_FLAG_DIRTY)) {
-        destroyedTileManager->updatedChunkAt(chunk->level, chunk->x, chunk->y, chunk->z, veryNearCount + 1);
-        return true;
-    }
-    if (nearChunk)
-        destroyedTileManager->updatedChunkAt(chunk->level, chunk->x, chunk->y, chunk->z, veryNearCount);
 
     return false;
 }
+
 void LevelRenderer::renderHit(std::shared_ptr<Player> player, HitResult* h,
                               int mode,
                               std::shared_ptr<ItemInstance> inventoryItem,

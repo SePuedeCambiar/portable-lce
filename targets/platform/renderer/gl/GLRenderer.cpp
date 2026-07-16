@@ -742,7 +742,7 @@ void GLRenderer::Initialise() {
     SDL_GL_MakeCurrent(s_window, s_glContext);
     pushRenderState();
 #ifdef ENABLE_VSYNC
-    SDL_GL_SetSwapInterval(1);
+    SDL_GL_SetSwapInterval(0);
 #else
     SDL_GL_SetSwapInterval(0);
 #endif
