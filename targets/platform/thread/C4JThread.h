@@ -51,13 +51,13 @@ public:
         bool m_signaled;
     };
 
-    // Lock-free bitmask of up to 32 events; waiters block via
-    // std::atomic::wait.
+    // Modificado: Sincronización pasiva nativa del kernel (Mutex + Condition Variable)
     class EventArray {
     public:
         enum class Mode { AutoClear, ManualClear };
 
         explicit EventArray(int size, Mode mode = Mode::AutoClear);
+        ~EventArray() = default;
 
         void set(int index);
         void clear(int index);
@@ -70,7 +70,10 @@ public:
     private:
         int m_size;
         Mode m_mode;
-        std::atomic<std::uint32_t> m_signaledMask;
+        // NUEVO: Variables de sincronización pasiva
+        std::mutex m_mutex;
+        std::condition_variable m_condition;
+        std::uint32_t m_signaledMask;
     };
 
     class EventQueue {

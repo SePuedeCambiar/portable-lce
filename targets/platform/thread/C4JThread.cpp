@@ -378,40 +378,42 @@ std::uint32_t C4JThread::Event::waitForSignal(int timeoutMs) {
 }
 
 C4JThread::EventArray::EventArray(int size, Mode mode)
-    : m_size(size), m_mode(mode), m_signaledMask(0U) {
+    : m_size(size), m_mode(mode), m_mutex(), m_condition(), m_signaledMask(0U) {
     assert(m_size > 0 && m_size <= 32);
 }
+
 
 void C4JThread::EventArray::set(int index) {
     assert(index >= 0 && index < m_size);
     const std::uint32_t bit = 1U << static_cast<std::uint32_t>(index);
-    
-    // fetch_or devuelve el valor ANTES de la operación.
-    // Solo notificamos si el bit NO estaba ya puesto.
-    std::uint32_t oldMask = m_signaledMask.fetch_or(bit, std::memory_order_acq_rel);
-    
-    if (!(oldMask & bit)) {
-        m_signaledMask.notify_all();
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_signaledMask |= bit;
     }
+    m_condition.notify_all(); // Despierta pasivamente a los hilos sin consumo de CPU
 }
 
 
 void C4JThread::EventArray::clear(int index) {
     assert(index >= 0 && index < m_size);
     const std::uint32_t bit = 1U << static_cast<std::uint32_t>(index);
-    m_signaledMask.fetch_and(~bit, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_signaledMask &= ~bit;
 }
 
 void C4JThread::EventArray::setAll() {
     const std::uint32_t mask = buildMaskForSize(m_size);
-    m_signaledMask.fetch_or(mask, std::memory_order_release);
-    m_signaledMask.notify_all();
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_signaledMask |= mask;
+    }
+    m_condition.notify_all();
 }
 
 void C4JThread::EventArray::clearAll() {
-    m_signaledMask.store(0U, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_signaledMask = 0U;
 }
-
 namespace {
 
 // Polling fallback for finite-timeout waits; std::atomic::wait has no timed
@@ -436,69 +438,53 @@ bool waitForMaskTimed(std::atomic<std::uint32_t>& mask, int timeoutMs,
 std::uint32_t C4JThread::EventArray::waitForSingle(int index, int timeoutMs) {
     assert(index >= 0 && index < m_size);
     const std::uint32_t bitMask = 1U << static_cast<std::uint32_t>(index);
-    const auto predicate = [bitMask](std::uint32_t cur) {
-        return (cur & bitMask) != 0U;
-    };
+    
+    std::unique_lock<std::mutex> lock(m_mutex);
+    auto predicate = [this, bitMask] { return (m_signaledMask & bitMask) != 0U; };
 
-    if (timeoutMs == kInfiniteTimeout) {
-        std::uint32_t cur = m_signaledMask.load(std::memory_order_acquire);
-        while (!predicate(cur)) {
-            m_signaledMask.wait(cur, std::memory_order_relaxed);
-            cur = m_signaledMask.load(std::memory_order_acquire);
-        }
-    } else if (!waitForMaskTimed(m_signaledMask, timeoutMs, predicate)) {
+    // Uso de Futex nativo del sistema operativo (0% de CPU durante la espera)
+    if (!waitForCondition(m_condition, lock, timeoutMs, predicate)) {
         return WaitResult::Timeout;
     }
 
     if (m_mode == Mode::AutoClear) {
-        m_signaledMask.fetch_and(~bitMask, std::memory_order_release);
+        m_signaledMask &= ~bitMask;
     }
     return WaitResult::Signaled;
 }
+
 
 std::uint32_t C4JThread::EventArray::waitForAll(int timeoutMs) {
     const std::uint32_t bitMask = buildMaskForSize(m_size);
-    const auto predicate = [bitMask](std::uint32_t cur) {
-        return (cur & bitMask) == bitMask;
-    };
+    
+    std::unique_lock<std::mutex> lock(m_mutex);
+    auto predicate = [this, bitMask] { return (m_signaledMask & bitMask) == bitMask; };
 
-    if (timeoutMs == kInfiniteTimeout) {
-        std::uint32_t cur = m_signaledMask.load(std::memory_order_acquire);
-        while (!predicate(cur)) {
-            m_signaledMask.wait(cur, std::memory_order_relaxed);
-            cur = m_signaledMask.load(std::memory_order_acquire);
-        }
-    } else if (!waitForMaskTimed(m_signaledMask, timeoutMs, predicate)) {
+    if (!waitForCondition(m_condition, lock, timeoutMs, predicate)) {
         return WaitResult::Timeout;
     }
 
     if (m_mode == Mode::AutoClear) {
-        m_signaledMask.fetch_and(~bitMask, std::memory_order_release);
+        m_signaledMask &= ~bitMask;
     }
     return WaitResult::Signaled;
 }
 
+
+
 std::uint32_t C4JThread::EventArray::waitForAny(int timeoutMs) {
     const std::uint32_t bitMask = buildMaskForSize(m_size);
-    const auto predicate = [bitMask](std::uint32_t cur) {
-        return (cur & bitMask) != 0U;
-    };
+    
+    std::unique_lock<std::mutex> lock(m_mutex);
+    auto predicate = [this, bitMask] { return (m_signaledMask & bitMask) != 0U; };
 
-    if (timeoutMs == kInfiniteTimeout) {
-        std::uint32_t cur = m_signaledMask.load(std::memory_order_acquire);
-        while (!predicate(cur)) {
-            m_signaledMask.wait(cur, std::memory_order_relaxed);
-            cur = m_signaledMask.load(std::memory_order_acquire);
-        }
-    } else if (!waitForMaskTimed(m_signaledMask, timeoutMs, predicate)) {
+    if (!waitForCondition(m_condition, lock, timeoutMs, predicate)) {
         return WaitResult::Timeout;
     }
 
-    const std::uint32_t cur = m_signaledMask.load(std::memory_order_acquire);
-    const std::uint32_t readyIndex = firstSetBitIndex(cur & bitMask);
+    const std::uint32_t readyIndex = firstSetBitIndex(m_signaledMask & bitMask);
     if (m_mode == Mode::AutoClear) {
-        m_signaledMask.fetch_and(~(1U << readyIndex),
-                                 std::memory_order_release);
+        m_signaledMask &= ~(1U << readyIndex);
     }
     return WaitResult::Signaled + readyIndex;
 }
@@ -590,8 +576,11 @@ void C4JThread::EventQueue::threadPoll() {
 
         {
             std::unique_lock lock(m_mutex);
-            m_queueCondition.wait_for(
-                lock, std::chrono::milliseconds(kEventQueueShutdownPollMs),
+            // OPTIMIZACIÓN CRÍTICA: Cambiamos 'wait_for' de 100ms por un 'wait' pasivo infinito.
+            // El hilo dormirá consumiendo 0 ciclos de CPU y solo se despertará si hay un evento
+            // o si el juego solicita cerrarse (m_stopRequested) mediante notify_all() en el destructor.
+            m_queueCondition.wait(
+                lock,
                 [this] {
                     return m_stopRequested.load(std::memory_order_acquire) ||
                            !m_queue.empty();

@@ -290,65 +290,25 @@ void CompressedTileStorage::setData(std::vector<uint8_t>& dataIn,
     allocatedSize = memToAlloc;
 }
 
-// NUEVA FUNCIÓN GETDATA (100% LIMPIA, ESTABLE Y COMPATIBLE)
 void CompressedTileStorage::getData(std::vector<uint8_t>& retArray,
                                     unsigned int retOffset) {
     std::lock_guard<std::recursive_mutex> lock(cs_write);
 
-    // 1. Asegurar la existencia del Buffer Sombra
-    if (!unpackedCache) {
-        unpackedCache = (uint8_t*)malloc(32768);
-    }
+    updateCache();
 
-    // 2. Si el cache está sucio, realizamos la descompresión usando 'getIndex' original de C++
-    if (isDirty) {
-        unsigned short* blockIndices = (unsigned short*)indicesAndData;
-        unsigned char* data = indicesAndData + 1024;
-
-        for (int i = 0; i < 512; i++) {
-            int indexType = blockIndices[i] & INDEX_TYPE_MASK;
-
-            if (indexType == INDEX_TYPE_0_OR_8_BIT) {
-                if (blockIndices[i] & INDEX_TYPE_0_BIT_FLAG) {
-                    uint8_t val = (blockIndices[i] >> INDEX_TILE_SHIFT) & INDEX_TILE_MASK;
-                    for (int j = 0; j < 64; j++) {
-                        unpackedCache[getIndex(i, j)] = val;
-                    }
-                } else {
-                    unsigned char* packed = data + ((blockIndices[i] >> INDEX_OFFSET_SHIFT) & INDEX_OFFSET_MASK);
-                    for (int j = 0; j < 64; j++) {
-                        unpackedCache[getIndex(i, j)] = packed[j];
-                    }
-                }
-            } else {
-                int bitspertile = 1 << indexType;
-                int tiletypecount = 1 << bitspertile;
-                int tiletypemask = tiletypecount - 1;
-                int indexshift = 3 - indexType;
-                int indexmask_bits = 7 >> indexType;
-                int indexmask_bytes = 62 >> indexshift;
-
-                unsigned char* tile_types = data + ((blockIndices[i] >> INDEX_OFFSET_SHIFT) & INDEX_OFFSET_MASK);
-                unsigned char* packed = tile_types + tiletypecount;
-
-                for (int j = 0; j < 64; j++) {
-                    int idx = (j >> indexshift) & indexmask_bytes;
-                    int bit = (j & indexmask_bits) * bitspertile;
-                    unpackedCache[getIndex(i, j)] = tile_types[(packed[idx] >> bit) & tiletypemask];
-                }
-            }
-        }
-        isDirty = false; // Cache validado
-    }
-
-    // 3. Retornar los datos copiando desde el cache lineal
     if (retArray.size() < 32768 + retOffset) {
         retArray.resize(32768 + retOffset);
     }
     memcpy(&retArray[retOffset], unpackedCache, 32768);
 }
-
 int CompressedTileStorage::get(int x, int y, int z) {
+    // OPTIMIZACIÓN LCE NATIVA PARA PC:
+    // Mapeo lineal directo de coordenadas de 15 bits (4 bits X, 4 bits Z, 7 bits Y).
+    // Evita llamar a getBlockAndTile y getIndex, reduciendo el coste de CPU a casi cero.
+    if (unpackedCache && !isDirty) {
+        return unpackedCache[(x << 11) | (z << 7) | y];
+    }
+
     if (!indicesAndData) return 0;
 
     unsigned short* blockIndices = (unsigned short*)indicesAndData;
@@ -857,15 +817,65 @@ void CompressedTileStorage::reverseIndices(unsigned char* indices) {
         System::ReverseUSHORT(&blockIndices[i]);
     }
 }
-
 void CompressedTileStorage::copyTo(uint8_t* dst) {
-    if (isDirty || !unpackedCache) {
-        std::vector<uint8_t> dummy(32768);
-        getData(dummy, 0);
-    }
+    std::lock_guard<std::recursive_mutex> lock(cs_write);
+    updateCache();
     if (unpackedCache) {
         memcpy(dst, unpackedCache, 32768);
     } else {
         memset(dst, 0, 32768);
     }
+}
+
+// NUEVO: Implementación de la función updateCache() que faltaba en el .cpp
+void CompressedTileStorage::updateCache() {
+    if (!unpackedCache) {
+        unpackedCache = (uint8_t*)malloc(32768);
+    }
+    if (isDirty) {
+        unsigned short* blockIndices = (unsigned short*)indicesAndData;
+        unsigned char* data = indicesAndData + 1024;
+
+        for (int i = 0; i < 512; i++) {
+            int indexType = blockIndices[i] & INDEX_TYPE_MASK;
+
+            if (indexType == INDEX_TYPE_0_OR_8_BIT) {
+                if (blockIndices[i] & INDEX_TYPE_0_BIT_FLAG) {
+                    uint8_t val = (blockIndices[i] >> INDEX_TILE_SHIFT) & INDEX_TILE_MASK;
+                    for (int j = 0; j < 64; j++) {
+                        unpackedCache[getIndex(i, j)] = val;
+                    }
+                } else {
+                    unsigned char* packed = data + ((blockIndices[i] >> INDEX_OFFSET_SHIFT) & INDEX_OFFSET_MASK);
+                    for (int j = 0; j < 64; j++) {
+                        unpackedCache[getIndex(i, j)] = packed[j];
+                    }
+                }
+            } else {
+                int bitspertile = 1 << indexType;
+                int tiletypecount = 1 << bitspertile;
+                int tiletypemask = tiletypecount - 1;
+                int indexshift = 3 - indexType;
+                int indexmask_bits = 7 >> indexType;
+                int indexmask_bytes = 62 >> indexshift;
+
+                unsigned char* tile_types = data + ((blockIndices[i] >> INDEX_OFFSET_SHIFT) & INDEX_OFFSET_MASK);
+                unsigned char* packed = tile_types + tiletypecount;
+
+                for (int j = 0; j < 64; j++) {
+                    int idx = (j >> indexshift) & indexmask_bytes;
+                    int bit = (j & indexmask_bits) * bitspertile;
+                    unpackedCache[getIndex(i, j)] = tile_types[(packed[idx] >> bit) & tiletypemask];
+                }
+            }
+        }
+        isDirty = false;
+    }
+}
+
+// NUEVO: Implementación de getUnpackedBuffer() que faltaba en el .cpp
+uint8_t* CompressedTileStorage::getUnpackedBuffer() {
+    std::lock_guard<std::recursive_mutex> lock(cs_write);
+    updateCache();
+    return unpackedCache;
 }

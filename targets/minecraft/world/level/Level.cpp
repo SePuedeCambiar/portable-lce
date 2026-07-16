@@ -722,6 +722,7 @@ int Level::getTopTile(int x, int z) {
     }
     return getTile(x, y, z);
 }
+
 int Level::getTile(int x, int y, int z) {
     if (x < -MAX_LEVEL_SIZE || z < -MAX_LEVEL_SIZE || x >= MAX_LEVEL_SIZE ||
         z >= MAX_LEVEL_SIZE) {
@@ -729,7 +730,22 @@ int Level::getTile(int x, int y, int z) {
     }
     if (y < minBuildHeight) return 0;
     if (y >= maxBuildHeight) return 0;
-    return getChunk(x >> 4, z >> 4)->getTile(x & 15, y, z & 15);
+
+    int xc = x >> 4;
+    int zc = z >> 4;
+    int ix = xc + (chunkSourceXZSize / 2);
+    int iz = zc + (chunkSourceXZSize / 2);
+
+    // OPTIMIZACIÓN: Acceso directo a la caché rápida de chunks para evitar el mapa de getChunk
+    if (ix >= 0 && ix < chunkSourceXZSize && iz >= 0 && iz < chunkSourceXZSize) {
+        int idx = ix * chunkSourceXZSize + iz;
+        LevelChunk* c = chunkSourceCache[idx];
+        if (c != nullptr) {
+            return c->getTile(x & 15, y, z & 15);
+        }
+    }
+
+    return getChunk(xc, zc)->getTile(x & 15, y, z & 15);
 }
 
 int Level::getTileLightBlock(int x, int y, int z) {
@@ -739,7 +755,22 @@ int Level::getTileLightBlock(int x, int y, int z) {
     }
     if (y < minBuildHeight) return 0;
     if (y >= maxBuildHeight) return 0;
-    return getChunk(x >> 4, z >> 4)->getTileLightBlock(x & 15, y, z & 15);
+
+    int xc = x >> 4;
+    int zc = z >> 4;
+    int ix = xc + (chunkSourceXZSize / 2);
+    int iz = zc + (chunkSourceXZSize / 2);
+
+    // OPTIMIZACIÓN: Acceso directo a la caché rápida de chunks
+    if (ix >= 0 && ix < chunkSourceXZSize && iz >= 0 && iz < chunkSourceXZSize) {
+        int idx = ix * chunkSourceXZSize + iz;
+        LevelChunk* c = chunkSourceCache[idx];
+        if (c != nullptr) {
+            return c->getTileLightBlock(x & 15, y, z & 15);
+        }
+    }
+
+    return getChunk(xc, zc)->getTileLightBlock(x & 15, y, z & 15);
 }
 
 bool Level::isEmptyTile(int x, int y, int z) { return getTile(x, y, z) == 0; }
@@ -882,10 +913,22 @@ int Level::getData(int x, int y, int z) {
     }
     if (y < 0) return 0;
     if (y >= maxBuildHeight) return 0;
-    LevelChunk* c = getChunk(x >> 4, z >> 4);
-    x &= 15;
-    z &= 15;
-    return c->getData(x, y, z);
+
+    int xc = x >> 4;
+    int zc = z >> 4;
+    int ix = xc + (chunkSourceXZSize / 2);
+    int iz = zc + (chunkSourceXZSize / 2);
+
+    // OPTIMIZACIÓN: Acceso directo a la caché rápida de chunks
+    if (ix >= 0 && ix < chunkSourceXZSize && iz >= 0 && iz < chunkSourceXZSize) {
+        int idx = ix * chunkSourceXZSize + iz;
+        LevelChunk* c = chunkSourceCache[idx];
+        if (c != nullptr) {
+            return c->getData(x & 15, y, z & 15);
+        }
+    }
+
+    return getChunk(xc, zc)->getData(x & 15, y, z & 15);
 }
 
 bool Level::setData(int x, int y, int z, int data, int updateFlags,
@@ -2587,37 +2630,50 @@ std::shared_ptr<TileEntity> Level::getTileEntity(int x, int y, int z) {
     }
     std::shared_ptr<TileEntity> tileEntity = nullptr;
 
-    if (updatingTileEntities) {
-        {
-            std::lock_guard<std::recursive_mutex> lock(m_tileEntityListCS);
-            for (int i = 0; i < pendingTileEntities.size(); i++) {
-                std::shared_ptr<TileEntity> e = pendingTileEntities.at(i);
-                if (!e->isRemoved() && e->x == x && e->y == y && e->z == z) {
-                    tileEntity = e;
-                    break;
-                }
+    // 1. Buscar en pending sólo si no está vacío y estamos actualizando las entidades en el hilo principal
+    if (updatingTileEntities && !pendingTileEntities.empty()) {
+        std::lock_guard<std::recursive_mutex> lock(m_tileEntityListCS);
+        for (size_t i = 0; i < pendingTileEntities.size(); i++) {
+            std::shared_ptr<TileEntity> e = pendingTileEntities[i];
+            if (!e->isRemoved() && e->x == x && e->y == y && e->z == z) {
+                tileEntity = e;
+                break;
             }
         }
     }
 
+    // 2. Buscar en el chunk (el camino rápido, local y más común)
     if (tileEntity == nullptr) {
-        LevelChunk* lc = getChunk(x >> 4, z >> 4);
-        if (lc != nullptr) {
-            tileEntity = lc->getTileEntity(x & 15, y, z & 15);
+        int xc = x >> 4;
+        int zc = z >> 4;
+        int ix = xc + (chunkSourceXZSize / 2);
+        int iz = zc + (chunkSourceXZSize / 2);
+
+        // Usamos la caché rápida de chunks para evitar buscar en el mapa si está disponible
+        if (ix >= 0 && ix < chunkSourceXZSize && iz >= 0 && iz < chunkSourceXZSize) {
+            int idx = ix * chunkSourceXZSize + iz;
+            LevelChunk* lc = chunkSourceCache[idx];
+            if (lc != nullptr) {
+                tileEntity = lc->getTileEntity(x & 15, y, z & 15);
+            }
+        } else {
+            LevelChunk* lc = getChunk(xc, zc);
+            if (lc != nullptr) {
+                tileEntity = lc->getTileEntity(x & 15, y, z & 15);
+            }
         }
     }
 
-    if (tileEntity == nullptr) {
-        {
-            std::lock_guard<std::recursive_mutex> lock(m_tileEntityListCS);
-            for (auto it = pendingTileEntities.begin();
-                 it != pendingTileEntities.end(); it++) {
-                std::shared_ptr<TileEntity> e = *it;
-
-                if (!e->isRemoved() && e->x == x && e->y == y && e->z == z) {
-                    tileEntity = e;
-                    break;
-                }
+    // 3. Buscar de nuevo en pending SÓLO si no se encontró en el chunk,
+    // NO estamos en fase de actualización (ya que si lo estuviéramos, ya se habría buscado en el paso 1),
+    // y la lista de pendientes realmente contiene elementos.
+    if (tileEntity == nullptr && !updatingTileEntities && !pendingTileEntities.empty()) {
+        std::lock_guard<std::recursive_mutex> lock(m_tileEntityListCS);
+        for (auto it = pendingTileEntities.begin(); it != pendingTileEntities.end(); it++) {
+            std::shared_ptr<TileEntity> e = *it;
+            if (!e->isRemoved() && e->x == x && e->y == y && e->z == z) {
+                tileEntity = e;
+                break;
             }
         }
     }

@@ -1021,6 +1021,8 @@ void GLRenderer::CBuffStart(int index, bool) {
     s_recVerts.clear();
     s_recDraws.clear();
 }
+
+
 void GLRenderer::CBuffEnd() {
     if (s_recListId < 0) return;
     std::lock_guard<std::mutex> lk(s_glCallMtx);
@@ -1034,13 +1036,18 @@ void GLRenderer::CBuffEnd() {
         s_recListId = -1;
         return;
     }
+    
     ChunkBuffer newCb;
-    newCb.rawVerts = std::move(s_recVerts);
+    // Copiamos los datos en lugar de moverlos para mantener la capacidad en s_recVerts.
+    newCb.rawVerts = s_recVerts; 
     newCb.draws = std::move(s_recDraws);
     newCb.valid = true;
     newCb.vboReady = false;
     newCb.lastUsedFrame = SDL_GetTicks();
     s_chunkPool[s_recListId] = std::move(newCb);
+    
+    // Limpiamos el vector para el siguiente chunk, pero MANTENIENDO la memoria ya reservada.
+    s_recVerts.clear(); 
     s_recListId = -1;
 }
 // BORRADO DIFERIDO THREAD-SAFE EN CLEAR
