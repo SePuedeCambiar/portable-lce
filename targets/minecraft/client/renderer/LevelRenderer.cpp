@@ -3931,9 +3931,8 @@ int LevelRenderer::checkAllPresentChunks(bool* faultFound) {
 }
 
 void LevelRenderer::unloadRenderChunk(int x, int z, int dimensionId) {
-    // Un chunk lógico (16x16) tiene varias secciones de renderizado (16x16x16)
     for (int y = 0; y < CHUNK_Y_COUNT; y++) {
-        // CORRECCIÓN: Convertimos coordenadas de chunk a coordenadas de bloque reales (* 16)
+        // Convertimos a coordenadas globales de bloque para obtener el ID correcto
         int blockX = x * CHUNK_XZSIZE;
         int blockY = y * CHUNK_SIZE;
         int blockZ = z * CHUNK_XZSIZE;
@@ -3941,20 +3940,47 @@ void LevelRenderer::unloadRenderChunk(int x, int z, int dimensionId) {
         int index = getGlobalIndexForChunk(blockX, blockY, blockZ, dimensionId);
         if (index == -1) continue;
 
-        // Calculamos la posición de las listas de renderizado (Opaca y Transparente)
+        // --- CORRECCIÓN CRÍTICA: Liberación real de memoria en VRAM ---
+        for (int layer = 0; layer < 2; layer++) {
+            // Obtenemos el VBO que asignamos en Chunk::rebuild()
+            int vboId = getVBOForChunk(index, layer);
+            if (vboId != 0) {
+                // Liberar buffer en la GPU
+                glDeleteBuffers(1, (GLuint*)&vboId);
+                
+                // Limpiar nuestro mapa/almacén interno para que no quede rastro
+                setVBOForChunk(index, layer, 0); 
+            }
+        }
+        // --- FIN DE LA CORRECCIÓN ---
+
+        // Mantener la lógica de limpieza original (por seguridad)
         int lists = index * 2 + chunkLists;
+        PlatformRenderer.CBuffClear(lists);
+        PlatformRenderer.CBuffClear(lists + 1);
 
-        // Forzamos la liberación segura de la memoria en la GPU
-        PlatformRenderer.CBuffClear(lists);     // Capa Opaca
-        PlatformRenderer.CBuffClear(lists + 1); // Capa Transparente
-
-        // Marcamos el chunk como vacío para que el renderizador no intente dibujarlo
+        // Marcar como vacío
         setGlobalChunkFlag(index, CHUNK_FLAG_EMPTYBOTH, 0);
 
-        // Decrementamos el contador de referencias de manera segura
+        // Manejo de referencias
         if (level[0] != nullptr) {
             decGlobalChunkRefCount(blockX, blockY, blockZ, level[0]);
         }
     }
-    Log::info("RenderRenderer: GPU buffers liberados para chunk [%d, %d]\n", x, z);
+}
+
+
+GLuint LevelRenderer::getVBOForChunk(int globalIdx, int layer) {
+    if (m_chunkVBOs.find(globalIdx) != m_chunkVBOs.end()) {
+        return m_chunkVBOs[globalIdx][layer];
+    }
+    return 0;
+}
+
+void LevelRenderer::setVBOForChunk(int globalIdx, int layer, GLuint vbo) {
+    m_chunkVBOs[globalIdx][layer] = vbo;
+}
+
+void LevelRenderer::setVertexCountForChunk(int globalIdx, int layer, size_t count) {
+    m_chunkVertexCounts[globalIdx][layer] = count;
 }

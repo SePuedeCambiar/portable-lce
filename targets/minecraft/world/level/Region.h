@@ -17,28 +17,22 @@ class ProgressListener;
 class Region : public LevelSource {
 private:
     int xc1, zc1;
-    std::vector<std::vector<LevelChunk*>>* chunks;
+    std::vector<std::vector<LevelChunk*>>* chunks; // Mantenemos el puntero original nulo por compatibilidad de ABI
     Level* level;
     bool allEmpty;
 
-    // AP - Sistema de caché original de Xbox 360 (Mantenido intacto para Steve y entidades)
+    // AP - Sistema de caché original de Xbox 360
     int xcCached, zcCached;
     unsigned char* CachedTiles;
 
-    // Modern PC - Canal de caché de alto rendimiento aislado (Exclusivo para rebuild de Chunks)
-    int m_pcOriginX, m_pcOriginZ;
-    unsigned char* m_pcTiles;
-    unsigned char* m_pcData;
-    unsigned char* m_pcBlockLight;
-    unsigned char* m_pcSkyLight;
-    bool m_pcCacheActive;
+    // Modern PC - Matriz estática de punteros de chunk (0 allocations / 0 contención de hilos)
+    LevelChunk* m_chunks[16][16];
+    int m_width;
+    int m_height;
 
 public:
     Region(Level* level, int x1, int y1, int z1, int x2, int y2, int z2, int r);
     virtual ~Region();
-    
-    // Método exclusivo de PC para activar el súper-caché de reconstrucción
-    void enableCache(int chunkX, int chunkZ);
 
     bool isAllEmpty();
     int getTile(int x, int y, int z);
@@ -65,6 +59,5 @@ public:
 
     LevelChunk* getLevelChunk(int x, int y, int z);
 
-    // Legacy Xbox 360 API (Preservada sin cambios para evitar bugs visuales)
     void setCachedTiles(unsigned char* tiles, int xc, int zc);
 };

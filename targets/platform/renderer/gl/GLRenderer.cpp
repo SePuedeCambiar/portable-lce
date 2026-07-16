@@ -785,6 +785,7 @@ void GLRenderer::StartFrame() {
     glViewport(0, 0, s_windowWidth, s_windowHeight);
 }
 // NUEVA FUNCIÓN PRESENT DE ALTA SEGURIDAD
+// NUEVA FUNCIÓN PRESENT DE ALTA SEGURIDAD (Sin GC temporal agresivo)
 void GLRenderer::Present() {
     // ============================================================
     // 1. FASE DE DESTRUCCIÓN SINCRONIZADA (Thread-Safe)
@@ -805,29 +806,7 @@ void GLRenderer::Present() {
     }
 
     // ============================================================
-    // 2. GARBAGE COLLECTOR SINCRONIZADO POR TICKS (Tick-Based GC)
-    // ============================================================
-    // Ahora usamos un umbral más realista (1200 chunks) y timeout de 30 segundos
-    // para ser más agresivos con la limpieza.
-    Uint32 now = SDL_GetTicks();
-    if (s_chunkPool.size() > 1200) {  // Cambiado de 1500 a 1200
-        std::lock_guard<std::mutex> lk_pool(s_glCallMtx);
-        for (auto it = s_chunkPool.begin(); it != s_chunkPool.end(); ) {
-            // 30000 ms = 30 segundos (más agresivo para liberar GPU antes)
-            if (now - it->second.lastUsedFrame > 30000) {
-                {
-                    std::lock_guard<std::mutex> lk_del(s_destructionMtx);
-                    s_pendingDestructions.push_back(std::move(it->second));
-                }
-                it = s_chunkPool.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-
-    // ============================================================
-    // 3. PROCESAMIENTO DE EVENTOS SDL
+    // 2. PROCESAMIENTO DE EVENTOS SDL
     // ============================================================
     if (!s_window) return;
     SDL_Event ev;
@@ -841,7 +820,7 @@ void GLRenderer::Present() {
     }
 
     // ============================================================
-    // 4. DIAGNÓSTICO Y MONITOREO (Opcional, puedes desactivarlo)
+    // 3. DIAGNÓSTICO Y MONITOREO
     // ============================================================
     // Solo mostramos diagnóstico cada 60 frames para no saturar la consola
     static int frameCounter = 0;
@@ -851,12 +830,11 @@ void GLRenderer::Present() {
     }
 
     // ============================================================
-    // 5. SWAP DE BUFFERS Y SINCRONIZACIÓN FINAL
+    // 4. SWAP DE BUFFERS Y SINCRONIZACIÓN FINAL
     // ============================================================
     glFlush();  // Asegura que todos los comandos se envíen a la GPU
     SDL_GL_SwapWindow(s_window);
 }
-
 
 void GLRenderer::SetWindowSize(int w, int h) {
     s_reqWidth = w;

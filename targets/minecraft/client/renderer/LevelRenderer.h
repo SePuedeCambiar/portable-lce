@@ -12,6 +12,10 @@
 #include <atomic>
 #include <shared_mutex>
 
+// NUEVO: Cabeceras necesarias para los VBOs y arrays
+#include <GL/glew.h>
+#include <array>
+
 class ClipChunk;
 class HitResult;
 class Icon;
@@ -130,6 +134,11 @@ public:
                        Level* level);  // 4J - added level param
 
     void unloadRenderChunk(int x, int z, int dimensionId); 
+    
+    // NUEVO: Declaraciones de las funciones para la gestión de VBOs
+    GLuint getVBOForChunk(int globalIdx, int layer);
+    void setVBOForChunk(int globalIdx, int layer, GLuint vbo);
+    void setVertexCountForChunk(int globalIdx, int layer, size_t count);
                        
     void cull(Culler* culler, float a);
     void playStreamingMusic(const std::string& name, int x, int y, int z);
@@ -374,4 +383,9 @@ public:
     void nonStackDirtyChunksAdded();
 
     int checkAllPresentChunks(bool* faultFound);  // 4J - added for testing
+
+private:
+    // NUEVO: Variables miembro privadas para guardar las VBOs y recuento de vértices
+    std::unordered_map<int, std::array<GLuint, 2>> m_chunkVBOs;
+    std::unordered_map<int, std::array<size_t, 2>> m_chunkVertexCounts;
 };

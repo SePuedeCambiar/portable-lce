@@ -14,8 +14,7 @@
 #include "minecraft/world/level/tile/Tile.h"
 
 Region::~Region() {
-    delete chunks;
-    // Liberamos solo el buffer legacy (tal y como lo hacía el juego original)
+    // 0 allocations en constructor = 0 deallocations en destructor. ¡Rendimiento instantáneo!
     if (CachedTiles) {
         free(CachedTiles);
     }
@@ -23,111 +22,61 @@ Region::~Region() {
 
 Region::Region(Level* level, int x1, int y1, int z1, int x2, int y2, int z2, int r) {
     this->level = level;
+    this->chunks = nullptr; // Forzamos a nulo para evitar asignación del vector lento
 
     xc1 = (x1 - r) >> 4;
     zc1 = (z1 - r) >> 4;
     int xc2 = (x2 + r) >> 4;
     int zc2 = (z2 + r) >> 4;
 
-    chunks = new std::vector<std::vector<LevelChunk*>>(
-        xc2 - xc1 + 1, std::vector<LevelChunk*>(zc2 - zc1 + 1, nullptr));
+    m_width = xc2 - xc1 + 1;
+    m_height = zc2 - zc1 + 1;
 
-    allEmpty = true;
-    for (int xc = xc1; xc <= xc2; xc++) {
-        for (int zc = zc1; zc <= zc2; zc++) {
+    // Límite de seguridad para nuestra matriz estática
+    if (m_width > 16) m_width = 16;
+    if (m_height > 16) m_height = 16;
+
+    // Limpiamos la matriz estática
+    memset(m_chunks, 0, sizeof(m_chunks));
+
+    // Rellenamos la matriz estática directamente de la memoria física
+    for (int lx = 0; lx < m_width; lx++) {
+        int xc = xc1 + lx;
+        for (int lz = 0; lz < m_height; lz++) {
+            int zc = zc1 + lz;
             LevelChunk* chunk = level->getChunk(xc, zc);
             if (chunk != nullptr) {
-                (*chunks)[xc - xc1][zc - zc1] = chunk;
+                m_chunks[lx][lz] = chunk;
             }
         }
     }
-    for (int xc = (x1 >> 4); xc <= (x2 >> 4); xc++) {
-        for (int zc = (z1 >> 4); zc <= (z2 >> 4); zc++) {
-            LevelChunk* chunk = (*chunks)[xc - xc1][zc - zc1];
-            if (chunk != nullptr) {
-                if (!chunk->isYSpaceEmpty(y1, y2)) {
-                    allEmpty = false;
+
+    // Calculamos si la sección está vacía reproduciendo fielmente la lógica de Xbox 360
+    allEmpty = true;
+    int startX = (x1 >> 4) - xc1;
+    int endX = (x2 >> 4) - xc1;
+    int startZ = (z1 >> 4) - zc1;
+    int endZ = (z2 >> 4) - zc1;
+
+    for (int lx = startX; lx <= endX; lx++) {
+        for (int lz = startZ; lz <= endZ; lz++) {
+            if (lx >= 0 && lx < m_width && lz >= 0 && lz < m_height) {
+                LevelChunk* chunk = m_chunks[lx][lz];
+                if (chunk != nullptr) {
+                    if (!chunk->isYSpaceEmpty(y1, y2)) {
+                        allEmpty = false;
+                    }
                 }
             }
         }
     }
 
-    // Inicialización del canal Legacy de Xbox 360
+    // Legacy Xbox 360
     xcCached = -1;
     zcCached = -1;
     CachedTiles = nullptr;
-
-    // Inicialización del canal rápido de PC
-    m_pcOriginX = -1;
-    m_pcOriginZ = -1;
-    m_pcTiles = nullptr;
-    m_pcData = nullptr;
-    m_pcBlockLight = nullptr;
-    m_pcSkyLight = nullptr;
-    m_pcCacheActive = false;
 }
 
-void Region::enableCache(int chunkX, int chunkZ) {
-    // CORREGIDO: Son coordenadas de bloque directas, no multiplicamos por 16!
-    m_pcOriginX = chunkX - 1;
-    m_pcOriginZ = chunkZ - 1;
-    int maxH = Level::maxBuildHeight;
-
-    // Buffers estáticos por hilo para rendimiento óptimo sin garbage collection
-    static thread_local unsigned char* tl_Tiles = nullptr;
-    static thread_local unsigned char* tl_Data = nullptr;
-    static thread_local unsigned char* tl_BlockLight = nullptr;
-    static thread_local unsigned char* tl_SkyLight = nullptr;
-
-    if (!tl_Tiles) {
-        tl_Tiles = (unsigned char*)malloc(18 * 18 * maxH);
-        tl_Data = (unsigned char*)malloc(18 * 18 * maxH);
-        tl_BlockLight = (unsigned char*)malloc(18 * 18 * maxH);
-        tl_SkyLight = (unsigned char*)malloc(18 * 18 * maxH);
-    }
-
-    m_pcTiles = tl_Tiles;
-    m_pcData = tl_Data;
-    m_pcBlockLight = tl_BlockLight;
-    m_pcSkyLight = tl_SkyLight;
-
-    // Pre-descompresión del área 18x18
-    for (int lx = 0; lx < 18; lx++) {
-        int worldX = m_pcOriginX + lx;
-        int xc = (worldX >> 4) - xc1;
-
-        for (int lz = 0; lz < 18; lz++) {
-            int worldZ = m_pcOriginZ + lz;
-            int zc = (worldZ >> 4) - zc1;
-
-            LevelChunk* lc = nullptr;
-            if (xc >= 0 && xc < (int)chunks->size() && zc >= 0 && zc < (int)(*chunks)[xc].size()) {
-                lc = (*chunks)[xc][zc];
-            }
-
-            int destOffset = (lx * 18 + lz) * maxH;
-
-            if (lc != nullptr) {
-                int localX = worldX & 15;
-                int localZ = worldZ & 15;
-                for (int y = 0; y < maxH; y++) {
-                    m_pcTiles[destOffset + y] = lc->getTile(localX, y, localZ);
-                    m_pcData[destOffset + y] = lc->getData(localX, y, localZ);
-                    m_pcBlockLight[destOffset + y] = lc->getBrightness(LightLayer::Block, localX, y, localZ);
-                    m_pcSkyLight[destOffset + y] = lc->getBrightness(LightLayer::Sky, localX, y, localZ);
-                }
-            } else {
-                memset(m_pcTiles + destOffset, 0, maxH);
-                memset(m_pcData + destOffset, 0, maxH);
-                memset(m_pcBlockLight + destOffset, 0, maxH);
-                memset(m_pcSkyLight + destOffset, 0, maxH);
-            }
-        }
-    }
-    m_pcCacheActive = true;
-}
-
-// Canal Legacy de Xbox 360 (Mantenido intacto para Steve y físicas)
 void Region::setCachedTiles(unsigned char* tiles, int xc, int zc) {
     xcCached = xc;
     zcCached = zc;
@@ -141,74 +90,53 @@ void Region::setCachedTiles(unsigned char* tiles, int xc, int zc) {
 bool Region::isAllEmpty() { return allEmpty; }
 
 int Region::getTile(int x, int y, int z) {
-    if (m_pcCacheActive && y >= 0 && y < Level::maxBuildHeight) {
-        int lx = x - m_pcOriginX;
-        int lz = z - m_pcOriginZ;
-        if (lx >= 0 && lx < 18 && lz >= 0 && lz < 18) {
-            return m_pcTiles[(lx * 18 + lz) * Level::maxBuildHeight + y];
+    if (y < 0 || y >= Level::maxBuildHeight) return 0;
+
+    int lx = (x >> 4) - xc1;
+    int lz = (z >> 4) - zc1;
+
+    if (lx >= 0 && lx < m_width && lz >= 0 && lz < m_height) {
+        LevelChunk* lc = m_chunks[lx][lz];
+        if (lc != nullptr) {
+            return lc->getTile(x & 15, y, z & 15);
         }
     }
-
-    if (y < 0) return 0;
-    if (y >= Level::maxBuildHeight) return 0;
-
-    int xc = (x >> 4) - xc1;
-    int zc = (z >> 4) - zc1;
-
-    if (xc < 0 || xc >= (int)chunks->size() || zc < 0 || zc >= (int)(*chunks)[xc].size()) {
-        return 0;
-    }
-
-    LevelChunk* lc = (*chunks)[xc][zc];
-    if (lc == nullptr) return 0;
-
-    return lc->getTile(x & 15, y, z & 15);
+    return 0;
 }
 
 int Region::getData(int x, int y, int z) {
-    if (m_pcCacheActive && y >= 0 && y < Level::maxBuildHeight) {
-        int lx = x - m_pcOriginX;
-        int lz = z - m_pcOriginZ;
-        if (lx >= 0 && lx < 18 && lz >= 0 && lz < 18) {
-            return m_pcData[(lx * 18 + lz) * Level::maxBuildHeight + y];
+    if (y < 0 || y >= Level::maxBuildHeight) return 0;
+
+    int lx = (x >> 4) - xc1;
+    int lz = (z >> 4) - zc1;
+
+    if (lx >= 0 && lx < m_width && lz >= 0 && lz < m_height) {
+        LevelChunk* lc = m_chunks[lx][lz];
+        if (lc != nullptr) {
+            return lc->getData(x & 15, y, z & 15);
         }
     }
-
-    if (y < 0) return 0;
-    if (y >= Level::maxBuildHeight) return 0;
-    int xc = (x >> 4) - xc1;
-    int zc = (z >> 4) - zc1;
-
-    if (xc < 0 || xc >= (int)chunks->size() || zc < 0 || zc >= (int)(*chunks)[xc].size()) {
-        return 0;
-    }
-
-    LevelChunk* lc = (*chunks)[xc][zc];
-    if (lc == nullptr) return 0;
-
-    return lc->getData(x & 15, y, z & 15);
+    return 0;
 }
 
 int Region::getBrightness(LightLayer::variety layer, int x, int y, int z) {
-    if (m_pcCacheActive && y >= 0 && y < Level::maxBuildHeight) {
-        int lx = x - m_pcOriginX;
-        int lz = z - m_pcOriginZ;
-        if (lx >= 0 && lx < 18 && lz >= 0 && lz < 18) {
-            int index = (lx * 18 + lz) * Level::maxBuildHeight + y;
-            return (layer == LightLayer::Block) ? m_pcBlockLight[index] : m_pcSkyLight[index];
-        }
-    }
-
     if (y < 0) y = 0;
     if (y >= Level::maxBuildHeight) y = Level::maxBuildHeight - 1;
-    if (y < 0 || y >= Level::maxBuildHeight || x < -Level::MAX_LEVEL_SIZE ||
-        z < -Level::MAX_LEVEL_SIZE || x >= Level::MAX_LEVEL_SIZE || z > Level::MAX_LEVEL_SIZE) {
+    if (x < -Level::MAX_LEVEL_SIZE || z < -Level::MAX_LEVEL_SIZE ||
+        x >= Level::MAX_LEVEL_SIZE || z > Level::MAX_LEVEL_SIZE) {
         return (int)layer;
     }
-    int xc = (x >> 4) - xc1;
-    int zc = (z >> 4) - zc1;
 
-    return (*chunks)[xc][zc]->getBrightness(layer, x & 15, y, z & 15);
+    int lx = (x >> 4) - xc1;
+    int lz = (z >> 4) - zc1;
+
+    if (lx >= 0 && lx < m_width && lz >= 0 && lz < m_height) {
+        LevelChunk* lc = m_chunks[lx][lz];
+        if (lc != nullptr) {
+            return lc->getBrightness(layer, x & 15, y, z & 15);
+        }
+    }
+    return (int)layer;
 }
 
 int Region::getBrightnessPropagate(LightLayer::variety layer, int x, int y, int z, int tileId) {
@@ -246,16 +174,24 @@ int Region::getBrightnessPropagate(LightLayer::variety layer, int x, int y, int 
 
 LevelChunk* Region::getLevelChunk(int x, int y, int z) {
     if (y < 0 || y >= Level::maxBuildHeight) return nullptr;
-    int xc = (x >> 4) - xc1;
-    int zc = (z >> 4) - zc1;
-    if (xc < 0 || xc >= (int)chunks->size() || zc < 0 || zc >= (int)(*chunks)[xc].size()) return nullptr;
-    return (*chunks)[xc][zc];
+    int lx = (x >> 4) - xc1;
+    int lz = (z >> 4) - zc1;
+    if (lx >= 0 && lx < m_width && lz >= 0 && lz < m_height) {
+        return m_chunks[lx][lz];
+    }
+    return nullptr;
 }
 
 std::shared_ptr<TileEntity> Region::getTileEntity(int x, int y, int z) {
-    int xc = (x >> 4) - xc1;
-    int zc = (z >> 4) - zc1;
-    return (*chunks)[xc][zc]->getTileEntity(x & 15, y, z & 15);
+    int lx = (x >> 4) - xc1;
+    int lz = (z >> 4) - zc1;
+    if (lx >= 0 && lx < m_width && lz >= 0 && lz < m_height) {
+        LevelChunk* lc = m_chunks[lx][lz];
+        if (lc != nullptr) {
+            return lc->getTileEntity(x & 15, y, z & 15);
+        }
+    }
+    return nullptr;
 }
 
 int Region::getLightColor(int x, int y, int z, int emitt, int tileId) {
@@ -307,7 +243,23 @@ int Region::getRawBrightness(int x, int y, int z, bool propagate) {
         }
     }
 
-    return getBrightness(LightLayer::Block, x, y, z);
+    if (y < 0) return 0;
+    if (y >= Level::maxBuildHeight) {
+        int br = Level::MAX_BRIGHTNESS - level->skyDarken;
+        if (br < 0) br = 0;
+        return br;
+    }
+
+    int lx = (x >> 4) - xc1;
+    int lz = (z >> 4) - zc1;
+
+    if (lx >= 0 && lx < m_width && lz >= 0 && lz < m_height) {
+        LevelChunk* lc = m_chunks[lx][lz];
+        if (lc != nullptr) {
+            return lc->getRawBrightness(x & 15, y, z & 15, level->skyDarken);
+        }
+    }
+    return 0;
 }
 
 Material* Region::getMaterial(int x, int y, int z) {

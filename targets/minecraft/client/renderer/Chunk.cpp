@@ -279,13 +279,16 @@ void Chunk::rebuild() {
     lists += levelRenderer->chunkLists;
 
     thread_local unsigned char tileIds[16 * 16 * Level::maxBuildHeight];
-    std::vector<uint8_t> tileArray(65536);
+    static thread_local std::vector<uint8_t> tileArray;
+    if (tileArray.size() < 65536) {
+        tileArray.resize(65536);
+    }
+
     level->getChunkAt(x, z)->getBlockData(tileArray);
     memcpy(tileIds, tileArray.data(), 16 * 16 * Level::maxBuildHeight);
 
-    // ✅ OPTIMIZACIÓN L1 CACHE: Creamos la Region y activamos su pre-descompresión
+    // ✅ OPTIMIZACIÓN DE CPU: Usamos Region con caché dinámica (sin VBOs)
     Region region(level, x0 - r, y0 - r, z0 - r, x1 + r, y1 + r, z1 + r, r);
-    region.enableCache(this->x, this->z); // Descomprime en una sola ráfaga lineal
 
     TileRenderer tileRenderer(&region, this->x, this->y, this->z, tileIds);
 
@@ -335,8 +338,11 @@ void Chunk::rebuild() {
     if (empty) {
         for (int currentLayer = 0; currentLayer < 2; currentLayer++) {
             levelRenderer->setGlobalChunkFlag(this->x, this->y, this->z, level, LevelRenderer::CHUNK_FLAG_EMPTY0, currentLayer);
+            // ✅ LIMPIEZA CRÍTICA: Liberar buffer huérfano cuando el chunk está vacío
             PlatformRenderer.CBuffClear(lists + currentLayer);
         }
+        // También limpiamos el segundo buffer si existe
+        PlatformRenderer.CBuffClear(lists + 1);
         return;
     }
 
@@ -513,10 +519,9 @@ void Chunk::rebuild() {
                                 t->vertexUV(cx, cy + ch, cz, pUEnd, pV0); t->vertexUV(cx + cw, cy + ch, cz, pU0, pV0);
                                 t->vertexUV(cx + cw, cy, cz, pU0, pVEnd); t->vertexUV(cx, cy, cz, pUEnd, pVEnd);
                             } else {
-    t->vertexUV(cx, cy + ch, cz + 1.0f, pU0, pV0); t->vertexUV(cx, cy, cz + 1.0f, pU0, pVEnd);
-    t->vertexUV(cx + cw, cy, cz + 1.0f, pUEnd, pVEnd); t->vertexUV(cx + cw, cy + ch, cz + 1.0f, pUEnd, pV0); //  Corregido a "cy + ch"
-}
-
+                                t->vertexUV(cx, cy + ch, cz + 1.0f, pU0, pV0); t->vertexUV(cx, cy, cz + 1.0f, pU0, pVEnd);
+                                t->vertexUV(cx + cw, cy, cz + 1.0f, pUEnd, pVEnd); t->vertexUV(cx + cw, cy + ch, cz + 1.0f, pUEnd, pV0);
+                            }
                         }
                     }
                 }
@@ -627,13 +632,20 @@ void Chunk::rebuild() {
             t->useCompactVertices(false);
             t->offset(0, 0, 0);
         }
-        if (rendered) levelRenderer->clearGlobalChunkFlag(this->x, this->y, this->z, level, LevelRenderer::CHUNK_FLAG_EMPTY0, currentLayer);
-        else {
+        
+        // ✅ CONTROL DE FLAGS Y LIMPIEZA DE VRAM THREAD-SAFE
+        if (rendered) {
+            levelRenderer->clearGlobalChunkFlag(this->x, this->y, this->z, level, LevelRenderer::CHUNK_FLAG_EMPTY0, currentLayer);
+        } else {
             levelRenderer->setGlobalChunkFlag(this->x, this->y, this->z, level, LevelRenderer::CHUNK_FLAG_EMPTY0, currentLayer);
+            // ✅ NUEVO: Limpieza crítica. Si en esta reconstrucción el chunk quedó vacío,
+            // forzamos la liberación del buffer viejo en la GPU para evitar fugas.
             PlatformRenderer.CBuffClear(lists + currentLayer);
         }
+        
         if ((currentLayer == 0) && (!renderNextLayer)) {
             levelRenderer->setGlobalChunkFlag(this->x, this->y, this->z, level, LevelRenderer::CHUNK_FLAG_EMPTY1);
+            // ✅ También limpiamos el buffer de la capa 1 si no se va a renderizar
             PlatformRenderer.CBuffClear(lists + 1);
             break;
         }
@@ -657,7 +669,6 @@ void Chunk::rebuild() {
     else levelRenderer->setGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_NOTSKYLIT);
     levelRenderer->setGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_COMPILED);
 }
-
 
 float Chunk::distanceToSqr(std::shared_ptr<Entity> player) const {
     float xd = (float)(player->x - xm);
