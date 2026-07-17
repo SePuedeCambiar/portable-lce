@@ -250,6 +250,13 @@ static GLuint gdraw_screenvbo = 0;
 static const void* gdraw_screenvbo_base = NULL;
 static size_t gdraw_expected_vbo_size = 0;
 
+static GLintptr gdraw_ring_offset = 0;
+static const GLsizeiptr GDRAW_RING_SIZE = 2 * 1024 * 1024; // 2MB es ideal para la geometría de la UI
+static GLintptr gdraw_current_vbo_offset = 0; // Desplazamiento del elemento actual en el búfer
+
+typedef void(APIENTRY* gdraw_buffersubdata_fn)(GLenum, GLintptr, GLsizeiptr, const void*);
+static gdraw_buffersubdata_fn gdraw_real_buffersubdata = NULL;
+
 typedef void(APIENTRY* gdraw_drawelements_fn)(GLenum mode, GLsizei count,
                                               GLenum type, const void* indices);
 static gdraw_drawelements_fn gdraw_real_drawelements = NULL;
@@ -353,6 +360,8 @@ static void load_extensions(void) {
     // Save raw pointers before we #define over the names below
     gdraw_real_vtxattrib =
         (gdraw_vtxattrib_fn)SDL_GL_GetProcAddress("glVertexAttribPointer");
+    gdraw_real_buffersubdata =
+        (gdraw_buffersubdata_fn)SDL_GL_GetProcAddress("glBufferSubData");
     gdraw_real_createshader =
         (gdraw_createshader_fn)SDL_GL_GetProcAddress("glCreateShader");
     gdraw_real_shadersource =
@@ -659,63 +668,78 @@ static void gdraw_TexSubImage2D(GLenum target, GLint level, GLint xoff,
 static void gdraw_ClientVertexAttribPointer(GLuint index, GLint size,
                                             GLenum type, GLboolean normalized,
                                             GLsizei stride,
-const void* pointer) {
-if (gdraw_glBindVertexArray && gdraw_vao) {
+                                            const void* pointer) {
+    if (gdraw_glBindVertexArray && gdraw_vao) {
         GLint current_vao = 0;
-glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &current_vao);
-if ((GLuint)current_vao != gdraw_vao)
-gdraw_glBindVertexArray(gdraw_vao);
+        glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &current_vao);
+        if ((GLuint)current_vao != gdraw_vao)
+            gdraw_glBindVertexArray(gdraw_vao);
     }
   
-
     GLint current_vbo = 0;
-glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &current_vbo);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &current_vbo);
   
-
-if (current_vbo != 0 && current_vbo != (GLint)gdraw_screenvbo) {
-gdraw_real_vtxattrib(index, size, type, normalized, stride, pointer);
-return;
+    if (current_vbo != 0 && current_vbo != (GLint)gdraw_screenvbo) {
+        gdraw_real_vtxattrib(index, size, type, normalized, stride, pointer);
+        return;
     }
   
-
-if (pointer == NULL) {
-gdraw_real_vtxattrib(index, size, type, normalized, stride, pointer);
-return;
+    if (pointer == NULL) {
+        gdraw_real_vtxattrib(index, size, type, normalized, stride, pointer);
+        return;
     }
   
-
-ptrdiff_t offset =
+    ptrdiff_t offset =
         gdraw_screenvbo_base
-? ((const char*)pointer - (const char*)gdraw_screenvbo_base)
-: -1;
+        ? ((const char*)pointer - (const char*)gdraw_screenvbo_base)
+        : -1;
   
-
-if (gdraw_screenvbo_base == NULL || offset < 0 ||
+    if (gdraw_screenvbo_base == NULL || offset < 0 ||
         offset >= (ptrdiff_t)gdraw_expected_vbo_size) {
-if (!gdraw_screenvbo) glGenBuffers(1, &gdraw_screenvbo);
-glBindBuffer(GL_ARRAY_BUFFER, gdraw_screenvbo);
+        
+        // Inicializar el VBO estático de 2MB una sola vez
+        if (!gdraw_screenvbo) {
+            glGenBuffers(1, &gdraw_screenvbo);
+            glBindBuffer(GL_ARRAY_BUFFER, gdraw_screenvbo);
+            glBufferData(GL_ARRAY_BUFFER, GDRAW_RING_SIZE, NULL, GL_STREAM_DRAW);
+        } else {
+            glBindBuffer(GL_ARRAY_BUFFER, gdraw_screenvbo);
+        }
   
-    size_t upload_size = gdraw_expected_vbo_size > 0
-? gdraw_expected_vbo_size  // <--- Quitamos el + 256
-: 65536;
+        size_t upload_size = gdraw_expected_vbo_size > 0
+            ? gdraw_expected_vbo_size  
+            : 65536;
 
-    // --- NUEVOS PRINTS AQUÍ ---
-//    fprintf(stderr, "[CRASH_DEBUG] Pointer: %p, ExpectedVboSize: %zu, UploadSize: %zu, Offset: %ld\n", 
-//            pointer, (size_t)gdraw_expected_vbo_size, upload_size, (long)offset);
-//    fflush(stderr);
-    // --------------------------
+        // Si la nueva geometría supera el límite de los 2MB, "huérfanos" el búfer y volvemos al inicio
+        if (gdraw_ring_offset + (GLintptr)upload_size > GDRAW_RING_SIZE) {
+            glBufferData(GL_ARRAY_BUFFER, GDRAW_RING_SIZE, NULL, GL_STREAM_DRAW);
+            gdraw_ring_offset = 0;
+        }
 
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)upload_size, pointer,
-                     GL_STREAM_DRAW);
+        // Subimos los datos únicamente en el offset circular actual utilizando el puntero dinámico resuelto
+        if (gdraw_real_buffersubdata) {
+            gdraw_real_buffersubdata(GL_ARRAY_BUFFER, gdraw_ring_offset, (GLsizeiptr)upload_size, pointer);
+        } else {
+            // Fallback de seguridad en caso de que el controlador falle en resolver el puntero dinámico
+            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)upload_size, pointer, GL_STREAM_DRAW);
+            gdraw_ring_offset = 0;
+        }
   
-
         gdraw_screenvbo_base = pointer;
-gdraw_real_vtxattrib(index, size, type, normalized, stride,
-                             (const void*)0);
+        gdraw_current_vbo_offset = gdraw_ring_offset;
+
+        gdraw_real_vtxattrib(index, size, type, normalized, stride,
+                             (const void*)gdraw_current_vbo_offset);
+
+        // Avanzar offset y alinearlo a 32 bytes por seguridad de acceso a memoria
+        gdraw_ring_offset += (GLintptr)upload_size;
+        gdraw_ring_offset = (gdraw_ring_offset + 31) & ~31;
+
     } else {
-glBindBuffer(GL_ARRAY_BUFFER, gdraw_screenvbo);
-gdraw_real_vtxattrib(index, size, type, normalized, stride,
-                             (const void*)offset);
+        // Si es un atributo subsecuente del mismo elemento, sumamos el desfase al offset de dibujo actual
+        glBindBuffer(GL_ARRAY_BUFFER, gdraw_screenvbo);
+        gdraw_real_vtxattrib(index, size, type, normalized, stride,
+                             (const void*)(gdraw_current_vbo_offset + offset));
     }
 }
 

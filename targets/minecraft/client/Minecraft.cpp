@@ -1686,7 +1686,7 @@ void Minecraft::run_middle() {
                     PlatformRenderer.StateSetViewport(
                         IPlatformRenderer::VIEWPORT_TYPE_FULLSCREEN);
                 }
-                glFlush();
+        //        glFlush();
 
                 /*	4J - removed
                 if (!Display::isActive())
@@ -1723,7 +1723,7 @@ void Minecraft::run_middle() {
 
                 achievementPopup->render();
 
-                std::this_thread::yield();  // 4jcraft added now that we have
+    //            std::this_thread::yield();  // 4jcraft added now that we have
                                             // portable thread yield.
                                             // std::this_thread::sleep_for(
                 //     std::chrono::milliseconds(0));  // 4J - was

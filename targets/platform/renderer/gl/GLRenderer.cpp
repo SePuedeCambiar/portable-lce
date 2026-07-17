@@ -488,8 +488,14 @@ static void pushRenderState() {
     }
     flushMatrices();
 }
+
 static GLuint s_sVAO_std = 0, s_sVBO_std = 0;
-static GLsizeiptr s_streamVBOSize = 0;
+// Ajustamos a un tamaño fijo de 4MB para el Ring Buffer, suficiente para el modo inmediato
+static GLsizeiptr s_streamVBOSize = 4 * 1024 * 1024; 
+static GLintptr s_streamVBOOffset = 0;
+
+
+
 static void bindStdAttribs() {
     glEnableVertexAttribArray(0);
     glEnableVertexAttribArray(1);
@@ -504,15 +510,20 @@ static void bindStdAttribs() {
 }
 
 
+
+
 static void initStreamingVAOs() {
     glGenVertexArrays(1, &s_sVAO_std);
     glGenBuffers(1, &s_sVBO_std);
     glBindVertexArray(s_sVAO_std);
     glBindBuffer(GL_ARRAY_BUFFER, s_sVBO_std);
+    // Pre-asignamos la memoria una sola vez para evitar asignaciones dinámicas en el ciclo de renderizado
+    glBufferData(GL_ARRAY_BUFFER, s_streamVBOSize, nullptr, GL_STREAM_DRAW);
     bindStdAttribs();
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
+
 
 // Chunk buffer pool (shared, protected by s_glCallMtx)
 struct ChunkDrawCall {
@@ -838,7 +849,7 @@ void GLRenderer::Present() {
     // ============================================================
     // 4. SWAP DE BUFFERS Y SINCRONIZACIÓN FINAL
     // ============================================================
-    glFlush();  // Asegura que todos los comandos se envíen a la GPU
+//    glFlush();  // Asegura que todos los comandos se envíen a la GPU
     SDL_GL_SwapWindow(s_window);
 }
 
@@ -934,34 +945,7 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     }
 
     // --- PIPELINE INMEDIATO OPTIMIZADO (Menus, HUD, Entidades, Mobs, Nubes) ---
-    // Usamos static thread_local para evitar crear y destruir el vector en cada frame
-    static thread_local std::vector<uint8_t> triData;
-    triData.clear();
-    
-    if (wasQuad) {
-        int numQuads = count / 4;
-        int triVerts = numQuads * 6;
-        triData.resize((size_t)triVerts * stride);
-        const uint8_t* src = (const uint8_t*)dataIn;
-        uint8_t* dst = triData.data();
-        for (int q = 0; q < numQuads; q++) {
-            const uint8_t* v0 = src + (q * 4 + 0) * stride;
-            const uint8_t* v1 = src + (q * 4 + 1) * stride;
-            const uint8_t* v2 = src + (q * 4 + 2) * stride;
-            const uint8_t* v3 = src + (q * 4 + 3) * stride;
-            memcpy(dst + 0 * stride, v0, stride);
-            memcpy(dst + 1 * stride, v1, stride);
-            memcpy(dst + 2 * stride, v2, stride);
-            memcpy(dst + 3 * stride, v0, stride);
-            memcpy(dst + 4 * stride, v2, stride);
-            memcpy(dst + 5 * stride, v3, stride);
-            dst += 6 * stride;
-        }
-        dataIn = triData.data();
-        count = triVerts;
-        glMode = GL_TRIANGLES;
-        bytes = (size_t)count * stride;
-    }
+    // Se ha eliminado la triangulación por software. Usamos el EBO global estático.
 
     std::lock_guard<std::mutex> lk(s_glCallMtx);
     pushRenderState();
@@ -970,21 +954,42 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
 
     glBindVertexArray(s_sVAO_std);
     glBindBuffer(GL_ARRAY_BUFFER, s_sVBO_std);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)bytes, nullptr, GL_STREAM_DRAW);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)bytes, dataIn);
-    s_streamVBOSize = (GLsizeiptr)bytes;
-    glDrawArrays(glMode, 0, count);
+
+    // Estrategia de Ring Buffer: si no queda espacio para el dibujo actual en los 4MB,
+    // huérfanos el búfer (reinicio de memoria del driver) y volvemos al principio.
+    if (s_streamVBOOffset + (GLintptr)bytes > s_streamVBOSize) {
+        glBufferData(GL_ARRAY_BUFFER, s_streamVBOSize, nullptr, GL_STREAM_DRAW);
+        s_streamVBOOffset = 0;
+    }
+
+    // Subir los datos en la posición actual de desplazamiento
+    glBufferSubData(GL_ARRAY_BUFFER, s_streamVBOOffset, (GLsizeiptr)bytes, dataIn);
+    
+    // El índice del vértice base se calcula dividiendo los bytes del offset por el stride de 32 bytes
+    GLint baseVertex = (GLint)(s_streamVBOOffset / stride);
+    
+    // Incrementamos el offset de escritura y lo alineamos a un límite de 32 bytes por seguridad
+    s_streamVBOOffset += (GLintptr)bytes;
+    s_streamVBOOffset = (s_streamVBOOffset + 31) & ~31;
+
+    if (wasQuad) {
+        // Enlazar el Index Buffer global y dibujar eficientemente usando hardware indexado
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_globalEBO);
+        GLsizei indexCount = (count / 4) * 6;
+        glDrawElementsBaseVertex(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, (void*)0, baseVertex);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    } else {
+        // Dibujo estándar para otro tipo de primitivas
+        glDrawArrays(glMode, baseVertex, count);
+    }
     
     // ================================================================
     // 🧹 HIGIENE TOTAL DE OPENGL - ELIMINA EL ERROR [GDraw]
     // ================================================================
-    // Desvinculamos TODO lo que pudiera haber quedado "pegado" en la GPU
-    glBindVertexArray(0);              // Desvincula el VAO
-    glBindBuffer(GL_ARRAY_BUFFER, 0);  // Desvincula el VBO
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0); // Desvincula el EBO (por si acaso)
+    glBindVertexArray(0);              
+    glBindBuffer(GL_ARRAY_BUFFER, 0);  
     // ================================================================
 }
-
 
 
 
@@ -1076,49 +1081,49 @@ void GLRenderer::CBuffClear(int index) {
 
 
 bool GLRenderer::CBuffCall(int index, bool) {
-    // 1. Buscamos el chunk de forma rápida bloqueando únicamente el pool
-    ChunkBuffer* pCb = nullptr;
-    {
-        std::lock_guard<std::mutex> lk_pool(s_poolMtx);
-        auto it = s_chunkPool.find(index);
-        if (it == s_chunkPool.end() || !it->second.valid) {
-            return false;
-        }
-        pCb = &it->second;
-        pCb->lastUsedFrame = SDL_GetTicks();
+    // Bloqueamos el pool para evitar que otros hilos borren o modifiquen el chunk mientras lo usamos
+    std::lock_guard<std::mutex> lk_pool(s_poolMtx);
+    
+    auto it = s_chunkPool.find(index);
+    if (it == s_chunkPool.end() || !it->second.valid) {
+        return false;
     }
     
-    // 2. Bloqueamos el renderizado OpenGL tradicional para dibujar
+    // Usamos una referencia directa en lugar de un puntero expuesto al exterior del candado
+    ChunkBuffer& cb = it->second;
+    cb.lastUsedFrame = SDL_GetTicks();
+    
+    // Bloqueamos el renderizado OpenGL tradicional para dibujar
     std::lock_guard<std::mutex> lk(s_glCallMtx);
     
-    if (!pCb->vboReady) {
-        if (pCb->rawVerts.empty()) {
+    if (!cb.vboReady) {
+        if (cb.rawVerts.empty()) {
             return false;
         }
-        glGenVertexArrays(1, &pCb->vao);
-        glGenBuffers(1, &pCb->vbo);
+        glGenVertexArrays(1, &cb.vao);
+        glGenBuffers(1, &cb.vbo);
         g_vaoCount++;
         g_vboCount++;
-        glBindVertexArray(pCb->vao);
-        glBindBuffer(GL_ARRAY_BUFFER, pCb->vbo);
-        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)pCb->rawVerts.size(),
-                     pCb->rawVerts.data(), GL_STATIC_DRAW);
+        glBindVertexArray(cb.vao);
+        glBindBuffer(GL_ARRAY_BUFFER, cb.vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)cb.rawVerts.size(),
+                     cb.rawVerts.data(), GL_STATIC_DRAW);
         bindStdAttribs();
         glBindVertexArray(0);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
-        pCb->rawVerts.clear();
-        pCb->rawVerts.shrink_to_fit();
-        pCb->vboReady = true;
+        cb.rawVerts.clear();
+        cb.rawVerts.shrink_to_fit();
+        cb.vboReady = true;
     }
 
     pushRenderState();
     
     glUniform1i(s_shader.uGreedyMode, 1); 
 
-    glBindVertexArray(pCb->vao);
+    glBindVertexArray(cb.vao);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_globalEBO);
     
-    for (const auto& dc : pCb->draws) {
+    for (const auto& dc : cb.draws) {
         if (dc.wasQuad) {
             GLsizei indexCount = (dc.count / 4) * 6;
             glDrawElementsBaseVertex(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, (void*)0, dc.first);
