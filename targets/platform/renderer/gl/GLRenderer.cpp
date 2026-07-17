@@ -9,7 +9,7 @@
 #include "java/IntBuffer.h"
 #include "platform/PlatformTypes.h"
 #include "platform/renderer/renderer.h"
-#include <dlfcn.h> /
+#include <dlfcn.h> 
 // undefine macros from header to avoid argument mismatch
 #undef glGenTextures
 #undef glDeleteTextures
@@ -53,6 +53,10 @@
 
 #include "app/common/Iggy/include/gdraw.h"
 #include "minecraft/util/Log.h"
+
+
+static thread_local bool s_recIsCompressed = false;
+
 
 static GLuint s_globalEBO = 0;
 // Capacidad máxima de vértices por sección de renderizado (Soporta hasta 65,536 Quads)
@@ -494,8 +498,6 @@ static GLuint s_sVAO_std = 0, s_sVBO_std = 0;
 static GLsizeiptr s_streamVBOSize = 4 * 1024 * 1024; 
 static GLintptr s_streamVBOOffset = 0;
 
-
-
 static void bindStdAttribs() {
     glEnableVertexAttribArray(0);
     glEnableVertexAttribArray(1);
@@ -507,6 +509,24 @@ static void bindStdAttribs() {
     glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, 32, (void*)20);
     glVertexAttribPointer(3, 3, GL_BYTE, GL_TRUE, 32, (void*)24);
     glVertexAttribIPointer(4, 2, GL_SHORT, 32, (void*)28); 
+}
+
+
+static void bindCompressedAttribs() {
+    glEnableVertexAttribArray(0); // Posición (aPos)
+    glEnableVertexAttribArray(1); // Coordenadas de textura (aUV0)
+    glEnableVertexAttribArray(2); // Color empaquetado (aColor)
+    glDisableVertexAttribArray(3); // Desactivar normales (No se usan en Chunks)
+    glEnableVertexAttribArray(4); // Mapa de luz (aLMraw)
+    
+    // Atrib 0: 3 Shorts (GL_SHORT), stride = 16, offset = 0 bytes
+    glVertexAttribPointer(0, 3, GL_SHORT, GL_FALSE, 16, (void*)0);
+    // Atrib 1: 2 Shorts (GL_SHORT), stride = 16, offset = 8 bytes (pShortData[4,5])
+    glVertexAttribPointer(1, 2, GL_SHORT, GL_FALSE, 16, (void*)8);
+    // Atrib 2: 1 Short (GL_SHORT), stride = 16, offset = 6 bytes (pShortData[3])
+    glVertexAttribPointer(2, 1, GL_SHORT, GL_FALSE, 16, (void*)6);
+    // Atrib 4: 2 Shorts (GL_SHORT) de mapa de luz de tipo entero, stride = 16, offset = 12 bytes
+    glVertexAttribIPointer(4, 2, GL_SHORT, 16, (void*)12); 
 }
 
 
@@ -540,6 +560,7 @@ struct ChunkBuffer {
     bool valid = false;
     bool vboReady = false;
     Uint32 lastUsedFrame = 0;
+    bool isCompressed = false; 
 
     ChunkBuffer() {
         lastUsedFrame = SDL_GetTicks();
@@ -888,12 +909,12 @@ void GLRenderer::Shutdown()  {
     SDL_Quit();
 }
 // PIPELINE DE DIBUJO ORIGINAL INTEGRAL (Garantiza entidades visibles)
-
 void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVertexType vType, ePixelShaderType psType) {
     if (count <= 0 || !dataIn) return;
     bool wasQuad = isQuadPrim((int)ptype);
     
-    size_t stride = 32; // Stride estándar de 32 bytes para el formato de vértices
+    // El stride por defecto es 32 bytes para formato estándar y 16 para compactado
+    size_t stride = (vType == VERTEX_TYPE_COMPRESSED) ? 16 : 32;
     size_t bytes = (size_t)count * stride;
     GLenum glMode = mapPrim((int)ptype);
     
@@ -901,36 +922,12 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     static thread_local std::vector<uint8_t> stdData;
     stdData.clear();
     if (vType == VERTEX_TYPE_COMPRESSED) {
-        stdData.resize((size_t)count * stride);
-        const int16_t* src = (const int16_t*)dataIn;
-        uint8_t* dst = stdData.data();
-        for (int i = 0; i < count; i++) {
-            float* dstF = (float*)dst;
-            dstF[0] = src[0] / 1024.0f;
-            dstF[1] = src[1] / 1024.0f;
-            dstF[2] = src[2] / 1024.0f;
-            dstF[3] = src[4] / 8192.0f;
-            dstF[4] = src[5] / 8192.0f;
-            {
-                uint16_t packed = (uint16_t)((int)src[3] + 32768);
-                dst[20] = 255;
-                dst[21] = (uint8_t)((packed & 0x1F) * 255 / 31);          // B
-                dst[22] = (uint8_t)(((packed >> 5) & 0x3F) * 255 / 63);   // G
-                dst[23] = (uint8_t)(((packed >> 11) & 0x1F) * 255 / 31);  // R
-            }
-            dst[24] = 0;
-            dst[25] = 127;  // +Y (up)
-            dst[26] = 0;
-            dst[27] = 0;
-            {
-                int16_t* dstS = (int16_t*)(dst + 28);
-                dstS[0] = src[6];
-                dstS[1] = src[7];
-            }
-            src += 8;
-            dst += 32;
-        }
-        dataIn = stdData.data();
+        // ¡BYPASS TOTAL DE LA DESCOMPRESIÓN EN CPU!
+        // No redimensionamos vectores, no calculamos floats, no desempaquetamos colores en la CPU.
+        // Pasamos el puntero 'dataIn' comprimido de 16 bytes tal y como viene directamente del Tesselator.
+        s_recIsCompressed = true; 
+    } else {
+        s_recIsCompressed = false;
     }
 
     // ------------------------------------------------------------------------
@@ -944,53 +941,45 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         return;
     }
 
-    // --- PIPELINE INMEDIATO OPTIMIZADO (Menus, HUD, Entidades, Mobs, Nubes) ---
-    // Se ha eliminado la triangulación por software. Usamos el EBO global estático.
-
+    // --- PIPELINE INMEDIATO ---
     std::lock_guard<std::mutex> lk(s_glCallMtx);
     pushRenderState();
-
-    glUniform1i(s_shader.uGreedyMode, 0); 
 
     glBindVertexArray(s_sVAO_std);
     glBindBuffer(GL_ARRAY_BUFFER, s_sVBO_std);
 
-    // Estrategia de Ring Buffer: si no queda espacio para el dibujo actual en los 4MB,
-    // huérfanos el búfer (reinicio de memoria del driver) y volvemos al principio.
     if (s_streamVBOOffset + (GLintptr)bytes > s_streamVBOSize) {
         glBufferData(GL_ARRAY_BUFFER, s_streamVBOSize, nullptr, GL_STREAM_DRAW);
         s_streamVBOOffset = 0;
     }
 
-    // Subir los datos en la posición actual de desplazamiento
     glBufferSubData(GL_ARRAY_BUFFER, s_streamVBOOffset, (GLsizeiptr)bytes, dataIn);
-    
-    // El índice del vértice base se calcula dividiendo los bytes del offset por el stride de 32 bytes
     GLint baseVertex = (GLint)(s_streamVBOOffset / stride);
     
-    // Incrementamos el offset de escritura y lo alineamos a un límite de 32 bytes por seguridad
     s_streamVBOOffset += (GLintptr)bytes;
     s_streamVBOOffset = (s_streamVBOOffset + 31) & ~31;
 
+    // Enlazar los atributos adecuados e informar al Shader del modo de compresión
+    if (vType == VERTEX_TYPE_COMPRESSED) {
+        bindCompressedAttribs();
+        glUniform1i(s_shader.uGreedyMode, 1);
+    } else {
+        bindStdAttribs();
+        glUniform1i(s_shader.uGreedyMode, 0);
+    }
+
     if (wasQuad) {
-        // Enlazar el Index Buffer global y dibujar eficientemente usando hardware indexado
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_globalEBO);
         GLsizei indexCount = (count / 4) * 6;
         glDrawElementsBaseVertex(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, (void*)0, baseVertex);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     } else {
-        // Dibujo estándar para otro tipo de primitivas
         glDrawArrays(glMode, baseVertex, count);
     }
     
-    // ================================================================
-    // 🧹 HIGIENE TOTAL DE OPENGL - ELIMINA EL ERROR [GDraw]
-    // ================================================================
     glBindVertexArray(0);              
     glBindBuffer(GL_ARRAY_BUFFER, 0);  
-    // ================================================================
 }
-
 
 
 void GLRenderer::ReadPixels(int x, int y, int w, int h, void* buf) {
@@ -1036,24 +1025,23 @@ void GLRenderer::CBuffStart(int index, bool) {
     s_recListId = index;
     s_recVerts.clear();
     s_recDraws.clear();
+    s_recIsCompressed = false; // Nuevo
 }
-
 
 
 void GLRenderer::CBuffEnd() {
     if (s_recListId < 0) return;
     
-    // Generar el buffer localmente SIN bloquear ningún hilo
     ChunkBuffer newCb;
     newCb.rawVerts = s_recVerts; 
     newCb.draws = std::move(s_recDraws);
     newCb.valid = true;
     newCb.vboReady = false;
     newCb.lastUsedFrame = SDL_GetTicks();
+    newCb.isCompressed = s_recIsCompressed; // Nuevo
 
-    // Bloqueamos ÚNICAMENTE la inserción rápida en el mapa global usando el candado ligero
     {
-        std::lock_guard<std::mutex> lk_pool(s_poolMtx); // Modificado
+        std::lock_guard<std::mutex> lk_pool(s_poolMtx); 
         ChunkBuffer& cb = s_chunkPool[s_recListId];
         {
             std::lock_guard<std::mutex> lk_del(s_destructionMtx);
@@ -1081,7 +1069,6 @@ void GLRenderer::CBuffClear(int index) {
 
 
 bool GLRenderer::CBuffCall(int index, bool) {
-    // Bloqueamos el pool para evitar que otros hilos borren o modifiquen el chunk mientras lo usamos
     std::lock_guard<std::mutex> lk_pool(s_poolMtx);
     
     auto it = s_chunkPool.find(index);
@@ -1089,11 +1076,9 @@ bool GLRenderer::CBuffCall(int index, bool) {
         return false;
     }
     
-    // Usamos una referencia directa en lugar de un puntero expuesto al exterior del candado
     ChunkBuffer& cb = it->second;
     cb.lastUsedFrame = SDL_GetTicks();
     
-    // Bloqueamos el renderizado OpenGL tradicional para dibujar
     std::lock_guard<std::mutex> lk(s_glCallMtx);
     
     if (!cb.vboReady) {
@@ -1108,7 +1093,14 @@ bool GLRenderer::CBuffCall(int index, bool) {
         glBindBuffer(GL_ARRAY_BUFFER, cb.vbo);
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)cb.rawVerts.size(),
                      cb.rawVerts.data(), GL_STATIC_DRAW);
-        bindStdAttribs();
+        
+        // Enlazar los atributos según corresponda al formato de este chunk
+        if (cb.isCompressed) {
+            bindCompressedAttribs();
+        } else {
+            bindStdAttribs();
+        }
+        
         glBindVertexArray(0);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         cb.rawVerts.clear();
@@ -1118,7 +1110,8 @@ bool GLRenderer::CBuffCall(int index, bool) {
 
     pushRenderState();
     
-    glUniform1i(s_shader.uGreedyMode, 1); 
+    // Informar al Vertex Shader si debe de aplicar descompresión por GPU
+    glUniform1i(s_shader.uGreedyMode, cb.isCompressed ? 1 : 0); 
 
     glBindVertexArray(cb.vao);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_globalEBO);

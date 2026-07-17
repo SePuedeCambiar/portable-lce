@@ -24,6 +24,7 @@ uniform float uFogEnd;
 uniform float uFogDensity;
 uniform vec4  uLMTransform;
 uniform vec2  uGlobalLM;
+uniform int   uGreedyMode; // NUEVO: Determina si el vértice está compactado (1) o estándar (0)
 
 out vec2  vUV0;
 out vec2  vUV1;
@@ -31,20 +32,43 @@ out vec4  vColor;
 out float vFogFactor;
 
 void main() {
-    vec4 aPos4   = vec4(aPos + uChunkOffset, 1.0);
+    vec3 decompressedPos;
+    vec2 decompressedUV;
+    vec4 decompressedColor;
+
+    if (uGreedyMode == 1) {
+        // --- DESCOMPRESIÓN DE VÉRTICES DE 16 BYTES EN GPU (Estilo Sodium) ---
+        decompressedPos = aPos / 1024.0;
+        decompressedUV  = aUV0 / 8192.0;
+
+        // Desempaquetar Color BGR565 de 16 bits nativo de consola
+        // aColor.x contiene el short con offset de consola (-32768)
+        int packedColorVal = int(aColor.x) + 32768;
+        float b = float(packedColorVal & 0x1F) / 31.0;
+        float g = float((packedColorVal >> 5) & 0x3F) / 63.0;
+        float r = float((packedColorVal >> 11) & 0x1F) / 31.0;
+        
+        // Empaquetamos en el orden raw esperado por la lógica .abgr de Minecraft
+        decompressedColor = vec4(1.0, b, g, r);
+    } else {
+        // --- FORMATO ESTÁNDAR DE 32 BYTES ---
+        decompressedPos = aPos;
+        decompressedUV  = aUV0;
+        decompressedColor = aColor;
+    }
+
+    vec4 aPos4   = vec4(decompressedPos + uChunkOffset, 1.0);
     vec4 eyePos  = uMV  * aPos4;
     gl_Position  = uMVP * aPos4;
     
     // Extracción segura del empaquetado Greedy
-    float packU = floor((aUV0.x + 0.001) / 10.0);
-    float packV = floor((aUV0.y + 0.001) / 10.0);
+    float packU = floor((decompressedUV.x + 0.001) / 10.0);
+    float packV = floor((decompressedUV.y + 0.001) / 10.0);
     
     if (packU > 0.0 && packV > 0.0) {
-        // Bloque Greedy: Pasamos el UV directo para no corromperlo con uTexMat0
-        vUV0 = aUV0; 
+        vUV0 = decompressedUV; 
     } else {
-        // Bloque Normal o Entidad (Inventario): Aplica animaciones y rotaciones estándar
-        vUV0 = (uTexMat0 * vec4(aUV0, 0.0, 1.0)).xy; 
+        vUV0 = (uTexMat0 * vec4(decompressedUV, 0.0, 1.0)).xy; 
     }
 
     // Mapa de luz estándar 100% nativo
@@ -53,9 +77,10 @@ void main() {
     vec2 lm = (aLMrawF.x < -0.5) ? uGlobalLM : normalizedLM;
     vUV1 = lm * uLMTransform.xy + uLMTransform.zw;
 
-    bool sentinel = (aColor == vec4(0.0));
-    vec4 col = sentinel ? uBaseColor : aColor.abgr;
+    bool sentinel = (decompressedColor == vec4(0.0));
+    vec4 col = sentinel ? uBaseColor : decompressedColor.abgr;
     if (uLighting == 1) {
+        // La iluminación dinámica solo se aplica a vértices estándar con normales
         vec3 n = normalize(uNormalMatrix * aNormal) * uNormalSign;
         float d0 = max(dot(n, uLight0Dir), 0.0);
         float d1 = max(dot(n, uLight1Dir), 0.0);
@@ -70,4 +95,5 @@ void main() {
     else if (uFogMode == 3) { float d = uFogDensity * eDist; vFogFactor = clamp(exp(-d*d), 0.0, 1.0); }
     else                    vFogFactor = 1.0;
 }
+
 )GLSL"
