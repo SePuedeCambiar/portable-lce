@@ -38,7 +38,7 @@ public:
     virtual uint8_t getId() = 0;
     void print(std::ostream& out);
     void print(char* prefix, std::ostream& out);
-    std::string getName();
+    const std::string& getName() const;
     Tag* setName(const std::string& name);
     static Tag* readNamedTag(DataInput* dis);
     static Tag* readNamedTag(DataInput* dis, int tagDepth);
