@@ -10,7 +10,7 @@
 #include "platform/PlatformTypes.h"
 #include "platform/renderer/renderer.h"
 #include <dlfcn.h> 
-// undefine macros from header to avoid argument mismatch
+
 #undef glGenTextures
 #undef glDeleteTextures
 #undef glTexImage2D
@@ -41,12 +41,13 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <shared_mutex>
 #include <optional>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#include <atomic> // Añadido para contadores estables
+#include <atomic>
 #include "glm/glm.hpp"
 #include "glm/gtc/matrix_transform.hpp"
 #include "glm/gtc/type_ptr.hpp"
@@ -54,18 +55,19 @@
 #include "app/common/Iggy/include/gdraw.h"
 #include "minecraft/util/Log.h"
 
-
 static thread_local bool s_recIsCompressed = false;
 
-
 static GLuint s_globalEBO = 0;
-// Capacidad máxima de vértices por sección de renderizado (Soporta hasta 65,536 Quads)
 static const int MAX_GLOBAL_VERTICES = 262144;
 
 // Contadores globales de diagnóstico
 static std::atomic<int> g_vboCount{0};
 static std::atomic<int> g_vaoCount{0};
 static std::atomic<int> g_texCount{0};
+
+// Caché de estados para erradicar el VAO Thrashing
+static GLuint s_currentBoundVAO = 0;
+static int s_currentGreedyMode = -1;
 
 namespace platform_internal {
 IPlatformRenderer& PlatformRenderer_get() {
@@ -103,7 +105,6 @@ static int s_reqWidth = 1920;
 static int s_reqHeight = 1080;
 static bool s_fullscreen = false;
 static thread_local SDL_GLContext s_glCtx = nullptr;
-static std::once_flag s_glCtxKeyOnce;
 static const int MAX_SHARED_CTXS = 6;
 static SDL_Window* s_sharedWins[MAX_SHARED_CTXS] = {};
 static SDL_GLContext s_sharedCtxs[MAX_SHARED_CTXS] = {};
@@ -193,7 +194,6 @@ static GLuint linkProgram(GLuint v, GLuint f) {
     return p;
 }
 
-// Shader struct
 struct ShaderUniforms {
     GLuint prog = 0;
     GLint uMVP = -1, uMV = -1, uBaseColor = -1;
@@ -208,8 +208,8 @@ struct ShaderUniforms {
     GLint uUseTexture = -1;
     GLint uInvGamma = -1;
     GLint uChunkOffset = -1;
-    GLint uCellSize = -1;   // <--- IMPORTANTE
-    GLint uGreedyMode = -1; // <--- IMPORTANTE
+    GLint uCellSize = -1;
+    GLint uGreedyMode = -1;
 
     void build(const char* vs, const char* fs) {
         GLuint v = compileShader(GL_VERTEX_SHADER, vs);
@@ -234,8 +234,6 @@ struct ShaderUniforms {
     }
 } s_shader;
 
-
-// Matrix stacks
 static const int STACK_DEPTH = 64;
 struct MatrixStack {
     glm::mat4 stack[STACK_DEPTH];
@@ -255,9 +253,8 @@ struct MatrixStack {
     void mul(const glm::mat4& m) { cur() = cur() * m; }
 };
 static thread_local MatrixStack s_proj, s_mv, s_tex[2];
-static thread_local int s_matMode = 0;  // 0=MV 1=proj 2=tex0 3=tex1
+static thread_local int s_matMode = 0;
 
-// cache normal matrix
 static thread_local bool s_normalMatDirty = true;
 static thread_local glm::mat3 s_cachedNormalMat;
 static thread_local float s_cachedNormalSign = 1.0f;
@@ -266,24 +263,19 @@ static inline void markNormalDirty() { s_normalMatDirty = true; }
 static inline void markMatrixDirty() { s_matDirty = true; }
 static MatrixStack& activeStack() {
     switch (s_matMode) {
-        case 1:
-            return s_proj;
-        case 2:
-            return s_tex[0];
-        case 3:
-            return s_tex[1];
+        case 1:  return s_proj;
+        case 2:  return s_tex[0];
+        case 3:  return s_tex[1];
+        default: return s_mv;
     }
-    return s_mv;
 }
+
 static void flushMatrices() {
     if (s_matDirty) {
         glm::mat4 mvp = s_proj.cur() * s_mv.cur();
         glUniformMatrix4fv(s_shader.uMVP, 1, GL_FALSE, glm::value_ptr(mvp));
-        glUniformMatrix4fv(s_shader.uMV, 1, GL_FALSE,
-                           glm::value_ptr(s_mv.cur()));
-        // Send the texture matrix to the depths of hell...
-        glUniformMatrix4fv(s_shader.uTexMat0, 1, GL_FALSE,
-                           glm::value_ptr(s_tex[0].cur()));
+        glUniformMatrix4fv(s_shader.uMV, 1, GL_FALSE, glm::value_ptr(s_mv.cur()));
+        glUniformMatrix4fv(s_shader.uTexMat0, 1, GL_FALSE, glm::value_ptr(s_tex[0].cur()));
         s_matDirty = false;
     }
     if (s_shader.uNormalMatrix >= 0 && s_normalMatDirty) {
@@ -291,13 +283,11 @@ static void flushMatrices() {
         s_cachedNormalMat = glm::transpose(glm::inverse(m3));
         s_cachedNormalSign = glm::determinant(m3) < 0.0f ? -1.0f : 1.0f;
         s_normalMatDirty = false;
-        glUniformMatrix3fv(s_shader.uNormalMatrix, 1, GL_FALSE,
-                           glm::value_ptr(s_cachedNormalMat));
+        glUniformMatrix3fv(s_shader.uNormalMatrix, 1, GL_FALSE, glm::value_ptr(s_cachedNormalMat));
         glUniform1f(s_shader.uNormalSign, s_cachedNormalSign);
     }
 }
 
-// Render state
 struct RenderState {
     glm::vec4 baseColor = {1, 1, 1, 1};
     glm::vec4 fogColor = {0, 0, 0, 1};
@@ -312,57 +302,49 @@ struct RenderState {
     glm::vec3 ldiff = {0.6f, 0.6f, 0.6f};
     glm::vec3 lamb = {0.4f, 0.4f, 0.4f};
     glm::vec4 lmt = {1, 1, 0, 0};
-    glm::vec2 globalLM = {240.f, 240.f};  // fullbright default
+    glm::vec2 globalLM = {240.f, 240.f};
     int activeTexture = 0;
 };
 enum RenderDirtyBits {
     DIRTY_BASECOLOR = 1 << 0,
-    DIRTY_LIGHTING = 1 << 1,
-    DIRTY_FOG = 1 << 2,
-    DIRTY_ALPHA = 1 << 3,
-    DIRTY_GAMMA = 1 << 4,
-    DIRTY_TEXTURE = 1 << 5,
-    DIRTY_LMT = 1 << 6,
+    DIRTY_LIGHTING  = 1 << 1,
+    DIRTY_FOG       = 1 << 2,
+    DIRTY_ALPHA     = 1 << 3,
+    DIRTY_GAMMA     = 1 << 4,
+    DIRTY_TEXTURE   = 1 << 5,
+    DIRTY_LMT       = 1 << 6,
     DIRTY_GLOBAL_LM = 1 << 7,
 };
 static inline void markDirty(unsigned int bit) { s_rs_dirty_mask |= bit; }
 static thread_local RenderState s_rs;
 
-// track currently bound program to avoid iggy shitting up
 static GLuint s_boundProgram = 0;
 static void glShadowSetBlend(bool e) {
     if (!(s_gl_shadow_mask & SHADOW_BLEND) || s_gl_state.blend != e) {
-        if (e)
-            ::glEnable(GL_BLEND);
-        else
-            ::glDisable(GL_BLEND);
+        if (e) ::glEnable(GL_BLEND);
+        else   ::glDisable(GL_BLEND);
         s_gl_state.blend = e;
         s_gl_shadow_mask |= SHADOW_BLEND;
     }
 }
 static void glShadowSetCull(bool e) {
     if (!(s_gl_shadow_mask & SHADOW_CULL) || s_gl_state.cull != e) {
-        if (e)
-            ::glEnable(GL_CULL_FACE);
-        else
-            ::glDisable(GL_CULL_FACE);
+        if (e) ::glEnable(GL_CULL_FACE);
+        else   ::glDisable(GL_CULL_FACE);
         s_gl_state.cull = e;
         s_gl_shadow_mask |= SHADOW_CULL;
     }
 }
 static void glShadowSetDepthTest(bool e) {
     if (!(s_gl_shadow_mask & SHADOW_DEPTH) || s_gl_state.depth != e) {
-        if (e)
-            ::glEnable(GL_DEPTH_TEST);
-        else
-            ::glDisable(GL_DEPTH_TEST);
+        if (e) ::glEnable(GL_DEPTH_TEST);
+        else   ::glDisable(GL_DEPTH_TEST);
         s_gl_state.depth = e;
         s_gl_shadow_mask |= SHADOW_DEPTH;
     }
 }
 static void glShadowSetBlendFunc(GLint s, GLint d) {
-    if (!(s_gl_shadow_mask & SHADOW_BLEND_FUNC) || s_gl_state.blendSrc != s ||
-        s_gl_state.blendDst != d) {
+    if (!(s_gl_shadow_mask & SHADOW_BLEND_FUNC) || s_gl_state.blendSrc != s || s_gl_state.blendDst != d) {
         ::glBlendFunc(s, d);
         s_gl_state.blendSrc = s;
         s_gl_state.blendDst = d;
@@ -376,8 +358,7 @@ static void glShadowSetDepthMask(GLboolean e) {
         s_gl_shadow_mask |= SHADOW_DEPTH_MASK;
     }
 }
-static void glShadowSetColorMask(GLboolean r, GLboolean g, GLboolean b,
-                                 GLboolean a) {
+static void glShadowSetColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
     if (!(s_gl_shadow_mask & SHADOW_COLOR_MASK) ||
         s_gl_state.colorMask[0] != r || s_gl_state.colorMask[1] != g ||
         s_gl_state.colorMask[2] != b || s_gl_state.colorMask[3] != a) {
@@ -397,8 +378,7 @@ static void glShadowSetLineWidth(float w) {
     }
 }
 static void glShadowSetFrontFace(GLenum mode) {
-    if (!(s_gl_shadow_mask & SHADOW_FRONT_FACE) ||
-        s_gl_state.frontFace != mode) {
+    if (!(s_gl_shadow_mask & SHADOW_FRONT_FACE) || s_gl_state.frontFace != mode) {
         ::glFrontFace(mode);
         s_gl_state.frontFace = mode;
         s_gl_shadow_mask |= SHADOW_FRONT_FACE;
@@ -406,12 +386,9 @@ static void glShadowSetFrontFace(GLenum mode) {
 }
 static void glShadowSetPolygonOffset(float slope, float bias) {
     bool enable = (slope != 0.0f || bias != 0.0f);
-    if (!(s_gl_shadow_mask & SHADOW_POLY_OFFSET) ||
-        s_gl_state.polygon != enable) {
-        if (enable)
-            ::glEnable(GL_POLYGON_OFFSET_FILL);
-        else
-            ::glDisable(GL_POLYGON_OFFSET_FILL);
+    if (!(s_gl_shadow_mask & SHADOW_POLY_OFFSET) || s_gl_state.polygon != enable) {
+        if (enable) ::glEnable(GL_POLYGON_OFFSET_FILL);
+        else        ::glDisable(GL_POLYGON_OFFSET_FILL);
         s_gl_state.polygon = enable;
         s_gl_shadow_mask |= SHADOW_POLY_OFFSET;
     }
@@ -425,8 +402,7 @@ static void glShadowSetPolygonOffset(float slope, float bias) {
         }
     }
 }
-static void glShadowSetStencil(GLenum fn, uint8_t ref, uint8_t fmask,
-                               uint8_t wmask) {
+static void glShadowSetStencil(GLenum fn, uint8_t ref, uint8_t fmask, uint8_t wmask) {
     if (!(s_gl_shadow_mask & SHADOW_STENCIL) || !s_gl_state.stencil) {
         ::glEnable(GL_STENCIL_TEST);
         s_gl_state.stencil = true;
@@ -434,8 +410,7 @@ static void glShadowSetStencil(GLenum fn, uint8_t ref, uint8_t fmask,
     }
     if (!(s_gl_shadow_mask & SHADOW_STENCIL_PARAMS) ||
         s_gl_state.stencilFunc != fn || s_gl_state.stencilRef != (GLint)ref ||
-        s_gl_state.stencilMask != fmask ||
-        s_gl_state.stencilWriteMask != wmask) {
+        s_gl_state.stencilMask != fmask || s_gl_state.stencilWriteMask != wmask) {
         ::glStencilFunc(fn, ref, fmask);
         ::glStencilMask(wmask);
         s_gl_state.stencilFunc = fn;
@@ -445,11 +420,12 @@ static void glShadowSetStencil(GLenum fn, uint8_t ref, uint8_t fmask,
         s_gl_shadow_mask |= SHADOW_STENCIL_PARAMS;
     }
 }
+
 static thread_local bool s_chunkOffsetValid = false;
 static thread_local glm::vec3 s_chunkOffset;
+
 static void pushRenderState() {
     if (!s_shader.prog) return;
-    // only call glUseProgram when something actually changed the binding
     if (s_boundProgram != s_shader.prog) {
         glUseProgram(s_shader.prog);
         s_boundProgram = s_shader.prog;
@@ -459,8 +435,7 @@ static void pushRenderState() {
     }
     if (s_rs_dirty_mask) {
         if (s_rs_dirty_mask & DIRTY_BASECOLOR)
-            glUniform4fv(s_shader.uBaseColor, 1,
-                         glm::value_ptr(s_rs.baseColor));
+            glUniform4fv(s_shader.uBaseColor, 1, glm::value_ptr(s_rs.baseColor));
         if (s_rs_dirty_mask & DIRTY_LIGHTING) {
             glUniform1i(s_shader.uLighting, s_rs.lighting ? 1 : 0);
             glUniform3fv(s_shader.uLight0Dir, 1, glm::value_ptr(s_rs.l0));
@@ -494,7 +469,6 @@ static void pushRenderState() {
 }
 
 static GLuint s_sVAO_std = 0, s_sVBO_std = 0;
-// Ajustamos a un tamaño fijo de 4MB para el Ring Buffer, suficiente para el modo inmediato
 static GLsizeiptr s_streamVBOSize = 4 * 1024 * 1024; 
 static GLintptr s_streamVBOOffset = 0;
 
@@ -511,47 +485,38 @@ static void bindStdAttribs() {
     glVertexAttribIPointer(4, 2, GL_SHORT, 32, (void*)28); 
 }
 
-
 static void bindCompressedAttribs() {
-    glEnableVertexAttribArray(0); // Posición (aPos)
-    glEnableVertexAttribArray(1); // Coordenadas de textura (aUV0)
-    glEnableVertexAttribArray(2); // Color empaquetado (aColor)
-    glDisableVertexAttribArray(3); // Desactivar normales (No se usan en Chunks)
-    glEnableVertexAttribArray(4); // Mapa de luz (aLMraw)
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glEnableVertexAttribArray(2);
+    glDisableVertexAttribArray(3);
+    glEnableVertexAttribArray(4);
     
-    // Atrib 0: 3 Shorts (GL_SHORT), stride = 16, offset = 0 bytes
     glVertexAttribPointer(0, 3, GL_SHORT, GL_FALSE, 16, (void*)0);
-    // Atrib 1: 2 Shorts (GL_SHORT), stride = 16, offset = 8 bytes (pShortData[4,5])
     glVertexAttribPointer(1, 2, GL_SHORT, GL_FALSE, 16, (void*)8);
-    // Atrib 2: 1 Short (GL_SHORT), stride = 16, offset = 6 bytes (pShortData[3])
     glVertexAttribPointer(2, 1, GL_SHORT, GL_FALSE, 16, (void*)6);
-    // Atrib 4: 2 Shorts (GL_SHORT) de mapa de luz de tipo entero, stride = 16, offset = 12 bytes
     glVertexAttribIPointer(4, 2, GL_SHORT, 16, (void*)12); 
 }
-
-
-
 
 static void initStreamingVAOs() {
     glGenVertexArrays(1, &s_sVAO_std);
     glGenBuffers(1, &s_sVBO_std);
     glBindVertexArray(s_sVAO_std);
     glBindBuffer(GL_ARRAY_BUFFER, s_sVBO_std);
-    // Pre-asignamos la memoria una sola vez para evitar asignaciones dinámicas en el ciclo de renderizado
     glBufferData(GL_ARRAY_BUFFER, s_streamVBOSize, nullptr, GL_STREAM_DRAW);
     bindStdAttribs();
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
+    s_currentBoundVAO = 0;
 }
 
-
-// Chunk buffer pool (shared, protected by s_glCallMtx)
 struct ChunkDrawCall {
     GLenum prim;
     GLint first;
     GLsizei count;
-    bool wasQuad; // NUEVO: Flag para saber si se renderiza con Index Buffer o directo
+    bool wasQuad;
 };
+
 struct ChunkBuffer {
     GLuint vbo = 0;
     GLuint vao = 0;
@@ -566,13 +531,9 @@ struct ChunkBuffer {
         lastUsedFrame = SDL_GetTicks();
     }
 
-    // --- EL CORAZÓN DEL ARREGLO: Gestión de Recursos ---
-
-    // 1. Borramos la posibilidad de COPIAR el buffer (evita duplicar IDs de GPU)
     ChunkBuffer(const ChunkBuffer&) = delete;
     ChunkBuffer& operator=(const ChunkBuffer&) = delete;
 
-    // 2. Implementamos el MOVIMIENTO (Transfiere la propiedad del VBO/VAO)
     ChunkBuffer(ChunkBuffer&& other) noexcept {
         this->vbo = other.vbo;
         this->vao = other.vao;
@@ -581,19 +542,15 @@ struct ChunkBuffer {
         this->valid = other.valid;
         this->vboReady = other.vboReady;
         this->lastUsedFrame = other.lastUsedFrame;
+        this->isCompressed = other.isCompressed;
 
-        // IMPORTANTE: Ponemos los IDs del origen en 0 para que 
-        // el destructor del objeto temporal no borre la GPU memory.
         other.vbo = 0;
         other.vao = 0;
     }
 
     ChunkBuffer& operator=(ChunkBuffer&& other) noexcept {
         if (this != &other) {
-            // PRIMERO: Borramos lo que ya teníamos en la GPU para evitar fugas
             destroy();
-
-            // SEGUNDO: Robamos los recursos del otro objeto
             this->vbo = other.vbo;
             this->vao = other.vao;
             this->draws = std::move(other.draws);
@@ -601,15 +558,14 @@ struct ChunkBuffer {
             this->valid = other.valid;
             this->vboReady = other.vboReady;
             this->lastUsedFrame = other.lastUsedFrame;
+            this->isCompressed = other.isCompressed;
 
-            // TERCERO: Dejamos el objeto origen vacío
             other.vbo = 0;
             other.vao = 0;
         }
         return *this;
     }
 
-    // Destructor para asegurar que si el objeto muere, la GPU se limpie
     ~ChunkBuffer() {
         destroy();
     }
@@ -621,6 +577,10 @@ struct ChunkBuffer {
             g_vboCount--;
         }
         if (vao) {
+            if (s_currentBoundVAO == vao) {
+                glBindVertexArray(0);
+                s_currentBoundVAO = 0;
+            }
             glDeleteVertexArrays(1, &vao);
             vao = 0;
             g_vaoCount--;
@@ -632,46 +592,33 @@ struct ChunkBuffer {
     }
 };
 
-
 static std::unordered_map<int, ChunkBuffer> s_chunkPool;
 static int s_nextListBase = 1;
-// Cola segura para liberar memoria OpenGL diferida en el hilo principal
 static std::vector<ChunkBuffer> s_pendingDestructions;
 static std::mutex s_destructionMtx;
-static std::mutex s_poolMtx; 
-// Per-thread recording state
+static std::shared_mutex s_poolMtx; // Concurrencia de lectura ultrarrápida
+
 static thread_local int s_recListId = -1;
 static thread_local std::vector<uint8_t> s_recVerts;
 static thread_local std::vector<ChunkDrawCall> s_recDraws;
-// Primitive helpers
+
 static bool isQuadPrim(int pt) {
-    return (pt == 0x0007 /*GL_QUADS*/ ||
-            pt == (int)GLRenderer::PRIMITIVE_TYPE_QUAD_LIST);
+    return (pt == 0x0007 || pt == (int)GLRenderer::PRIMITIVE_TYPE_QUAD_LIST);
 }
 static GLenum mapPrim(int pt) {
     if (isQuadPrim(pt)) return GL_TRIANGLES;
     switch (pt) {
-        case 0:
-            return GL_TRIANGLES;
-        case 1:
-            return GL_LINES;
-        case 2:
-            return GL_TRIANGLE_FAN;
-        case 3:
-            return GL_LINE_STRIP;
-        case 4:
-            return GL_TRIANGLES;
-        case 5:
-            return GL_TRIANGLE_STRIP;
-        case 6:
-            return GL_TRIANGLE_FAN;
-        default:
-            return GL_TRIANGLES;
+        case 0: return GL_TRIANGLES;
+        case 1: return GL_LINES;
+        case 2: return GL_TRIANGLE_FAN;
+        case 3: return GL_LINE_STRIP;
+        case 4: return GL_TRIANGLES;
+        case 5: return GL_TRIANGLE_STRIP;
+        case 6: return GL_TRIANGLE_FAN;
+        default: return GL_TRIANGLES;
     }
 }
 
-// MARK: Renderer impl
-// Initialises the renderer
 void GLRenderer::Initialise() {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "[4J_Render] SDL_Init: %s\n", SDL_GetError());
@@ -692,10 +639,7 @@ void GLRenderer::Initialise() {
 #else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-    // CAMBIO CRÍTICO: Reemplazar SDL_GL_CONTEXT_PROFILE_CORE por COMPATIBILITY
-    // Esto habilitará los formatos de textura heredados que requiere la interfaz de Iggy
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
-                        SDL_GL_CONTEXT_PROFILE_COMPATIBILITY); 
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_COMPATIBILITY); 
 #endif
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
@@ -735,9 +679,8 @@ void GLRenderer::Initialise() {
     glViewport(0, 0, s_windowWidth, s_windowHeight);
     s_shader.build(VERT_SRC, FRAG_SRC);
     initStreamingVAOs();
-    // ------------------------------------------------------------------------
-    // NUEVO: Inicialización del EBO Global (Index Buffer para Quads)
-    // ------------------------------------------------------------------------
+
+    // Generación del EBO global pre-calculado
     std::vector<GLuint> indices;
     indices.reserve((MAX_GLOBAL_VERTICES / 4) * 6);
     for (int i = 0; i < MAX_GLOBAL_VERTICES / 4; ++i) {
@@ -753,8 +696,7 @@ void GLRenderer::Initialise() {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_globalEBO);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(GLuint), indices.data(), GL_STATIC_DRAW);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-    Log::info("RenderRenderer: EBO Estático Global generado con éxito (%zu índices).\n", indices.size());
-    // ------------------------------------------------------------------------
+
     s_mainThreadId = std::this_thread::get_id();
     s_mainThreadSet = true;
     s_glCtx = s_glContext;
@@ -776,12 +718,9 @@ void GLRenderer::Initialise() {
     }
     SDL_GL_MakeCurrent(s_window, s_glContext);
     pushRenderState();
-#ifdef ENABLE_VSYNC
     SDL_GL_SetSwapInterval(0);
-#else
-    SDL_GL_SetSwapInterval(0);
-#endif
 }
+
 void GLRenderer::InitialiseContext() {
     if (!s_window) return;
     if (s_mainThreadSet && std::this_thread::get_id() == s_mainThreadId) {
@@ -811,8 +750,11 @@ void GLRenderer::InitialiseContext() {
     }
     s_glCtx = shared;
 }
+
 void GLRenderer::StartFrame() {
     Set_matrixDirty();
+    s_currentBoundVAO = 0;
+    s_currentGreedyMode = -1;
     int w, h;
     SDL_GetWindowSize(s_window, &w, &h);
     s_windowWidth = w > 0 ? w : 1;
@@ -821,13 +763,7 @@ void GLRenderer::StartFrame() {
 }
 
 void GLRenderer::Present() {
-    GLenum err;
-    while ((err = glGetError()) != GL_NO_ERROR) {
-        printf("[DIAGNOSTICO_IGGY] OpenGL Error detectado en el frame: 0x%04x\n", err);
-    }
-    // ============================================================
-    // 1. FASE DE DESTRUCCIÓN SINCRONIZADA (Thread-Safe)
-    // ============================================================
+    // 1. Limpieza diferida sin bloquear el hilo de dibujo
     std::vector<ChunkBuffer> toDestroy;
     {
         std::lock_guard<std::mutex> lk_del(s_destructionMtx);
@@ -836,41 +772,28 @@ void GLRenderer::Present() {
             s_pendingDestructions.clear();
         }
     }
-    if (!toDestroy.empty()) {
-        std::lock_guard<std::mutex> lk_pool(s_glCallMtx);
-        for (auto& cb : toDestroy) {
-            cb.destroy();
-        }
+    for (auto& cb : toDestroy) {
+        cb.destroy();
     }
 
-    // ============================================================
-    // 2. PROCESAMIENTO DE EVENTOS SDL
-    // ============================================================
+    // 2. Eventos SDL
     if (!s_window) return;
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT)
-            s_shouldClose = true;
-        else if (ev.window.event == SDL_WINDOWEVENT_CLOSE)
+        if (ev.type == SDL_QUIT || ev.window.event == SDL_WINDOWEVENT_CLOSE)
             s_shouldClose = true;
         else if (ev.window.event == SDL_WINDOWEVENT_RESIZED)
             onFramebufferResize(ev.window.data1, ev.window.data2);
     }
 
-    // ============================================================
-    // 3. DIAGNÓSTICO Y MONITOREO
-    // ============================================================
-    // Solo mostramos diagnóstico cada 60 frames para no saturar la consola
+    // 3. Diagnóstico ligero
     static int frameCounter = 0;
-    if (++frameCounter % 60 == 0) {
+    if (++frameCounter % 120 == 0) {
         printf("GPU Resources -> VBOs: %d | VAOs: %d | Texs: %d | Pool: %zu\n",
                g_vboCount.load(), g_vaoCount.load(), g_texCount.load(), s_chunkPool.size());
     }
 
-    // ============================================================
-    // 4. SWAP DE BUFFERS Y SINCRONIZACIÓN FINAL
-    // ============================================================
-//    glFlush();  // Asegura que todos los comandos se envíen a la GPU
+    // 4. Presentar a pantalla
     SDL_GL_SwapWindow(s_window);
 }
 
@@ -885,14 +808,16 @@ void GLRenderer::GetFramebufferSize(int& w, int& h) {
     h = s_windowHeight;
 }
 void GLRenderer::Close() { s_window = nullptr; }
+
 void GLRenderer::Shutdown()  {
     {
-        std::lock_guard<std::mutex> lk(s_glCallMtx);
+        std::unique_lock<std::shared_mutex> lk(s_poolMtx);
         for (auto& kv : s_chunkPool) kv.second.destroy();
         s_chunkPool.clear();
     }
     glDeleteVertexArrays(1, &s_sVAO_std);
     glDeleteBuffers(1, &s_sVBO_std);
+    if (s_globalEBO) glDeleteBuffers(1, &s_globalEBO);
     if (s_shader.prog) glDeleteProgram(s_shader.prog);
     if (s_glContext) {
         SDL_GL_DeleteContext(s_glContext);
@@ -908,44 +833,29 @@ void GLRenderer::Shutdown()  {
     }
     SDL_Quit();
 }
-// PIPELINE DE DIBUJO ORIGINAL INTEGRAL (Garantiza entidades visibles)
+
 void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVertexType vType, ePixelShaderType psType) {
     if (count <= 0 || !dataIn) return;
     bool wasQuad = isQuadPrim((int)ptype);
-    
-    // El stride por defecto es 32 bytes para formato estándar y 16 para compactado
     size_t stride = (vType == VERTEX_TYPE_COMPRESSED) ? 16 : 32;
     size_t bytes = (size_t)count * stride;
     GLenum glMode = mapPrim((int)ptype);
-    
-    // --- CONVERSIÓN DE VÉRTICES COMPRIMIDOS (Si vienen en formato de 360) ---
-    static thread_local std::vector<uint8_t> stdData;
-    stdData.clear();
-    if (vType == VERTEX_TYPE_COMPRESSED) {
-        // ¡BYPASS TOTAL DE LA DESCOMPRESIÓN EN CPU!
-        // No redimensionamos vectores, no calculamos floats, no desempaquetamos colores en la CPU.
-        // Pasamos el puntero 'dataIn' comprimido de 16 bytes tal y como viene directamente del Tesselator.
-        s_recIsCompressed = true; 
-    } else {
-        s_recIsCompressed = false;
-    }
 
-    // ------------------------------------------------------------------------
-    // GRABADOR DIFERIDO (Hilo de reconstrucción de Chunks de fondo)
-    // ------------------------------------------------------------------------
+    s_recIsCompressed = (vType == VERTEX_TYPE_COMPRESSED);
+
     if (s_recListId >= 0) {
         int first = (int)(s_recVerts.size() / stride);
-        s_recVerts.insert(s_recVerts.end(), (const uint8_t*)dataIn,
-                          (const uint8_t*)dataIn + bytes);
+        s_recVerts.insert(s_recVerts.end(), (const uint8_t*)dataIn, (const uint8_t*)dataIn + bytes);
         s_recDraws.push_back({glMode, first, (GLsizei)count, wasQuad});
         return;
     }
 
-    // --- PIPELINE INMEDIATO ---
-    std::lock_guard<std::mutex> lk(s_glCallMtx);
     pushRenderState();
 
-    glBindVertexArray(s_sVAO_std);
+    if (s_currentBoundVAO != s_sVAO_std) {
+        glBindVertexArray(s_sVAO_std);
+        s_currentBoundVAO = s_sVAO_std;
+    }
     glBindBuffer(GL_ARRAY_BUFFER, s_sVBO_std);
 
     if (s_streamVBOOffset + (GLintptr)bytes > s_streamVBOSize) {
@@ -959,13 +869,12 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     s_streamVBOOffset += (GLintptr)bytes;
     s_streamVBOOffset = (s_streamVBOOffset + 31) & ~31;
 
-    // Enlazar los atributos adecuados e informar al Shader del modo de compresión
-    if (vType == VERTEX_TYPE_COMPRESSED) {
-        bindCompressedAttribs();
-        glUniform1i(s_shader.uGreedyMode, 1);
-    } else {
-        bindStdAttribs();
-        glUniform1i(s_shader.uGreedyMode, 0);
+    int greedyTarget = (vType == VERTEX_TYPE_COMPRESSED) ? 1 : 0;
+    if (s_currentGreedyMode != greedyTarget) {
+        if (greedyTarget == 1) bindCompressedAttribs();
+        else                   bindStdAttribs();
+        glUniform1i(s_shader.uGreedyMode, greedyTarget);
+        s_currentGreedyMode = greedyTarget;
     }
 
     if (wasQuad) {
@@ -976,28 +885,24 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     } else {
         glDrawArrays(glMode, baseVertex, count);
     }
-    
-    glBindVertexArray(0);              
+
     glBindBuffer(GL_ARRAY_BUFFER, 0);  
 }
 
-
 void GLRenderer::ReadPixels(int x, int y, int w, int h, void* buf) {
     if (!buf) return;
-    std::lock_guard<std::mutex> lk(s_glCallMtx);
     glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf);
 }
 
 int GLRenderer::CBuffCreate(int count) {
-    std::lock_guard<std::mutex> lk(s_poolMtx); // Modificado
+    std::unique_lock<std::shared_mutex> lk(s_poolMtx);
     int b = s_nextListBase;
     s_nextListBase += count;
     return b;
 }
 
-
 void GLRenderer::CBuffDelete(int first, int count) {
-    std::lock_guard<std::mutex> lk(s_poolMtx); // Modificado
+    std::unique_lock<std::shared_mutex> lk(s_poolMtx);
     for (int i = first; i < first + count; i++) {
         auto it = s_chunkPool.find(i);
         if (it != s_chunkPool.end()) {
@@ -1010,9 +915,8 @@ void GLRenderer::CBuffDelete(int first, int count) {
     }
 }
 
-
 void GLRenderer::CBuffDeleteAll() {
-    std::lock_guard<std::mutex> lk(s_poolMtx); // Modificado
+    std::unique_lock<std::shared_mutex> lk(s_poolMtx);
     for (auto& kv : s_chunkPool) {
         std::lock_guard<std::mutex> lk_del(s_destructionMtx);
         s_pendingDestructions.push_back(std::move(kv.second));
@@ -1025,23 +929,22 @@ void GLRenderer::CBuffStart(int index, bool) {
     s_recListId = index;
     s_recVerts.clear();
     s_recDraws.clear();
-    s_recIsCompressed = false; // Nuevo
+    s_recIsCompressed = false;
 }
-
 
 void GLRenderer::CBuffEnd() {
     if (s_recListId < 0) return;
     
     ChunkBuffer newCb;
-    newCb.rawVerts = s_recVerts; 
+    newCb.rawVerts = std::move(s_recVerts); 
     newCb.draws = std::move(s_recDraws);
     newCb.valid = true;
     newCb.vboReady = false;
     newCb.lastUsedFrame = SDL_GetTicks();
-    newCb.isCompressed = s_recIsCompressed; // Nuevo
+    newCb.isCompressed = s_recIsCompressed;
 
     {
-        std::lock_guard<std::mutex> lk_pool(s_poolMtx); 
+        std::unique_lock<std::shared_mutex> lk_pool(s_poolMtx); 
         ChunkBuffer& cb = s_chunkPool[s_recListId];
         {
             std::lock_guard<std::mutex> lk_del(s_destructionMtx);
@@ -1054,9 +957,8 @@ void GLRenderer::CBuffEnd() {
     s_recListId = -1;
 }
 
-
 void GLRenderer::CBuffClear(int index) {
-    std::lock_guard<std::mutex> lk(s_poolMtx); // Modificado
+    std::unique_lock<std::shared_mutex> lk(s_poolMtx);
     auto it = s_chunkPool.find(index);
     if (it != s_chunkPool.end()) {
         {
@@ -1067,9 +969,10 @@ void GLRenderer::CBuffClear(int index) {
     }
 }
 
-
+// BUCLE DE DIBUJO OPTIMIZADO: Cero contención y cero VAO Thrashing
 bool GLRenderer::CBuffCall(int index, bool) {
-    std::lock_guard<std::mutex> lk_pool(s_poolMtx);
+    // 1. Acceso de solo lectura compartido y sin bloqueos exclusivos
+    std::shared_lock<std::shared_mutex> lk_pool(s_poolMtx);
     
     auto it = s_chunkPool.find(index);
     if (it == s_chunkPool.end() || !it->second.valid) {
@@ -1078,31 +981,34 @@ bool GLRenderer::CBuffCall(int index, bool) {
     
     ChunkBuffer& cb = it->second;
     cb.lastUsedFrame = SDL_GetTicks();
-    
-    std::lock_guard<std::mutex> lk(s_glCallMtx);
-    
+
+    // 2. Inicialización diferida del VBO/VAO si aún no está en GPU
     if (!cb.vboReady) {
-        if (cb.rawVerts.empty()) {
-            return false;
-        }
+        if (cb.rawVerts.empty()) return false;
+        
         glGenVertexArrays(1, &cb.vao);
         glGenBuffers(1, &cb.vbo);
         g_vaoCount++;
         g_vboCount++;
+        
         glBindVertexArray(cb.vao);
         glBindBuffer(GL_ARRAY_BUFFER, cb.vbo);
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)cb.rawVerts.size(),
                      cb.rawVerts.data(), GL_STATIC_DRAW);
         
-        // Enlazar los atributos según corresponda al formato de este chunk
         if (cb.isCompressed) {
             bindCompressedAttribs();
         } else {
             bindStdAttribs();
         }
         
+        // VINCULAR EBO PERMANENTEMENTE EN EL VAO (Cero llamadas en cada frame)
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_globalEBO);
+
         glBindVertexArray(0);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
+        s_currentBoundVAO = 0;
+
         cb.rawVerts.clear();
         cb.rawVerts.shrink_to_fit();
         cb.vboReady = true;
@@ -1110,12 +1016,20 @@ bool GLRenderer::CBuffCall(int index, bool) {
 
     pushRenderState();
     
-    // Informar al Vertex Shader si debe de aplicar descompresión por GPU
-    glUniform1i(s_shader.uGreedyMode, cb.isCompressed ? 1 : 0); 
+    // 3. Caché de greedy mode uniforme
+    int targetGreedy = cb.isCompressed ? 1 : 0;
+    if (s_currentGreedyMode != targetGreedy) {
+        glUniform1i(s_shader.uGreedyMode, targetGreedy);
+        s_currentGreedyMode = targetGreedy;
+    }
 
-    glBindVertexArray(cb.vao);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_globalEBO);
+    // 4. Evitar re-enlazar si el VAO ya está en uso
+    if (s_currentBoundVAO != cb.vao) {
+        glBindVertexArray(cb.vao);
+        s_currentBoundVAO = cb.vao;
+    }
     
+    // 5. Dibujar en ráfaga (el EBO ya está retenido por el VAO)
     for (const auto& dc : cb.draws) {
         if (dc.wasQuad) {
             GLsizei indexCount = (dc.count / 4) * 6;
@@ -1125,20 +1039,14 @@ bool GLRenderer::CBuffCall(int index, bool) {
         }
     }
     
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-    glBindVertexArray(0);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    
+    // NO DESVINCULAMOS A CERO AQUÍ: Esto permite que los sub-chunks se dibujen consecutivamente
     return true;
 }
 
 void GLRenderer::MatrixMode(int t) {
-    if (t == GL_PROJECTION)
-        s_matMode = 1;
-    else if (t == GL_TEXTURE)
-        s_matMode = 2;
-    else
-        s_matMode = 0;
+    if (t == GL_PROJECTION)      s_matMode = 1;
+    else if (t == GL_TEXTURE)   s_matMode = 2;
+    else                        s_matMode = 0;
 }
 void GLRenderer::MatrixSetIdentity() {
     activeStack().load(glm::mat4(1.f));
@@ -1174,8 +1082,7 @@ void GLRenderer::MatrixPerspective(float fovy, float asp, float zn, float zf) {
     s_proj.cur() = glm::perspective(glm::radians(fovy), asp, zn, zf);
     markMatrixDirty();
 }
-void GLRenderer::MatrixOrthogonal(float l, float r, float b, float t, float zn,
-                                  float zf) {
+void GLRenderer::MatrixOrthogonal(float l, float r, float b, float t, float zn, float zf) {
     s_proj.cur() = glm::ortho(l, r, b, t, zn, zf);
     markMatrixDirty();
 }
@@ -1228,16 +1135,12 @@ void GLRenderer::SetChunkOffset(float x, float y, float z) {
         glUniform3f(s_shader.uChunkOffset, x, y, z);
     }
 }
-void GLRenderer::StateSetDepthMask(bool e) {
-    glShadowSetDepthMask(e ? GL_TRUE : GL_FALSE);
-}
+void GLRenderer::StateSetDepthMask(bool e) { glShadowSetDepthMask(e ? GL_TRUE : GL_FALSE); }
 void GLRenderer::StateSetBlendEnable(bool e) { glShadowSetBlend(e); }
 void GLRenderer::StateSetBlendFunc(int s, int d) { glShadowSetBlendFunc(s, d); }
 void GLRenderer::StateSetDepthFunc(int f) { ::glDepthFunc(f); }
 void GLRenderer::StateSetFaceCull(bool e) { glShadowSetCull(e); }
-void GLRenderer::StateSetFaceCullCW(bool e) {
-    glShadowSetFrontFace(e ? GL_CW : GL_CCW);
-}
+void GLRenderer::StateSetFaceCullCW(bool e) { glShadowSetFrontFace(e ? GL_CW : GL_CCW); }
 void GLRenderer::StateSetLineWidth(float w) {
 #ifndef GLES
     glShadowSetLineWidth(w);
@@ -1245,9 +1148,7 @@ void GLRenderer::StateSetLineWidth(float w) {
     (void)w;
 #endif
 }
-void GLRenderer::StateSetWriteEnable(bool r, bool g, bool b, bool a) {
-    glShadowSetColorMask(r, g, b, a);
-}
+void GLRenderer::StateSetWriteEnable(bool r, bool g, bool b, bool a) { glShadowSetColorMask(r, g, b, a); }
 void GLRenderer::StateSetDepthTestEnable(bool e) { glShadowSetDepthTest(e); }
 void GLRenderer::StateSetAlphaTestEnable(bool e) {
     float v = e ? 0.1f : 0.f;
@@ -1262,9 +1163,7 @@ void GLRenderer::StateSetAlphaFunc(int, float p) {
         markDirty(DIRTY_ALPHA);
     }
 }
-void GLRenderer::StateSetDepthSlopeAndBias(float s, float b) {
-    glShadowSetPolygonOffset(s, b);
-}
+void GLRenderer::StateSetDepthSlopeAndBias(float s, float b) { glShadowSetPolygonOffset(s, b); }
 void GLRenderer::StateSetBlendFactor(unsigned int col) {
     float a = ((col >> 24) & 0xFF) / 255.f;
     float r = ((col >> 16) & 0xFF) / 255.f;
@@ -1279,10 +1178,7 @@ void GLRenderer::StateSetFogEnable(bool e) {
     }
 }
 void GLRenderer::StateSetFogMode(int mode) {
-    int v = (mode == GL_LINEAR) ? 1
-            : (mode == GL_EXP)  ? 2
-            : (mode == 0x0801)  ? 3
-                                : 0;
+    int v = (mode == GL_LINEAR) ? 1 : (mode == GL_EXP) ? 2 : (mode == 0x0801) ? 3 : 0;
     if (s_rs.fogMode != v) {
         s_rs.fogMode = v;
         markDirty(DIRTY_FOG);
@@ -1336,15 +1232,9 @@ void GLRenderer::StateSetLightAmbientColour(float r, float g, float b) {
 void GLRenderer::StateSetLightDirection(int light, float x, float y, float z) {
     glm::vec3 d = glm::normalize(glm::mat3(s_mv.cur()) * glm::vec3(x, y, z));
     if (light == 0) {
-        if (s_rs.l0 != d) {
-            s_rs.l0 = d;
-            markDirty(DIRTY_LIGHTING);
-        }
+        if (s_rs.l0 != d) { s_rs.l0 = d; markDirty(DIRTY_LIGHTING); }
     } else {
-        if (s_rs.l1 != d) {
-            s_rs.l1 = d;
-            markDirty(DIRTY_LIGHTING);
-        }
+        if (s_rs.l1 != d) { s_rs.l1 = d; markDirty(DIRTY_LIGHTING); }
     }
 }
 void GLRenderer::StateSetViewport(eViewportType) {
@@ -1357,8 +1247,7 @@ void GLRenderer::StateSetVertexTextureUV(float u, float v) {
         markDirty(DIRTY_GLOBAL_LM);
     }
 }
-void GLRenderer::StateSetStencil(int fn, uint8_t ref, uint8_t fmask,
-                                 uint8_t wmask) {
+void GLRenderer::StateSetStencil(int fn, uint8_t ref, uint8_t fmask, uint8_t wmask) {
     glShadowSetStencil(fn, ref, fmask, wmask);
 }
 void GLRenderer::StateSetTextureEnable(bool e) {
@@ -1368,7 +1257,6 @@ void GLRenderer::StateSetTextureEnable(bool e) {
     }
 }
 
-// TEXTURE TRACKING IN STANDARD CREATOR
 int GLRenderer::TextureCreate() {
     GLuint id;
     glGenTextures(1, &id);
@@ -1415,15 +1303,13 @@ void GLRenderer::TextureBindVertex(int idx, bool scaleLight) {
 void GLRenderer::TextureSetTextureLevels(int l) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, l > 0 ? l - 1 : 0);
     if (l > 1)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-                        GL_NEAREST_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_LINEAR);
     else
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 }
 int GLRenderer::TextureGetTextureLevels() { return 1; }
 void GLRenderer::TextureData(int w, int h, void* d, int lvl, eTextureFormat) {
-    glTexImage2D(GL_TEXTURE_2D, lvl, GL_RGBA, w, h, 0, GL_RGBA,
-                 GL_UNSIGNED_BYTE, d);
+    glTexImage2D(GL_TEXTURE_2D, lvl, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, d);
     if (lvl == 0) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         GLint maxLvl = 0;
@@ -1432,25 +1318,20 @@ void GLRenderer::TextureData(int w, int h, void* d, int lvl, eTextureFormat) {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     }
 }
-void GLRenderer::TextureDataUpdate(int xo, int yo, int w, int h, void* d,
-                                   int lvl) {
-    glTexSubImage2D(GL_TEXTURE_2D, lvl, xo, yo, w, h, GL_RGBA, GL_UNSIGNED_BYTE,
-                    d);
+void GLRenderer::TextureDataUpdate(int xo, int yo, int w, int h, void* d, int lvl) {
+    glTexSubImage2D(GL_TEXTURE_2D, lvl, xo, yo, w, h, GL_RGBA, GL_UNSIGNED_BYTE, d);
 }
 void GLRenderer::TextureSetParam(int p, int v) {
     glTexParameteri(GL_TEXTURE_2D, p, v);
 }
 
-// stbLoad unificado mediante plantillas para evitar conflictos de estructuras (D3DXIMAGE_INFO vs ImageInfo)
-// Además, reserva memoria usando malloc para evitar corrupción de Heap con el free() del cliente.
 template <typename T>
 static int stbLoad(unsigned char* data, int w, int h, T* info, int** out) {
     int* px = (int*)malloc(w * h * sizeof(int));
     if (!px) return -1;
     
     for (int i = 0; i < w * h; i++) {
-        unsigned char r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2],
-                      a = data[i * 4 + 3];
+        unsigned char r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2], a = data[i * 4 + 3];
         px[i] = (a << 24) | (r << 16) | (g << 8) | b;
     }
     if (info) {
@@ -1458,23 +1339,17 @@ static int stbLoad(unsigned char* data, int w, int h, T* info, int** out) {
         info->Height = h;
     }
     *out = px;
-    return 0;  // Éxito
+    return 0;
 }
-
-
 
 int GLRenderer::LoadTextureData(const char* szFilename, D3DXIMAGE_INFO* pSrcInfo, int** ppDataOut) {
     int w, h, c;
     unsigned char* d = stbi_load(szFilename, &w, &h, &c, 4);
     if (!d) return -1;
-    
-    // Usamos la función helper stbLoad que ya tienes definida
-    // OJO: Si stbLoad usa ImageInfo, cámbialo a D3DXIMAGE_INFO
     int hr = stbLoad(d, w, h, pSrcInfo, ppDataOut);
     stbi_image_free(d);
     return hr;
 }
-
 
 int GLRenderer::LoadTextureData(std::uint8_t* pbData, std::uint32_t byteCount, D3DXIMAGE_INFO* pSrcInfo, int** ppDataOut) {
     int w, h, c;
@@ -1485,24 +1360,22 @@ int GLRenderer::LoadTextureData(std::uint8_t* pbData, std::uint32_t byteCount, D
     return hr;
 }
 
-
 int GLRenderer::SaveTextureData(const char* szFilename, D3DXIMAGE_INFO* pSrcInfo, int* ppDataOut) {
-    return 0; // Stub
+    return 0;
 }
 
-// TODO: TO REMOVE SOON.
 void GLRenderer::UpdateGamma(unsigned short usGamma) {
     constexpr unsigned short GAMMA_MAX = 32768;
     s_rs.gamma = 0.5f + ((float)(usGamma) * (1.0f / GAMMA_MAX));
 }
-// HELPER FUNCTIONS (DECLARADAS ARRIBA PARA EVITAR SCOPE ERRORS)
+
 inline int* getIntPtr(IntBuffer* buf) {
     return buf ? (int*)buf->getBuffer() + buf->position() : nullptr;
 }
 inline void* getBytePtr(ByteBuffer* buf) {
     return buf ? (char*)buf->getBuffer() + buf->position() : nullptr;
 }
-// MARK: C hooks (CON CONTADOR DE TEXTURAS CORREGIDO)
+
 int glGenTextures_4J() {
     GLuint id = 0;
     ::glGenTextures(1, &id);
@@ -1522,7 +1395,7 @@ void glDeleteTextures_4J(int n, const unsigned int* textures) {
     ::glDeleteTextures(n, textures);
     g_texCount -= n;
 }
-// MARK: LinuxStubs
+
 #ifdef GLES
 extern "C" {
 extern void glClearDepthf(float depth);
@@ -1537,6 +1410,7 @@ void glEndList(void) {}
 void glCallLists(int, unsigned int, const void*) {}
 }
 #endif
+
 void glGenTextures_4J(IntBuffer* buf) {
     if (!buf) return;
     int n = buf->limit() - buf->position();
@@ -1552,23 +1426,16 @@ void glDeleteTextures_4J(IntBuffer* buf) {
 void glTexImage2D_4J(int target, int level, int internalformat, int width,
                      int height, int border, int format, int type,
                      ByteBuffer* pixels) {
-    (void)target;
-    (void)internalformat;
-    (void)border;
-    (void)format;
-    (void)type;
+    (void)target; (void)internalformat; (void)border; (void)format; (void)type;
     PlatformRenderer.TextureData(width, height, getBytePtr(pixels), level,
                                  IPlatformRenderer::TEXTURE_FORMAT_RxGyBzAw);
 }
 void glLight_4J(int light, int pname, FloatBuffer* params) {
     const float* p = params->_getDataPointer();
     int idx = (light == 0x4001) ? 1 : 0;
-    if (pname == 0x1203)
-        PlatformRenderer.StateSetLightDirection(idx, p[0], p[1], p[2]);
-    else if (pname == 0x1201)
-        PlatformRenderer.StateSetLightColour(idx, p[0], p[1], p[2]);
-    else if (pname == 0x1200)
-        PlatformRenderer.StateSetLightAmbientColour(p[0], p[1], p[2]);
+    if (pname == 0x1203)      PlatformRenderer.StateSetLightDirection(idx, p[0], p[1], p[2]);
+    else if (pname == 0x1201) PlatformRenderer.StateSetLightColour(idx, p[0], p[1], p[2]);
+    else if (pname == 0x1200) PlatformRenderer.StateSetLightAmbientColour(p[0], p[1], p[2]);
 }
 void glLightModel_4J(int pname, FloatBuffer* params) {
     if (pname == 0x0B53) {
@@ -1592,26 +1459,22 @@ void glCallLists_4J(IntBuffer* lists) {
         (void)PlatformRenderer.CBuffCall(ids[i], false);
 }
 void glReadPixels_4J(int x, int y, int w, int h, int f, int t, ByteBuffer* p) {
-    (void)f;
-    (void)t;
+    (void)f; (void)t;
     PlatformRenderer.ReadPixels(x, y, w, h, getBytePtr(p));
 }
-// dead stubs
+
 void glTexCoordPointer_4J(int, int, FloatBuffer*) {}
 void glNormalPointer_4J(int, ByteBuffer*) {}
 void glColorPointer_4J(int, bool, int, ByteBuffer*) {}
 void glVertexPointer_4J(int, int, FloatBuffer*) {}
 void glEndList_4J(int) {}
 void glTexGen_4J(int, int, FloatBuffer*) {}
-void glGetFloat(int pname, FloatBuffer* params) {
-    glGetFloat_4J(pname, params);
-}
+void glGetFloat(int pname, FloatBuffer* params) { glGetFloat_4J(pname, params); }
+
 void GLRenderer::flushIggyCache() {
-    // Llamamos al puente de Iggy para limpiar la caché de texturas de la UI
     Iggy_FlushCache();
     Log::info("RenderRenderer: Iggy Cache flushed via Bridge.\n");
 }
-
 
 void GLRenderer::SetAtlasSize(int width, int height) {
     if (width <= 0 || height <= 0) return;
@@ -1621,40 +1484,21 @@ void GLRenderer::SetAtlasSize(int width, int height) {
     glUniform2f(s_shader.uCellSize, cellW, cellH);
 }
 
-
-
-void GLRenderer::CBuffDeferredModeEnd() {
-    // Implementación vacía para satisfacer la interfaz
-}
-
+void GLRenderer::CBuffDeferredModeEnd() {}
 
 void GLRenderer::StateSetActiveTexture(int tex) {
     glActiveTexture(GL_TEXTURE0 + (tex % 8));
 }
 
 void GLRenderer::CaptureScreen(ImageFileBuffer* jpgOut, void* previewOut) {
-    (void)jpgOut;
-    (void)previewOut;
+    (void)jpgOut; (void)previewOut;
 }
 
-
 extern "C" {
-// Declaramos la firma real de la función de OpenGL
 typedef void (*PFNGLTEXIMAGE2DPROC)(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels);
 
-// INTERCEPTOR GLOBAL DE OPENGL: Captura todas las llamadas a glTexImage2D del proceso (incluido Iggy)
 void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels) {
-    // Obtenemos un puntero hacia la función real de OpenGL del controlador de video (Mesa/Nvidia)
     static PFNGLTEXIMAGE2DPROC real_glTexImage2D = (PFNGLTEXIMAGE2DPROC)dlsym(RTLD_NEXT, "glTexImage2D");
-    
-    // Ejecutamos la carga real de la textura en la GPU
     real_glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
-    
-    // Capturamos si la GPU la rechazó y con qué parámetros
-    GLenum err = glGetError();
-    if (err != GL_NO_ERROR) {
-        printf("[DEBUG_GL_HOOK] ERROR en glTexImage2D: 0x%04x | target: 0x%04x | internalformat: 0x%04x | format: 0x%04x | type: 0x%04x | size: %dx%d\n", 
-               err, target, internalformat, format, type, width, height);
-    }
 }
 }

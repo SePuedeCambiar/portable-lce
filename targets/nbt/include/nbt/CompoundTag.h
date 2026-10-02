@@ -40,7 +40,8 @@ public:
         }
         tags.clear();
         for (;;) {
-            Tag* rawTag = Tag::readNamedTag(dis, tagDepth + 1);
+            
+            Tag* rawTag = Tag::readNamedTag(dis);
             if (rawTag == nullptr) break; // Previene crash en EOF/corrupción
             if (rawTag->getId() == Tag::TAG_End) {
                 delete rawTag; // Libera el EndTag sin meterlo al mapa
