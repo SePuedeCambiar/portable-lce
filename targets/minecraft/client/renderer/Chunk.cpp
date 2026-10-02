@@ -27,10 +27,6 @@
 #include "platform/stubs.h"
 #include "util/FrameProfiler.h"
 
-
-
-#define GREEDY_MESH_TILING 0
-
 int Chunk::updates = 0;
 
 #if defined(_LARGE_WORLDS)
@@ -110,8 +106,6 @@ void Chunk::reconcileRenderableTileEntities(
     }
 }
 
-// TODO - 4J see how input entity vector is set up and decide what way is best
-// to pass this to the function
 Chunk::Chunk(Level* level, LevelRenderer::rteMap& globalRenderableTileEntities,
              std::shared_mutex& globalRenderableTileEntities_cs, int x, int y, int z,
              ClipChunk* clipChunk)
@@ -123,24 +117,19 @@ Chunk::Chunk(Level* level, LevelRenderer::rteMap& globalRenderableTileEntities,
     id = 0;
 
     this->level = level;
-    // this->globalRenderableTileEntities = globalRenderableTileEntities;
-
     assigned = false;
     this->clipChunk = clipChunk;
     setPos(x, y, z);
 }
 
 void Chunk::setPos(int x, int y, int z) {
-    // El wrapper público se encarga del LOCK
     std::unique_lock<std::shared_mutex> lock(levelRenderer->m_csDirtyChunks);
     setPos_Internal(x, y, z);
 }
 
 void Chunk::setPos_Internal(int x, int y, int z) {
-    // ESTA FUNCIÓN NO BLOQUEA NADA.
     if (assigned && (x == this->x && y == this->y && z == this->z)) return;
 
-    // Llamamos al reset interno (sin lock)
     reset_Internal();
 
     this->x = x;
@@ -174,8 +163,6 @@ void Chunk::setPos_Internal(int x, int y, int z) {
 
     assigned = true;
 
-    // El refCount y los flags son ATÓMICOS, no necesitan lock adicional 
-    // pero como ya estamos dentro del lock de m_csDirtyChunks en resortChunks, es seguro.
     unsigned char refCount = levelRenderer->incGlobalChunkRefCount(x, y, z, level);
     if (refCount == 1) {
         levelRenderer->setGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_DIRTY);
@@ -210,7 +197,6 @@ void Chunk::makeCopyForRebuild(Chunk* source) {
         source->globalRenderableTileEntities_cs;
 }
 
-
 struct FaceInfo {
     uint8_t tileId = 0;
     Icon* texture = nullptr;
@@ -228,9 +214,6 @@ struct FaceInfo {
 };
 
 void Chunk::rebuild() {
-    // ============================================================================
-    // 1. LUTs DINÁMICAS (Se llenan basadas en las propiedades reales de los Tiles)
-    // ============================================================================
     static bool isSolidLUT[256];
     static bool isGreedySafeLUT[256];
     static bool isInitialized = false;
@@ -287,9 +270,7 @@ void Chunk::rebuild() {
     level->getChunkAt(x, z)->getBlockData(tileArray);
     memcpy(tileIds, tileArray.data(), 16 * 16 * Level::maxBuildHeight);
 
-    // ✅ OPTIMIZACIÓN DE CPU: Usamos Region con caché dinámica (sin VBOs)
     Region region(level, x0 - r, y0 - r, z0 - r, x1 + r, y1 + r, z1 + r, r);
-
     TileRenderer tileRenderer(&region, this->x, this->y, this->z, tileIds);
 
     int offsetBaseY[Level::maxBuildHeight];
@@ -306,7 +287,7 @@ void Chunk::rebuild() {
     }
 
     // ============================================================================
-    // 5. FAST CULLING PREPASS
+    // FAST CULLING PREPASS
     // ============================================================================
     bool empty = true;
     {
@@ -338,10 +319,8 @@ void Chunk::rebuild() {
     if (empty) {
         for (int currentLayer = 0; currentLayer < 2; currentLayer++) {
             levelRenderer->setGlobalChunkFlag(this->x, this->y, this->z, level, LevelRenderer::CHUNK_FLAG_EMPTY0, currentLayer);
-            // ✅ LIMPIEZA CRÍTICA: Liberar buffer huérfano cuando el chunk está vacío
             PlatformRenderer.CBuffClear(lists + currentLayer);
         }
-        // También limpiamos el segundo buffer si existe
         PlatformRenderer.CBuffClear(lists + 1);
         return;
     }
@@ -369,7 +348,8 @@ void Chunk::rebuild() {
                 started = true;
                 glNewList(lists + currentLayer, GL_COMPILE);
                 glDepthMask(true);
-                t->useCompactVertices(false); 
+                // ACTIVAMOS FORMATO COMPACTO DE 16 BYTES
+                t->useCompactVertices(true); 
                 t->begin();
                 t->offset((float)(-this->x), (float)(-this->y), (float)(-this->z));
             }
@@ -431,23 +411,36 @@ void Chunk::rebuild() {
                                 height++;
                             }
                             for (int cv = v; cv < v + height; cv++) for (int cu = u; cu < u + width; cu++) grid[cv * 16 + cu].merged = true;
+                            
                             startTesselatorIfNeeded();
                             rendered = true;
                             float mult = (face == 0) ? 0.5f : 1.0f;
-                            t->color(((current.tileColor >> 16) & 0xff) / 255.0f * mult, ((current.tileColor >> 8) & 0xff) / 255.0f * mult, ((current.tileColor) & 0xff) / 255.0f * mult);
-                            float u0 = current.texture ? current.texture->getU0() : 0.0f, v0 = current.texture ? current.texture->getV0() : 0.0f;
-                            float u1 = current.texture ? current.texture->getU1() : 0.0f, v1 = current.texture ? current.texture->getV1() : 0.0f;
-                            float cellW = u1 - u0, cellH = v1 - v0, uEnd = u0 + (width * cellW), vEnd = v0 + (height * cellH);
-                            float packU = std::floor(u0 * 1024.0f + 0.5f) + 1.0f, packV = std::floor(v0 * 1024.0f + 0.5f) + 1.0f;
-                            float oU = packU * 10.0f, oV = packV * 10.0f, pU0 = u0 + oU, pV0 = v0 + oV, pUEnd = uEnd + oU, pVEnd = vEnd + oV;
+                            t->color(((current.tileColor >> 16) & 0xff) / 255.0f * mult, 
+                                     ((current.tileColor >> 8) & 0xff) / 255.0f * mult, 
+                                     ((current.tileColor) & 0xff) / 255.0f * mult);
+
+                            float u0 = current.texture ? current.texture->getU0() : 0.0f;
+                            float v0 = current.texture ? current.texture->getV0() : 0.0f;
+                            float u1 = current.texture ? current.texture->getU1() : 0.0f;
+                            float v1 = current.texture ? current.texture->getV1() : 0.0f;
                             t->tex2(current.lightColor);
-                            float cx = (float)(x0 + u), cz = (float)(z0 + v), cy = (float)y, cw = (float)width, ch = (float)height;
-                            if (face == 0) {
-                                t->vertexUV(cx, cy, cz + ch, pU0, pVEnd); t->vertexUV(cx, cy, cz, pU0, pV0);
-                                t->vertexUV(cx + cw, cy, cz, pUEnd, pV0); t->vertexUV(cx + cw, cy, cz + ch, pUEnd, pVEnd);
-                            } else {
-                                t->vertexUV(cx + cw, cy + 1.0f, cz + ch, pUEnd, pVEnd); t->vertexUV(cx + cw, cy + 1.0f, cz, pUEnd, pV0);
-                                t->vertexUV(cx, cy + 1.0f, cz, pU0, pV0); t->vertexUV(cx, cy + 1.0f, cz + ch, pU0, pVEnd);
+
+                            // EMISIÓN LIMPIA DE UVs DE 16 BYTES (Sin factor *10 desbordante)
+                            for (int cv = 0; cv < height; cv++) {
+                                for (int cu = 0; cu < width; cu++) {
+                                    float cx = (float)(x0 + u + cu), cz = (float)(z0 + v + cv), cy = (float)y;
+                                    if (face == 0) {
+                                        t->vertexUV(cx, cy, cz + 1.0f, u0, v1);
+                                        t->vertexUV(cx, cy, cz, u0, v0);
+                                        t->vertexUV(cx + 1.0f, cy, cz, u1, v0);
+                                        t->vertexUV(cx + 1.0f, cy, cz + 1.0f, u1, v1);
+                                    } else {
+                                        t->vertexUV(cx + 1.0f, cy + 1.0f, cz + 1.0f, u1, v1);
+                                        t->vertexUV(cx + 1.0f, cy + 1.0f, cz, u1, v0);
+                                        t->vertexUV(cx, cy + 1.0f, cz, u0, v0);
+                                        t->vertexUV(cx, cy + 1.0f, cz + 1.0f, u0, v1);
+                                    }
+                                }
                             }
                         }
                     }
@@ -504,23 +497,36 @@ void Chunk::rebuild() {
                                 height++;
                             }
                             for (int cv = v; cv < v + height; cv++) for (int cu = u; cu < u + width; cu++) grid[cv * 16 + cu].merged = true;
+                            
                             startTesselatorIfNeeded();
                             rendered = true;
                             float mult = 0.8f;
-                            t->color(((current.tileColor >> 16) & 0xff) / 255.0f * mult, ((current.tileColor >> 8) & 0xff) / 255.0f * mult, ((current.tileColor) & 0xff) / 255.0f * mult);
-                            float u0 = current.texture ? current.texture->getU0() : 0.0f, v0 = current.texture ? current.texture->getV0() : 0.0f;
-                            float u1 = current.texture ? current.texture->getU1() : 0.0f, v1 = current.texture ? current.texture->getV1() : 0.0f;
-                            float cellW = u1 - u0, cellH = v1 - v0, uEnd = u0 + (width * cellW), vEnd = v0 + (height * cellH);
-                            float packU = std::floor(u0 * 1024.0f + 0.5f) + 1.0f, packV = std::floor(v0 * 1024.0f + 0.5f) + 1.0f;
-                            float oU = packU * 10.0f, oV = packV * 10.0f, pU0 = u0 + oU, pV0 = v0 + oV, pUEnd = uEnd + oU, pVEnd = vEnd + oV;
+                            t->color(((current.tileColor >> 16) & 0xff) / 255.0f * mult, 
+                                     ((current.tileColor >> 8) & 0xff) / 255.0f * mult, 
+                                     ((current.tileColor) & 0xff) / 255.0f * mult);
+
+                            float u0 = current.texture ? current.texture->getU0() : 0.0f;
+                            float v0 = current.texture ? current.texture->getV0() : 0.0f;
+                            float u1 = current.texture ? current.texture->getU1() : 0.0f;
+                            float v1 = current.texture ? current.texture->getV1() : 0.0f;
                             t->tex2(current.lightColor);
-                            float cx = (float)(x0 + u), cy = (float)(y0 + v), cz = (float)(z0 + z), cw = (float)width, ch = (float)height;
-                            if (face == 2) {
-                                t->vertexUV(cx, cy + ch, cz, pUEnd, pV0); t->vertexUV(cx + cw, cy + ch, cz, pU0, pV0);
-                                t->vertexUV(cx + cw, cy, cz, pU0, pVEnd); t->vertexUV(cx, cy, cz, pUEnd, pVEnd);
-                            } else {
-                                t->vertexUV(cx, cy + ch, cz + 1.0f, pU0, pV0); t->vertexUV(cx, cy, cz + 1.0f, pU0, pVEnd);
-                                t->vertexUV(cx + cw, cy, cz + 1.0f, pUEnd, pVEnd); t->vertexUV(cx + cw, cy + ch, cz + 1.0f, pUEnd, pV0);
+
+                            // EMISIÓN LIMPIA DE UVs DE 16 BYTES
+                            for (int cv = 0; cv < height; cv++) {
+                                for (int cu = 0; cu < width; cu++) {
+                                    float cx = (float)(x0 + u + cu), cy = (float)(y0 + v + cv), cz = (float)(z0 + z);
+                                    if (face == 2) {
+                                        t->vertexUV(cx, cy + 1.0f, cz, u1, v0);
+                                        t->vertexUV(cx + 1.0f, cy + 1.0f, cz, u0, v0);
+                                        t->vertexUV(cx + 1.0f, cy, cz, u0, v1);
+                                        t->vertexUV(cx, cy, cz, u1, v1);
+                                    } else {
+                                        t->vertexUV(cx, cy + 1.0f, cz + 1.0f, u0, v0);
+                                        t->vertexUV(cx, cy, cz + 1.0f, u0, v1);
+                                        t->vertexUV(cx + 1.0f, cy, cz + 1.0f, u1, v1);
+                                        t->vertexUV(cx + 1.0f, cy + 1.0f, cz + 1.0f, u1, v0);
+                                    }
+                                }
                             }
                         }
                     }
@@ -577,23 +583,36 @@ void Chunk::rebuild() {
                                 height++;
                             }
                             for (int cv = v; cv < v + height; cv++) for (int cu = u; cu < u + width; cu++) grid[cv * 16 + cu].merged = true;
+                            
                             startTesselatorIfNeeded();
                             rendered = true;
                             float mult = 0.6f;
-                            t->color(((current.tileColor >> 16) & 0xff) / 255.0f * mult, ((current.tileColor >> 8) & 0xff) / 255.0f * mult, ((current.tileColor) & 0xff) / 255.0f * mult);
-                            float u0 = current.texture ? current.texture->getU0() : 0.0f, v0 = current.texture ? current.texture->getV0() : 0.0f;
-                            float u1 = current.texture ? current.texture->getU1() : 0.0f, v1 = current.texture ? current.texture->getV1() : 0.0f;
-                            float cellW = u1 - u0, cellH = v1 - v0, uEnd = u0 + (width * cellW), vEnd = v0 + (height * cellH);
-                            float packU = std::floor(u0 * 1024.0f + 0.5f) + 1.0f, packV = std::floor(v0 * 1024.0f + 0.5f) + 1.0f;
-                            float oU = packU * 10.0f, oV = packV * 10.0f, pU0 = u0 + oU, pV0 = v0 + oV, pUEnd = uEnd + oU, pVEnd = vEnd + oV;
+                            t->color(((current.tileColor >> 16) & 0xff) / 255.0f * mult, 
+                                     ((current.tileColor >> 8) & 0xff) / 255.0f * mult, 
+                                     ((current.tileColor) & 0xff) / 255.0f * mult);
+
+                            float u0 = current.texture ? current.texture->getU0() : 0.0f;
+                            float v0 = current.texture ? current.texture->getV0() : 0.0f;
+                            float u1 = current.texture ? current.texture->getU1() : 0.0f;
+                            float v1 = current.texture ? current.texture->getV1() : 0.0f;
                             t->tex2(current.lightColor);
-                            float cx = (float)(x0 + x), cy = (float)(y0 + v), cz = (float)(z0 + u), cw = (float)width, ch = (float)height;
-                            if (face == 4) {
-                                t->vertexUV(cx, cy + ch, cz + cw, pUEnd, pV0); t->vertexUV(cx, cy + ch, cz, pU0, pV0);
-                                t->vertexUV(cx, cy, cz, pU0, pVEnd); t->vertexUV(cx, cy, cz + cw, pUEnd, pVEnd);
-                            } else {
-                                t->vertexUV(cx + 1.0f, cy, cz + cw, pU0, pVEnd); t->vertexUV(cx + 1.0f, cy, cz, pUEnd, pVEnd);
-                                t->vertexUV(cx + 1.0f, cy + ch, cz, pUEnd, pV0); t->vertexUV(cx + 1.0f, cy + ch, cz + cw, pU0, pV0);
+
+                            // EMISIÓN LIMPIA DE UVs DE 16 BYTES
+                            for (int cv = 0; cv < height; cv++) {
+                                for (int cu = 0; cu < width; cu++) {
+                                    float cx = (float)(x0 + x), cy = (float)(y0 + v + cv), cz = (float)(z0 + u + cu);
+                                    if (face == 4) {
+                                        t->vertexUV(cx, cy + 1.0f, cz + 1.0f, u1, v0);
+                                        t->vertexUV(cx, cy + 1.0f, cz, u0, v0);
+                                        t->vertexUV(cx, cy, cz, u0, v1);
+                                        t->vertexUV(cx, cy, cz + 1.0f, u1, v1);
+                                    } else {
+                                        t->vertexUV(cx + 1.0f, cy, cz + 1.0f, u0, v1);
+                                        t->vertexUV(cx + 1.0f, cy, cz, u1, v1);
+                                        t->vertexUV(cx + 1.0f, cy + 1.0f, cz, u1, v0);
+                                        t->vertexUV(cx + 1.0f, cy + 1.0f, cz + 1.0f, u0, v0);
+                                    }
+                                }
                             }
                         }
                     }
@@ -629,23 +648,19 @@ void Chunk::rebuild() {
             t->end();
             bounds.addBounds(t->bounds);
             glEndList();
-            t->useCompactVertices(false);
+            t->useCompactVertices(true); // Mantenemos el formato compacto consistente
             t->offset(0, 0, 0);
         }
         
-        // ✅ CONTROL DE FLAGS Y LIMPIEZA DE VRAM THREAD-SAFE
         if (rendered) {
             levelRenderer->clearGlobalChunkFlag(this->x, this->y, this->z, level, LevelRenderer::CHUNK_FLAG_EMPTY0, currentLayer);
         } else {
             levelRenderer->setGlobalChunkFlag(this->x, this->y, this->z, level, LevelRenderer::CHUNK_FLAG_EMPTY0, currentLayer);
-            // ✅ NUEVO: Limpieza crítica. Si en esta reconstrucción el chunk quedó vacío,
-            // forzamos la liberación del buffer viejo en la GPU para evitar fugas.
             PlatformRenderer.CBuffClear(lists + currentLayer);
         }
         
         if ((currentLayer == 0) && (!renderNextLayer)) {
             levelRenderer->setGlobalChunkFlag(this->x, this->y, this->z, level, LevelRenderer::CHUNK_FLAG_EMPTY1);
-            // ✅ También limpiamos el buffer de la capa 1 si no se va a renderizar
             PlatformRenderer.CBuffClear(lists + 1);
             break;
         }
@@ -705,8 +720,8 @@ uint64_t Chunk::computeConnectivity(const uint8_t* tileIds) {
 
         uint8_t tileId = tileIds[offset + ((lx << 11) | (lz << 7) | indexY)];
 
-        if (tileId == 0) return true;      // air
-        if (tileId == 0xFF) return false;  // hidden tile (yeah)
+        if (tileId == 0) return true;
+        if (tileId == 0xFF) return false;
 
         Tile* t = Tile::tiles[tileId];
         return (t == nullptr) || !t->isSolidRender();
@@ -731,56 +746,13 @@ uint64_t Chunk::computeConnectivity(const uint8_t* tileIds) {
         queue.clear();
         int x0s, x1s, y0s, y1s, z0s, z1s;
         switch (entryFace) {
-            case 0:
-                x0s = W - 1;
-                x1s = W - 1;
-                y0s = 0;
-                y1s = H - 1;
-                z0s = 0;
-                z1s = W - 1;
-                break;  // +X
-            case 1:
-                x0s = 0;
-                x1s = 0;
-                y0s = 0;
-                y1s = H - 1;
-                z0s = 0;
-                z1s = W - 1;
-                break;  // -X
-            case 2:
-                x0s = 0;
-                x1s = W - 1;
-                y0s = H - 1;
-                y1s = H - 1;
-                z0s = 0;
-                z1s = W - 1;
-                break;  // +Y
-            case 3:
-                x0s = 0;
-                x1s = W - 1;
-                y0s = 0;
-                y1s = 0;
-                z0s = 0;
-                z1s = W - 1;
-                break;  // -Y
-            case 4:
-                x0s = 0;
-                x1s = W - 1;
-                y0s = 0;
-                y1s = H - 1;
-                z0s = W - 1;
-                z1s = W - 1;
-                break;  // +Z
-            case 5:
-                x0s = 0;
-                x1s = W - 1;
-                y0s = 0;
-                y1s = H - 1;
-                z0s = 0;
-                z1s = 0;
-                break;  // -Z
-            default:
-                continue;
+            case 0: x0s = W - 1; x1s = W - 1; y0s = 0; y1s = H - 1; z0s = 0; z1s = W - 1; break;
+            case 1: x0s = 0; x1s = 0; y0s = 0; y1s = H - 1; z0s = 0; z1s = W - 1; break;
+            case 2: x0s = 0; x1s = W - 1; y0s = H - 1; y1s = H - 1; z0s = 0; z1s = W - 1; break;
+            case 3: x0s = 0; x1s = W - 1; y0s = 0; y1s = 0; z0s = 0; z1s = W - 1; break;
+            case 4: x0s = 0; x1s = W - 1; y0s = 0; y1s = H - 1; z0s = W - 1; z1s = W - 1; break;
+            case 5: x0s = 0; x1s = W - 1; y0s = 0; y1s = H - 1; z0s = 0; z1s = 0; break;
+            default: continue;
         }
 
         for (int sy = y0s; sy <= y1s; sy++)
@@ -801,10 +773,7 @@ uint64_t Chunk::computeConnectivity(const uint8_t* tileIds) {
                 int ny = cur.y + FY[nb];
                 int nz = cur.z + FZ[nb];
 
-                // entry exit conn
-                if (nx < 0 || nx >= W || ny < 0 || ny >= H || nz < 0 ||
-                    nz >= W) {
-                    // nb IS the exit face because FX,FY,FZ are aligned
+                if (nx < 0 || nx >= W || ny < 0 || ny >= H || nz < 0 || nz >= W) {
                     result |= ((uint64_t)1 << (entryFace * 6 + nb));
                     continue;
                 }
@@ -824,7 +793,6 @@ uint64_t Chunk::computeConnectivity(const uint8_t* tileIds) {
 #endif
 
 void Chunk::reset() {
-    // El wrapper público se encarga del LOCK
     std::unique_lock<std::shared_mutex> lock(levelRenderer->m_csDirtyChunks);
     
     int oldKey = -1;
@@ -832,11 +800,8 @@ void Chunk::reset() {
 
     if (assigned) {
         oldKey = levelRenderer->getGlobalIndexForChunk(x, y, z, level);
-        
-        // Llamamos a la lógica interna que NO bloquea
         reset_Internal();
         
-        // El refCount se maneja aquí para decidir si retiramos entidades
         unsigned char refCount = levelRenderer->decGlobalChunkRefCount(x, y, z, level);
         if (refCount == 0 && oldKey != -1) {
             retireRenderableTileEntities = true;
@@ -855,8 +820,6 @@ void Chunk::reset() {
 }
 
 void Chunk::reset_Internal() {
-    // ESTA FUNCIÓN NO BLOQUEA NADA. 
-    // Se asume que quien la llama ya tiene el lock de m_csDirtyChunks.
     assigned = false;
 }
 
@@ -883,9 +846,7 @@ void Chunk::cull(Culler* culler) {
     }
 }
 
-void Chunk::renderBB() {
-    //	glCallList(lists + 2);	// 4J - removed - TODO put back in
-}
+void Chunk::renderBB() {}
 
 bool Chunk::isEmpty() {
     if (!levelRenderer->getGlobalChunkFlag(x, y, z, level,
@@ -896,8 +857,6 @@ bool Chunk::isEmpty() {
 }
 
 void Chunk::setDirty() {
-    // 4J - not used, but if this starts being used again then we'll need to
-    // investigate how best to handle it.
     assert(0);
     levelRenderer->setGlobalChunkFlag(x, y, z, level,
                                       LevelRenderer::CHUNK_FLAG_DIRTY);
