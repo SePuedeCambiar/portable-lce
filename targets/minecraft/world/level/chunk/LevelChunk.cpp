@@ -853,9 +853,10 @@ int LevelChunk::getTileLightBlock(int x, int y, int z) {
 }
 
 int LevelChunk::getTile(int x, int y, int z) {
-    CompressedTileStorage* blocks =
-        y >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT ? upperBlocks : lowerBlocks;
-    return blocks->get(x, y % Level::COMPRESSED_CHUNK_SECTION_HEIGHT, z);
+    if (y >= Level::COMPRESSED_CHUNK_SECTION_HEIGHT) {
+        return upperBlocks ? upperBlocks->get(x, y & 127, z) : 0;
+    }
+    return lowerBlocks ? lowerBlocks->get(x, y, z) : 0;
 }
 
 bool LevelChunk::setTileAndData(int x, int y, int z, int _tile, int _data) {
@@ -2304,19 +2305,16 @@ void LevelChunk::setBlockData(std::vector<uint8_t>& data) {
 
 // Sets data in passed in array of size 32768, from the block data in this chunk
 void LevelChunk::getBlockData(std::vector<uint8_t>& data) {
-    // 1. Aseguramos que el vector tenga el tamaño necesario (32768 * 2)
     if (data.size() < 65536) {
         data.resize(65536);
     }
 
-    // 2. Copiamos la parte inferior (0-127) desde el Shadow Buffer
     if (lowerBlocks) {
-        lowerBlocks->copyTo(data.data()); // .data() convierte el vector en puntero
+        lowerBlocks->copyTo(data.data());
     } else {
         memset(data.data(), 0, 32768);
     }
 
-    // 3. Copiamos la parte superior (128-255)
     if (upperBlocks) {
         upperBlocks->copyTo(data.data() + 32768);
     } else {
