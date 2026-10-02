@@ -1182,14 +1182,10 @@ void LevelChunk::removeEntity(std::shared_ptr<Entity> e, int yc) {
 
     {
         std::lock_guard<std::recursive_mutex> lock(m_csEntities);
-
-        // 4J - was entityBlocks[yc]->remove(e);
-        auto it = find(entityBlocks[yc]->begin(), entityBlocks[yc]->end(), e);
+        auto it = std::find(entityBlocks[yc]->begin(), entityBlocks[yc]->end(), e);
         if (it != entityBlocks[yc]->end()) {
             entityBlocks[yc]->erase(it);
-            // 4J - we don't want storage creeping up here as thinkgs move round
-            // the world accumulating up spare space
-            entityBlocks[yc]->shrink_to_fit();
+            // Eliminado shrink_to_fit(): Conservar la capacidad evita reasignaciones de heap continuas
         }
     }
 }
@@ -1518,27 +1514,23 @@ void LevelChunk::getEntities(std::shared_ptr<Entity> except, AABB* bb,
     if (yc0 < 0) yc0 = 0;
     if (yc1 >= ENTITY_BLOCKS_LENGTH) yc1 = ENTITY_BLOCKS_LENGTH - 1;
 
-    // AP - locking is expensive so enter once in
-    // Level::getEntities
     {
         std::lock_guard<std::recursive_mutex> lock(m_csEntities);
         for (int yc = yc0; yc <= yc1; yc++) {
-            std::vector<std::shared_ptr<Entity> >* entities = entityBlocks[yc];
+            const auto& entities = *entityBlocks[yc];
 
-            auto itEnd = entities->end();
-            for (auto it = entities->begin(); it != itEnd; it++) {
-                std::shared_ptr<Entity> e = *it;  // entities->at(i);
+            // CERO COPIAS ATÓMICAS: Iteración por referencia constante
+            for (const auto& e : entities) {
                 if (e != except && e->bb.intersects(*bb) &&
                     (selector == nullptr || selector->matches(e))) {
-                    es.push_back(e);
-                    std::vector<std::shared_ptr<Entity> >* subs =
-                        e->getSubEntities();
+                    es.push_back(e); // Solo incrementa si realmente intersecta
+                    
+                    std::vector<std::shared_ptr<Entity> >* subs = e->getSubEntities();
                     if (subs != nullptr) {
-                        for (int j = 0; j < subs->size(); j++) {
-                            e = subs->at(j);
-                            if (e != except && e->bb.intersects(*bb) &&
-                                (selector == nullptr || selector->matches(e))) {
-                                es.push_back(e);
+                        for (const auto& sub : *subs) {
+                            if (sub != except && sub->bb.intersects(*bb) &&
+                                (selector == nullptr || selector->matches(sub))) {
+                                es.push_back(sub);
                             }
                         }
                     }
@@ -1554,58 +1546,37 @@ void LevelChunk::getEntitiesOfClass(const std::type_info& ec, AABB* bb,
     int yc0 = Mth::floor((bb->y0 - 2) / 16);
     int yc1 = Mth::floor((bb->y1 + 2) / 16);
 
-    if (yc0 < 0) {
-        yc0 = 0;
-    } else if (yc0 >= ENTITY_BLOCKS_LENGTH) {
-        yc0 = ENTITY_BLOCKS_LENGTH - 1;
-    }
-    if (yc1 >= ENTITY_BLOCKS_LENGTH) {
-        yc1 = ENTITY_BLOCKS_LENGTH - 1;
-    } else if (yc1 < 0) {
-        yc1 = 0;
-    }
+    if (yc0 < 0) yc0 = 0;
+    else if (yc0 >= ENTITY_BLOCKS_LENGTH) yc0 = ENTITY_BLOCKS_LENGTH - 1;
+    if (yc1 >= ENTITY_BLOCKS_LENGTH) yc1 = ENTITY_BLOCKS_LENGTH - 1;
+    else if (yc1 < 0) yc1 = 0;
 
-    // AP - locking is expensive so enter once in
-    // Level::getEntitiesOfClass
     {
         std::lock_guard<std::recursive_mutex> lock(m_csEntities);
         for (int yc = yc0; yc <= yc1; yc++) {
-            std::vector<std::shared_ptr<Entity> >* entities = entityBlocks[yc];
+            const auto& entities = *entityBlocks[yc];
 
-            auto itEnd = entities->end();
-            for (auto it = entities->begin(); it != itEnd; it++) {
-                std::shared_ptr<Entity> e = *it;  // entities->at(i);
+            // CERO COPIAS ATÓMICAS EN EL FILTRO
+            for (const auto& e : entities) {
+                Entity* entity = e.get();
+                if (!entity) continue;
 
                 bool isAssignableFrom = false;
-                // Some special cases where the base class is a general type
-                // that our class may be derived from, otherwise do a direct
-                // comparison of type_info
-                if (ec == typeid(Player))
-                    isAssignableFrom = e->instanceof(eTYPE_PLAYER);
-                else if (ec == typeid(Entity))
-                    isAssignableFrom = e->instanceof(eTYPE_ENTITY);
-                else if (ec == typeid(Mob))
-                    isAssignableFrom = e->instanceof(eTYPE_MOB);
-                else if (ec == typeid(LivingEntity))
-                    isAssignableFrom = e->instanceof(eTYPE_LIVINGENTITY);
-                else if (ec == typeid(ItemEntity))
-                    isAssignableFrom = e->instanceof(eTYPE_ITEMENTITY);
-                else if (ec == typeid(Minecart))
-                    isAssignableFrom = e->instanceof(eTYPE_MINECART);
-                else if (ec == typeid(Monster))
-                    isAssignableFrom = e->instanceof(eTYPE_MONSTER);
-                else if (ec == typeid(Zombie))
-                    isAssignableFrom = e->instanceof(eTYPE_ZOMBIE);
-                else if (Entity* entity = e.get();
-                         entity != nullptr && ec == typeid(*entity))
-                    isAssignableFrom = true;
+                if (ec == typeid(Player))            isAssignableFrom = e->instanceof(eTYPE_PLAYER);
+                else if (ec == typeid(Entity))       isAssignableFrom = e->instanceof(eTYPE_ENTITY);
+                else if (ec == typeid(Mob))          isAssignableFrom = e->instanceof(eTYPE_MOB);
+                else if (ec == typeid(LivingEntity)) isAssignableFrom = e->instanceof(eTYPE_LIVINGENTITY);
+                else if (ec == typeid(ItemEntity))   isAssignableFrom = e->instanceof(eTYPE_ITEMENTITY);
+                else if (ec == typeid(Minecart))     isAssignableFrom = e->instanceof(eTYPE_MINECART);
+                else if (ec == typeid(Monster))      isAssignableFrom = e->instanceof(eTYPE_MONSTER);
+                else if (ec == typeid(Zombie))       isAssignableFrom = e->instanceof(eTYPE_ZOMBIE);
+                else if (ec == typeid(*entity))      isAssignableFrom = true;
+
                 if (isAssignableFrom && e->bb.intersects(*bb)) {
                     if (selector == nullptr || selector->matches(e)) {
                         es.push_back(e);
                     }
                 }
-                // 4J - note needs to be equivalent to
-                // baseClass.isAssignableFrom(e.getClass())
             }
         }
     }

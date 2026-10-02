@@ -1748,6 +1748,10 @@ std::vector<AABB>* Level::getCubes(std::shared_ptr<Entity> source, AABB* box,
                                    bool noEntities /* = false*/,
                                    bool blockAtEdge /* = false*/) {
     boxes.clear();
+    if (boxes.capacity() < 64) {
+        boxes.reserve(64);
+    }
+
     int x0 = Mth::floor(box->x0);
     int x1 = Mth::floor(box->x1 + 1);
     int y0 = Mth::floor(box->y0);
@@ -1757,29 +1761,43 @@ std::vector<AABB>* Level::getCubes(std::shared_ptr<Entity> source, AABB* box,
 
     int maxxz = (dimension->getXZSize() * 16) / 2;
     int minxz = -maxxz;
-    for (int x = x0; x < x1; x++)
+
+    for (int x = x0; x < x1; x++) {
         for (int z = z0; z < z1; z++) {
-            // 4J - If we are outside the map, return solid AABBs (rock is a bit
-            // of an arbitrary choice here, just need a correct AABB)
-            if (blockAtEdge &&
-                ((x < minxz) || (x >= maxxz) || (z < minxz) || (z >= maxxz))) {
+            if (blockAtEdge && ((x < minxz) || (x >= maxxz) || (z < minxz) || (z >= maxxz))) {
                 for (int y = y0 - 1; y < y1; y++) {
                     Tile::stone->addAABBs(this, x, y, z, box, &boxes, source);
                 }
             } else {
-                if (hasChunkAt(x, 64, z)) {
+                // OPTIMIZACIÓN: Obtener el chunk una sola vez por columna (X, Z)
+                int xc = x >> 4;
+                int zc = z >> 4;
+                int ix = xc + (chunkSourceXZSize / 2);
+                int iz = zc + (chunkSourceXZSize / 2);
+
+                LevelChunk* lc = nullptr;
+                if (ix >= 0 && ix < chunkSourceXZSize && iz >= 0 && iz < chunkSourceXZSize) {
+                    lc = chunkSourceCache[ix * chunkSourceXZSize + iz];
+                }
+                if (!lc) {
+                    lc = hasChunk(xc, zc) ? getChunk(xc, zc) : nullptr;
+                }
+
+                if (lc != nullptr && !lc->isEmpty()) {
+                    int lx = x & 15;
+                    int lz = z & 15;
                     for (int y = y0 - 1; y < y1; y++) {
-                        Tile* tile = Tile::tiles[getTile(x, y, z)];
-                        if (tile != nullptr) {
-                            tile->addAABBs(this, x, y, z, box, &boxes, source);
+                        if (y < minBuildHeight || y >= maxBuildHeight) continue;
+                        int tileId = lc->getTile(lx, y, lz);
+                        if (tileId > 0 && Tile::tiles[tileId] != nullptr) {
+                            Tile::tiles[tileId]->addAABBs(this, x, y, z, box, &boxes, source);
                         }
                     }
                 }
             }
         }
-    // 4J - also stop player falling out of the bottom of the map if blockAtEdge
-    // is true. Again, rock is an arbitrary choice here 4J Stu - Don't stop
-    // entities falling into the void while in The End (it has no bedrock)
+    }
+
     if (blockAtEdge && ((y0 - 1) < 0) && dimension->id != 1) {
         for (int y = y0 - 1; y < 0; y++) {
             for (int x = x0; x < x1; x++)
@@ -1788,8 +1806,7 @@ std::vector<AABB>* Level::getCubes(std::shared_ptr<Entity> source, AABB* box,
                 }
         }
     }
-    // 4J - final bounds check - limit vertical movement so we can't move above
-    // maxMovementHeight
+
     if (blockAtEdge && (y1 > maxMovementHeight)) {
         for (int y = maxMovementHeight; y < y1; y++) {
             for (int x = x0; x < x1; x++)
@@ -1798,32 +1815,27 @@ std::vector<AABB>* Level::getCubes(std::shared_ptr<Entity> source, AABB* box,
                 }
         }
     }
-    // 4J - now add in collision for any blocks which have actually been
-    // removed, but haven't had their render data updated to reflect this yet.
-    // This is to stop the player being able to move the view position inside a
-    // tile which is (visually) still there, and see out of the world. This is
-    // particularly a problem when moving upwards in creative mode as the player
-    // can get very close to the edge of tiles whilst looking upwards and can
-    // therefore very quickly move inside one.
-    Minecraft::GetInstance()->levelRenderer->destroyedTileManager->addAABBs(
-        this, box, &boxes);
 
-    // 4J - added
+    Minecraft::GetInstance()->levelRenderer->destroyedTileManager->addAABBs(this, box, &boxes);
+
     if (noEntities) return &boxes;
 
     double r = 0.25;
     AABB grown = box->grow(r, r, r);
     std::vector<std::shared_ptr<Entity> >* ee = getEntities(source, &grown);
-    std::vector<std::shared_ptr<Entity> >::iterator itEnd = ee->end();
-    for (auto it = ee->begin(); it != itEnd; it++) {
-        AABB* collideBox = (*it)->getCollideBox();
+    
+    // Cero copias atómicas al comprobar cajas de colisión de entidades
+    for (const auto& ent : *ee) {
+        AABB* collideBox = ent->getCollideBox();
         if (collideBox != nullptr && collideBox->intersects(*box)) {
             boxes.push_back(*collideBox);
         }
 
-        collideBox = source->getCollideAgainstBox(*it);
-        if (collideBox != nullptr && collideBox->intersects(*box)) {
-            boxes.push_back(*collideBox);
+        if (source != nullptr) {
+            collideBox = source->getCollideAgainstBox(ent);
+            if (collideBox != nullptr && collideBox->intersects(*box)) {
+                boxes.push_back(*collideBox);
+            }
         }
     }
 
@@ -2083,66 +2095,47 @@ void Level::forceAddTileTick(int x, int y, int z, int tileId, int tickDelay,
                              int prioTilt) {}
 
 void Level::tickEntities() {
-    std::vector<std::shared_ptr<Entity> >::iterator itGE =
-        globalEntities.begin();
+    // 1. Entidades globales
+    auto itGE = globalEntities.begin();
     while (itGE != globalEntities.end()) {
-        std::shared_ptr<Entity> e = *itGE;
+        const auto& e = *itGE;
         e->tickCount++;
         e->tick();
         if (e->removed) {
             itGE = globalEntities.erase(itGE);
         } else {
-            itGE++;
+            ++itGE;
         }
     }
 
-    {
-        std::lock_guard<std::recursive_mutex> lock(m_entitiesCS);
-
-        for (auto it = entities.begin(); it != entities.end();) {
-            bool found = false;
-            for (auto it2 = entitiesToRemove.begin();
-                 it2 != entitiesToRemove.end(); it2++) {
-                if ((*it) == (*it2)) {
-                    found = true;
-                    break;
+    // 2. Limpieza de entidades pendientes de remoción en una sola pasada O(N)
+    if (!entitiesToRemove.empty()) {
+        {
+            std::lock_guard<std::recursive_mutex> lock(m_entitiesCS);
+            for (const auto& e : entitiesToRemove) {
+                int xc = e->xChunk;
+                int zc = e->zChunk;
+                if (e->inChunk && hasChunk(xc, zc)) {
+                    getChunk(xc, zc)->removeEntity(e);
                 }
+                entityRemoved(e);
             }
-            if (found) {
-                it = entities.erase(it);
-            } else {
-                it++;
-            }
+
+            // Remoción compacta rápida en una sola pasada lineal
+            auto removePred = [this](const std::shared_ptr<Entity>& ent) {
+                return std::find(entitiesToRemove.begin(), entitiesToRemove.end(), ent) != entitiesToRemove.end();
+            };
+            entities.erase(std::remove_if(entities.begin(), entities.end(), removePred), entities.end());
         }
+        entitiesToRemove.clear();
     }
 
-    auto itETREnd = entitiesToRemove.end();
-    for (auto it = entitiesToRemove.begin(); it != itETREnd; it++) {
-        std::shared_ptr<Entity> e = *it;  // entitiesToRemove.at(j);
-        int xc = e->xChunk;
-        int zc = e->zChunk;
-        if (e->inChunk && hasChunk(xc, zc)) {
-            getChunk(xc, zc)->removeEntity(e);
-        }
-    }
-
-    itETREnd = entitiesToRemove.end();
-    for (auto it = entitiesToRemove.begin(); it != itETREnd; it++) {
-        entityRemoved(*it);
-    }
-    //
-    entitiesToRemove.clear();
-
-    // for (int i = 0; i < entities.size(); i++)
-
-    /* 4J Jev, using an iterator causes problems here as
-     * the vector is modified from inside this loop.
-     */
+    // 3. Ticking principal de entidades (Sin copias atómicas redundantes)
     {
         std::lock_guard<std::recursive_mutex> lock(m_entitiesCS);
 
         for (unsigned int i = 0; i < entities.size();) {
-            std::shared_ptr<Entity> e = entities.at(i);
+            const std::shared_ptr<Entity>& e = entities[i]; // REFERENCIA CONSTANTE: Cero atomic_fetch_add/sub
 
             if (e->riding != nullptr) {
                 if (e->riding->removed || e->riding->rider.lock() != e) {
@@ -2171,31 +2164,24 @@ void Level::tickEntities() {
                 if (e->inChunk && hasChunk(xc, zc)) {
                     getChunk(xc, zc)->removeEntity(e);
                 }
-                // entities.remove(i--);
-                // itE = entities.erase( itE );
 
-                // 4J Find the entity again before deleting, as things might
-                // have moved in the entity array eg from the explosion created
-                // by tnt
-                auto it = find(entities.begin(), entities.end(), e);
-                if (it != entities.end()) {
-                    entities.erase(it);
-                }
-
-                entityRemoved(e);
+                std::shared_ptr<Entity> removedEntity = e;
+                // Eliminación directa por índice 'i': Evita hacer find() en todo el vector
+                entities.erase(entities.begin() + i);
+                entityRemoved(removedEntity);
             } else {
                 i++;
             }
         }
     }
 
+    // 4. Ticking de TileEntities (Hornos, cofres, tolvas)
     {
         std::lock_guard<std::recursive_mutex> lock(m_tileEntityListCS);
 
         updatingTileEntities = true;
         for (auto it = tileEntityList.begin(); it != tileEntityList.end();) {
-            std::shared_ptr<TileEntity> te =
-                *it;  // tilevector<shared_ptr<Entity> >.at(i);
+            const auto& te = *it;
             if (!te->isRemoved() && te->hasLevel()) {
                 if (hasChunkAt(te->x, te->y, te->z)) {
 #if defined(_LARGE_WORLDS)
@@ -2209,45 +2195,31 @@ void Level::tickEntities() {
             }
 
             if (te->isRemoved()) {
-                it = tileEntityList.erase(it);
                 if (hasChunk(te->x >> 4, te->z >> 4)) {
                     LevelChunk* lc = getChunk(te->x >> 4, te->z >> 4);
                     if (lc != nullptr)
                         lc->removeTileEntity(te->x & 15, te->y, te->z & 15);
                 }
+                it = tileEntityList.erase(it);
             } else {
                 it++;
             }
         }
         updatingTileEntities = false;
 
-        // 4J-PB - Stuart  - check this is correct here
-
         if (!tileEntitiesToUnload.empty()) {
             FRAME_PROFILE_SCOPE(TileEntityUnloadCleanup);
-
-            for (auto it = tileEntityList.begin();
-                 it != tileEntityList.end();) {
-                if (tileEntitiesToUnload.find(*it) !=
-                    tileEntitiesToUnload.end()) {
-                    if (isClientSide) {
-                        assert(0);
-                    }
-                    it = tileEntityList.erase(it);
-                } else {
-                    it++;
-                }
-            }
+            auto unloadPred = [this](const std::shared_ptr<TileEntity>& te) {
+                return tileEntitiesToUnload.find(te) != tileEntitiesToUnload.end();
+            };
+            tileEntityList.erase(std::remove_if(tileEntityList.begin(), tileEntityList.end(), unloadPred), tileEntityList.end());
             tileEntitiesToUnload.clear();
         }
 
         if (!pendingTileEntities.empty()) {
-            for (auto it = pendingTileEntities.begin();
-                 it != pendingTileEntities.end(); it++) {
-                std::shared_ptr<TileEntity> e = *it;
+            for (const auto& e : pendingTileEntities) {
                 if (!e->isRemoved()) {
-                    if (find(tileEntityList.begin(), tileEntityList.end(), e) ==
-                        tileEntityList.end()) {
+                    if (std::find(tileEntityList.begin(), tileEntityList.end(), e) == tileEntityList.end()) {
                         tileEntityList.push_back(e);
                     }
                     if (hasChunk(e->x >> 4, e->z >> 4)) {
@@ -3451,18 +3423,18 @@ std::vector<std::shared_ptr<Entity> >* Level::getEntitiesOfClass(
 
 std::shared_ptr<Entity> Level::getClosestEntityOfClass(
     const std::type_info& baseClass, AABB* bb, std::shared_ptr<Entity> source) {
-    std::vector<std::shared_ptr<Entity> >* entities =
-        getEntitiesOfClass(baseClass, bb);
+    std::vector<std::shared_ptr<Entity> >* entities = getEntitiesOfClass(baseClass, bb);
     std::shared_ptr<Entity> closest = nullptr;
     double closestDistSqr = std::numeric_limits<double>::max();
-    // for (Entity entity : entities)
-    for (auto it = entities->begin(); it != entities->end(); ++it) {
-        std::shared_ptr<Entity> entity = *it;
+
+    // Cero copias atómicas en el escaneo de IA
+    for (const auto& entity : *entities) {
         if (entity == source) continue;
         double distSqr = source->distanceToSqr(entity);
-        if (distSqr > closestDistSqr) continue;
-        closest = entity;
-        closestDistSqr = distSqr;
+        if (distSqr < closestDistSqr) {
+            closest = entity;
+            closestDistSqr = distSqr;
+        }
     }
     delete entities;
     return closest;
