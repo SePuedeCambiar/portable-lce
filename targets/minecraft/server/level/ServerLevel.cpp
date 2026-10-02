@@ -443,80 +443,54 @@ void ServerLevel::validateSpawn() {
 // never seemed to creep up much beyond this in normal play anyway, and we need
 // some finite limit).
 void ServerLevel::tickTiles() {
-    // Index into the arrays used by the update thread
     int iLev = 0;
-    if (dimension->id == -1) {
-        iLev = 1;
-    } else if (dimension->id == 1) {
-        iLev = 2;
-    }
+    if (dimension->id == -1)      iLev = 1;
+    else if (dimension->id == 1) iLev = 2;
     chunksToPoll.clear();
-
-    unsigned int tickCount = 0;
 
     {
         std::lock_guard<std::recursive_mutex> lock(m_updateCS[iLev]);
-        // This section processes the tiles that need to be ticked, which we
-        // worked out in the previous tick (or haven't yet, if this is the first
-        // frame)
-        /*int grassTicks = 0;
-        int lavaTicks = 0;
-        int otherTicks = 0;*/
         for (int i = 0; i < m_updateTileCount[iLev]; i++) {
             int x = m_updateTileX[iLev][i];
             int y = m_updateTileY[iLev][i];
             int z = m_updateTileZ[iLev][i];
-            if (hasChunkAt(x, y, z)) {
-                int id = getTile(x, y, z);
-                if (Tile::tiles[id] != nullptr &&
-                    Tile::tiles[id]->isTicking()) {
-                    /*if(id == 2) ++grassTicks;
-                    else if(id == 11) ++lavaTicks;
-                    else ++otherTicks;*/
+            
+            // Acceso directo a la caché rápida de chunks
+            int xc = x >> 4;
+            int zc = z >> 4;
+            int ix = xc + (chunkSourceXZSize / 2);
+            int iz = zc + (chunkSourceXZSize / 2);
+
+            LevelChunk* lc = nullptr;
+            if (ix >= 0 && ix < chunkSourceXZSize && iz >= 0 && iz < chunkSourceXZSize) {
+                lc = chunkSourceCache[ix * chunkSourceXZSize + iz];
+            }
+            if (!lc && hasChunk(xc, zc)) {
+                lc = getChunk(xc, zc);
+            }
+
+            if (lc != nullptr && !lc->isEmpty()) {
+                int id = lc->getTile(x & 15, y, z & 15);
+                if (id > 0 && Tile::tiles[id] != nullptr && Tile::tiles[id]->isTicking()) {
                     Tile::tiles[id]->tick(this, x, y, z, random);
                 }
             }
         }
-        // printf("Total ticks - Grass: %d, Lava: %d, Other: %d, Total: %d\n",
-        // grassTicks, lavaTicks, otherTicks, grassTicks + lavaTicks +
-        // otherTicks);
         m_updateTileCount[iLev] = 0;
         m_updateChunkCount[iLev] = 0;
     }
 
     Level::tickTiles();
 
-    // AP moved this outside of the loop
     int prob = 100000;
     if (gameServices().debugGetMask() & (1L << eDebugSetting_RegularLightning))
         prob = 100;
 
-    auto itEndCtp = chunksToPoll.end();
-    for (auto it = chunksToPoll.begin(); it != itEndCtp; it++) {
-        ChunkPos cp = *it;
+    for (const auto& cp : chunksToPoll) {
         int xo = cp.x * 16;
         int zo = cp.z * 16;
 
-        // 4J added - don't let this actually load/create any chunks, we'll let
-        // the normal updateDirtyChunks etc. processes do that, so it can happen
-        // on another thread
         if (!this->hasChunk(cp.x, cp.z)) continue;
-
-        // 4J Stu - When adding a 5th player to the game, the number of
-        // chunksToPoll is greater than the size of the m_updateChunkX &
-        // m_updateChunkZ arrays (19*19*4 at time of writing). It doesn't seem
-        // like there should ever be that many chunks needing polled, so this
-        // needs looked at in more detail. For now I have enlarged the size of
-        // the array to 19*19*8 but this seems way to big for our needs.
-
-        // The cause of this is largely because the chunksToPoll vector does not
-        // enforce unique elements The java version used a HashSet which would,
-        // although if our world size gets a lot larger then we may have no
-        // overlaps of players surrounding chunks
-        // assert(false);
-
-        // If you hit this assert, then a memory overwrite will occur when you
-        // continue
         assert(m_updateChunkCount[iLev] < LEVEL_CHUNKS_TO_UPDATE_MAX);
 
         m_updateChunkX[iLev][m_updateChunkCount[iLev]] = cp.x;
@@ -533,12 +507,10 @@ void ServerLevel::tickTiles() {
             int y = getTopRainBlock(x, z);
 
             if (isRainingAt(x, y, z)) {
-                addGlobalEntity(std::shared_ptr<LightningBolt>(
-                    new LightningBolt(this, x, y, z)));
+                addGlobalEntity(std::make_shared<LightningBolt>(this, x, y, z));
             }
         }
 
-        // 4J - changes here brought forrward from 1.2.3
         if (random->nextInt(16) == 0) {
             randValue = randValue * 3 + addend;
             int val = (randValue >> 2);
@@ -553,24 +525,20 @@ void ServerLevel::tickTiles() {
             }
             if (isRaining()) {
                 Biome* b = getBiome(x + xo, z + zo);
-                if (b->hasRain()) {
+                if (b && b->hasRain()) {
                     int tile = getTile(x + xo, yy - 1, z + zo);
-                    if (tile != 0) {
-                        Tile::tiles[tile]->handleRain(this, x + xo, yy - 1,
-                                                      z + zo);
+                    if (tile != 0 && Tile::tiles[tile] != nullptr) {
+                        Tile::tiles[tile]->handleRain(this, x + xo, yy - 1, z + zo);
                     }
                 }
             }
         }
 
-        // 4J - lighting change brought forward from 1.8.2
-        checkLight(xo + random->nextInt(16), random->nextInt(128),
-                   zo + random->nextInt(16));
+        checkLight(xo + random->nextInt(16), random->nextInt(128), zo + random->nextInt(16));
     }
 
     m_level[iLev] = this;
     m_randValue[iLev] = randValue;
-    // We've set up everything that the udpate thread needs, so kick it off
     m_updateTrigger->set(iLev);
 }
 
@@ -652,33 +620,25 @@ void ServerLevel::resetEmptyTime() { emptyTime = 0; }
 
 bool ServerLevel::tickPendingTicks(bool force) {
     std::lock_guard<std::recursive_mutex> lock(m_tickNextTickCS);
-    int count = (int)tickNextTickList.size();
-    int count2 = (int)tickNextTickSet.size();
-    if (count != tickNextTickSet.size()) {
-        // TODO 4J Stu - Add new exception types
-        // throw new IllegalStateException("TickNextTick list out of synch");
-    }
+    int count = static_cast<int>(tickNextTickList.size());
     if (count > MAX_TICK_TILES_PER_TICK) count = MAX_TICK_TILES_PER_TICK;
 
     auto itTickList = tickNextTickList.begin();
     for (int i = 0; i < count; i++) {
-        TickNextTickData td = *(itTickList);
+        const TickNextTickData& td = *itTickList;
         if (!force && td.m_delay > levelData->getGameTime()) {
             break;
         }
 
-        itTickList = tickNextTickList.erase(itTickList);
-        tickNextTickSet.erase(td);
         toBeTicked.push_back(td);
+        tickNextTickSet.erase(td);
+        itTickList = tickNextTickList.erase(itTickList);
     }
 
-    for (auto it = toBeTicked.begin(); it != toBeTicked.end();) {
-        TickNextTickData td = *it;
-        it = toBeTicked.erase(it);
-
+    // CERO DESPLAZAMIENTOS DE MEMORIA: Iteración lineal O(N) sin erase(begin())
+    for (const auto& td : toBeTicked) {
         int r = 0;
-        if (hasChunksAt(td.x - r, td.y - r, td.z - r, td.x + r, td.y + r,
-                        td.z + r)) {
+        if (hasChunksAt(td.x - r, td.y - r, td.z - r, td.x + r, td.y + r, td.z + r)) {
             int id = getTile(td.x, td.y, td.z);
             if (id > 0 && Tile::isMatching(id, td.tileId)) {
                 Tile::tiles[id]->tick(this, td.x, td.y, td.z, random);
@@ -690,12 +650,7 @@ bool ServerLevel::tickPendingTicks(bool force) {
 
     toBeTicked.clear();
 
-    int count3 = (int)tickNextTickList.size();
-    int count4 = (int)tickNextTickSet.size();
-
-    bool retval = tickNextTickList.size() != 0;
-
-    return retval;
+    return !tickNextTickList.empty();
 }
 
 std::vector<TickNextTickData>* ServerLevel::fetchTicksInChunk(LevelChunk* chunk,
@@ -1227,14 +1182,20 @@ void ServerLevel::queueSendTileUpdate(int x, int y, int z) {
 }
 
 void ServerLevel::runQueuedSendTileUpdates() {
-    std::lock_guard<std::recursive_mutex> lock(m_csQueueSendTileUpdates);
-    for (auto it = m_queuedSendTileUpdates.begin();
-         it != m_queuedSendTileUpdates.end(); ++it) {
-        Pos* p = *it;
-        sendTileUpdated(p->x, p->y, p->z);
-        delete p;
+    std::vector<Pos*> toProcess;
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_csQueueSendTileUpdates);
+        if (m_queuedSendTileUpdates.empty()) return;
+        toProcess.swap(m_queuedSendTileUpdates); // Vaciado instantáneo bajo el mutex
     }
-    m_queuedSendTileUpdates.clear();
+
+    // Procesar y liberar fuera del cerrojo de red
+    for (Pos* p : toProcess) {
+        if (p) {
+            sendTileUpdated(p->x, p->y, p->z);
+            delete p;
+        }
+    }
 }
 
 // 4J - added special versions of addEntity and extra processing on entity

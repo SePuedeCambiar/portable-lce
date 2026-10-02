@@ -99,10 +99,12 @@ static const char* FRAG_SRC =
 static SDL_Window* s_window = nullptr;
 static SDL_GLContext s_glContext = nullptr;
 static bool s_shouldClose = false;
-static int s_windowWidth = 1920;
-static int s_windowHeight = 1080;
-static int s_reqWidth = 1920;
-static int s_reqHeight = 1080;
+
+static int s_windowWidth = 1280;
+
+static int s_windowHeight = 720;
+static int s_reqWidth = 0;
+static int s_reqHeight = 0;
 static bool s_fullscreen = false;
 static thread_local SDL_GLContext s_glCtx = nullptr;
 static const int MAX_SHARED_CTXS = 6;
@@ -624,14 +626,36 @@ void GLRenderer::Initialise() {
         fprintf(stderr, "[4J_Render] SDL_Init: %s\n", SDL_GetError());
         return;
     }
+
+    // 1. OBTENCIÓN DE LA RESOLUCIÓN NATIVA REAL DE LA PANTALLA
     SDL_DisplayMode dm;
+    int desktopW = 1280;
+    int desktopH = 720;
+    if (SDL_GetDesktopDisplayMode(0, &dm) == 0) {
+        desktopW = dm.w;
+        desktopH = dm.h;
+    }
+
+    // 2. CÁLCULO INTELIGENTE DE RESOLUCIÓN
     if (s_reqWidth > 0 && s_reqHeight > 0) {
         s_windowWidth = s_reqWidth;
         s_windowHeight = s_reqHeight;
-    } else if (SDL_GetCurrentDisplayMode(0, &dm) == 0) {
-        s_windowWidth = (int)(dm.w * 0.4f);
-        s_windowHeight = (int)(dm.h * 0.4f);
+    } else if (s_fullscreen) {
+        // Pantalla completa: Usar el 100% nativo del monitor (ej. 1366x768)
+        s_windowWidth = desktopW;
+        s_windowHeight = desktopH;
+    } else {
+        // Modo ventana: Si la pantalla es de 1366x768 o similar, ajustar al 88%
+        // para que quepa perfectamente con los bordes y barra de tareas
+        if (desktopW <= 1366 || desktopH <= 768) {
+            s_windowWidth = (int)(desktopW * 0.88f);
+            s_windowHeight = (int)(desktopH * 0.88f);
+        } else {
+            s_windowWidth = 1280;
+            s_windowHeight = 720;
+        }
     }
+
 #ifdef GLES
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
@@ -644,8 +668,10 @@ void GLRenderer::Initialise() {
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    Uint32 wf = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE;
+
+    Uint32 wf = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
     if (s_fullscreen) wf |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+
     s_window = SDL_CreateWindow("Minecraft Console Edition",
                                 SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                 s_windowWidth, s_windowHeight, wf);
@@ -653,6 +679,7 @@ void GLRenderer::Initialise() {
         fprintf(stderr, "[4J_Render] Window: %s\n", SDL_GetError());
         return;
     }
+
     s_glContext = SDL_GL_CreateContext(s_window);
     if (!s_glContext) {
         fprintf(stderr, "[4J_Render] Context: %s\n", SDL_GetError());
@@ -661,9 +688,12 @@ void GLRenderer::Initialise() {
 #ifndef GLES
     gl3_load();
 #endif
+
+    // Píxeles reales del Framebuffer (garantiza nitidez nativa 1:1)
     int fw, fh;
-    SDL_GetWindowSize(s_window, &fw, &fh);
+    SDL_GL_GetDrawableSize(s_window, &fw, &fh);
     onFramebufferResize(fw, fh);
+
     glShadowSetDepthTest(true);
     ::glDepthFunc(GL_LEQUAL);
 #ifdef GLES
@@ -680,7 +710,6 @@ void GLRenderer::Initialise() {
     s_shader.build(VERT_SRC, FRAG_SRC);
     initStreamingVAOs();
 
-    // Generación del EBO global pre-calculado
     std::vector<GLuint> indices;
     indices.reserve((MAX_GLOBAL_VERTICES / 4) * 6);
     for (int i = 0; i < MAX_GLOBAL_VERTICES / 4; ++i) {
@@ -755,15 +784,17 @@ void GLRenderer::StartFrame() {
     Set_matrixDirty();
     s_currentBoundVAO = 0;
     s_currentGreedyMode = -1;
+    
+    // Leer el tamaño real de los píxeles de la GPU
     int w, h;
-    SDL_GetWindowSize(s_window, &w, &h);
+    SDL_GL_GetDrawableSize(s_window, &w, &h);
     s_windowWidth = w > 0 ? w : 1;
     s_windowHeight = h > 0 ? h : 1;
     glViewport(0, 0, s_windowWidth, s_windowHeight);
 }
 
 void GLRenderer::Present() {
-    // 1. Limpieza diferida sin bloquear el hilo de dibujo
+    // 1. Limpieza diferida de VBOs/VAOs sin bloquear el hilo de dibujo
     std::vector<ChunkBuffer> toDestroy;
     {
         std::lock_guard<std::mutex> lk_del(s_destructionMtx);
@@ -776,24 +807,34 @@ void GLRenderer::Present() {
         cb.destroy();
     }
 
-    // 2. Eventos SDL
+    // 2. Procesamiento de Eventos SDL y Cambio Dinámico de Resolución
     if (!s_window) return;
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT || ev.window.event == SDL_WINDOWEVENT_CLOSE)
+        if (ev.type == SDL_QUIT || ev.window.event == SDL_WINDOWEVENT_CLOSE) {
             s_shouldClose = true;
-        else if (ev.window.event == SDL_WINDOWEVENT_RESIZED)
-            onFramebufferResize(ev.window.data1, ev.window.data2);
+        } else if (ev.type == SDL_WINDOWEVENT &&
+                  (ev.window.event == SDL_WINDOWEVENT_RESIZED ||
+                   ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
+                   ev.window.event == SDL_WINDOWEVENT_MAXIMIZED ||
+                   ev.window.event == SDL_WINDOWEVENT_RESTORED)) {
+            // Lee los píxeles reales del framebuffer (1366x768 nativo o cualquier monitor)
+            int dw, dh;
+            SDL_GL_GetDrawableSize(s_window, &dw, &dh);
+            onFramebufferResize(dw, dh);
+        }
     }
 
-    // 3. Diagnóstico ligero
+    // 3. Diagnóstico (lo dejamos comentado para mantener la consola limpia)
+    /*
     static int frameCounter = 0;
     if (++frameCounter % 120 == 0) {
         printf("GPU Resources -> VBOs: %d | VAOs: %d | Texs: %d | Pool: %zu\n",
                g_vboCount.load(), g_vaoCount.load(), g_texCount.load(), s_chunkPool.size());
     }
+    */
 
-    // 4. Presentar a pantalla
+    // 4. Presentar a pantalla (Swap Buffers)
     SDL_GL_SwapWindow(s_window);
 }
 

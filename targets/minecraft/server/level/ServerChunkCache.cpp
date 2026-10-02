@@ -767,84 +767,61 @@ bool ServerChunkCache::save(bool force, ProgressListener* progressListener) {
 bool ServerChunkCache::tick() {
     if (!level->noSave) {
 #if defined(_LARGE_WORLDS)
-        // --- 1. GESTIÓN de PRESUPUESTO DE RAM ---
-        bool forceUnload = false;
-        // Si superamos el límite de chunks cargados, forzamos la limpieza 
-        // sin importar la distancia (excepto si el jugador está dentro)
-        if (m_loadedChunkList.size() > 256) { 
-            forceUnload = true;
-        }
+        // 1. Presupuesto amplio para arquitecturas modernas (1024 chunks = ~32 MB de RAM)
+        // Evita el ciclo destructivo de descargar y volver a cargar chunks continuamente
+        bool forceUnload = (m_loadedChunkList.size() > 1024);
 
-        for (int i = 0; i < 100; i++) {
-            if (!m_toDrop.empty()) {
-                LevelChunk* chunk = m_toDrop.front();
-                
-                if (chunk == nullptr) { 
-                    m_toDrop.pop_front(); 
-                    continue; 
+        // Limitamos a un máximo de 8 chunks por tick para que las escrituras a disco no congelen el framerate
+        int processedDrops = 0;
+        const int MAX_DROPS_PER_TICK = 8;
+
+        while (!m_toDrop.empty() && processedDrops < MAX_DROPS_PER_TICK) {
+            LevelChunk* chunk = m_toDrop.front();
+            m_toDrop.pop_front();
+
+            if (chunk == nullptr) continue;
+
+            // NUNCA descargar si un jugador está dentro del chunk
+            if (chunk->containsPlayer()) continue;
+
+            if (Minecraft::GetInstance()->player == nullptr) break;
+
+            Entity* playerEnt = reinterpret_cast<Entity*>(Minecraft::GetInstance()->player.get());
+            float playerX = playerEnt->x / 16.0f;
+            float playerZ = playerEnt->z / 16.0f;
+            float distSq = (chunk->x - playerX) * (chunk->x - playerX) +
+                           (chunk->z - playerZ) * (chunk->z - playerZ);
+
+            // Radio de seguridad (24 chunks de distancia al cuadrado = 576)
+            const float SAFE_ZONE_SQ = 24.0f * 24.0f;
+
+            // Solo descargar si el jugador se alejó de verdad o si se superó el límite de 1024 chunks
+            if (distSq > SAFE_ZONE_SQ || forceUnload) {
+                processedDrops++;
+
+                // A. Limpieza de buffers en GPU
+                if (Minecraft::GetInstance()->levelRenderer != nullptr) {
+                    Minecraft::GetInstance()->levelRenderer->unloadRenderChunk(chunk->x, chunk->z, level->dimension->id);
                 }
-                
-                // NUNCA borramos un chunk si el jugador está dentro (Evita crashes críticos)
-                if (chunk->containsPlayer()) { 
-                    m_toDrop.pop_front(); 
-                    continue; 
+
+                // B. Guardado y descarga lógica
+                save(chunk);
+                saveEntities(chunk);
+                chunk->unload(true);
+
+                // C. Remoción instantánea O(1) con Swap-and-Pop
+                auto it = std::find(m_loadedChunkList.begin(), m_loadedChunkList.end(), chunk);
+                if (it != m_loadedChunkList.end()) {
+                    *it = m_loadedChunkList.back();
+                    m_loadedChunkList.pop_back();
                 }
 
-                if (Minecraft::GetInstance()->player == nullptr) break;
-
-                // Cálculo de distancia al jugador
-                Entity* playerEnt = reinterpret_cast<Entity*>(Minecraft::GetInstance()->player.get());
-                float playerX = playerEnt->x / 16.0f;
-                float playerZ = playerEnt->z / 16.0f;
-                float distSq = (chunk->x - playerX) * (chunk->x - playerX) +
-                               (chunk->z - playerZ) * (chunk->z - playerZ);
-
-                // Radios de seguridad
-                const float SAFE_ZONE_SQ = 24.0f * 24.0f; 
-
-                // LÓGICA DE DESCARGA:
-                // Descargamos si el chunk está fuera de la Safe Zone O si hemos superado el presupuesto de RAM
-                if (distSq > SAFE_ZONE_SQ || forceUnload) {
-                    
-                    // A. LIMPIEZA DE GPU Y UI (Evita la fuga de RAM de Intel HD)
-                    if (Minecraft::GetInstance()->levelRenderer != nullptr) {
-                        // Libera los buffers de vértices del mundo
-                        Minecraft::GetInstance()->levelRenderer->unloadRenderChunk(chunk->x, chunk->z, level->dimension->id);
-                        
-                        // Obliga a Iggy a vaciar su cache de texturas/buffers (Detiene la subida al 95% de RAM)
-                        //Minecraft::GetInstance()->levelRenderer->flushIggyCache();
-                        
-                    }
-
-                    // B. GUARDADO Y DESCARGA LÓGICA
-                    save(chunk);
-                    saveEntities(chunk);
-                    chunk->unload(true);
-
-                    // Quitar de la lista de chunks activos
-                    auto it = find(m_loadedChunkList.begin(), m_loadedChunkList.end(), chunk);
-                    if (it != m_loadedChunkList.end()) m_loadedChunkList.erase(it);
-
-                    // C. GESTIÓN DEL CACHE DE HIBERNACIÓN
-                    int idx = (chunk->x + XZOFFSET) * XZSIZE + (chunk->z + XZOFFSET);
-                    if (m_unloadedCache[idx] != nullptr) {
-                        // Marcamos la hibernación como descargada para liberar memoria interna
-                        m_unloadedCache[idx]->unload(true);
-                    }
-                    
-                    // Quitamos el chunk del mapa activo para que el renderizador deje de dibujarlo
-                    cache[idx] = nullptr;
-
-                    // NOTA: NO hacemos 'delete chunk' aquí para evitar el SIGNAL 11.
-                    // El objeto se gestiona a través de los punteros de hibernación o el sistema de memoria.
-                    
-                    m_toDrop.pop_front();
-                } else {
-                    // El chunk está en la Safe Zone, lo mantenemos vivo y visible
-                    m_toDrop.pop_front();
+                // D. Limpiar del caché activo
+                int idx = (chunk->x + XZOFFSET) * XZSIZE + (chunk->z + XZOFFSET);
+                if (m_unloadedCache[idx] != nullptr) {
+                    m_unloadedCache[idx]->unload(true);
                 }
-            } else {
-                break;
+                cache[idx] = nullptr;
             }
         }
 #endif
