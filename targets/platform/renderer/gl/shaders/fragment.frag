@@ -8,7 +8,7 @@ uniform float uAlphaRef;
 uniform vec4  uFogColor;
 uniform int   uFogEnable;
 uniform float uInvGamma;
-uniform vec2  uCellSize;   // Debe ser (256, 256) en tu caso
+uniform vec2  uCellSize;
 
 in  vec2  vUV0;
 in  vec2  vUV1;
@@ -29,11 +29,8 @@ void main() {
     if (packU > 0.0 && packV > 0.0) {
         vec2 offset = vec2((packU - 1.0) / 1024.0, (packV - 1.0) / 1024.0);
         
-        // Tamaño de celda para atlas 16×32
-        vec2 uvCellSize = vec2(1.0 / 16.0, 1.0 / 32.0);
-        if (uCellSize.x > 0.0) {
-            uvCellSize = vec2(16.0 / uCellSize.x, 32.0 / uCellSize.y);
-        }
+        // Tamaño de celda en espacio UV
+        vec2 uvCellSize = (uCellSize.x > 0.0) ? uCellSize : vec2(1.0 / 16.0, 1.0 / 32.0);
         
         vec2 localUV = actualUV - offset;
         vec2 fracUV = fract(localUV / uvCellSize);
