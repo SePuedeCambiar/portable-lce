@@ -18,8 +18,12 @@ bool Tesselator::USE_VBO = false;
 thread_local std::unique_ptr<Tesselator> Tesselator::m_tlsInstance;
 
 Tesselator* Tesselator::getInstance() { 
+    if (!m_tlsInstance) {
+        CreateNewThreadStorage(2 * 1024 * 1024);
+    }
     return m_tlsInstance.get(); 
 }
+
 
 void Tesselator::CreateNewThreadStorage(int bytes) {
     Tesselator::m_tlsInstance = std::unique_ptr<Tesselator>(new Tesselator(bytes / 4));
@@ -93,8 +97,10 @@ void Tesselator::end() {
             unsigned int* pColData = (unsigned int*)_array.data();
             pColData += 5;
             for (int i = 0; i < vertices; i++) {
-                *pColData = 0x00000000;
-                pColData += 8;
+                if ((size_t)(i * 8 + 5) < _array.size()) {
+                    *pColData = 0x00000000;
+                    pColData += 8;
+                }
             }
         }
 
@@ -199,6 +205,14 @@ void Tesselator::color(std::uint8_t r, std::uint8_t g, std::uint8_t b) {
 void Tesselator::vertexUV(float x, float y, float z, float u, float v) {
     count++;
     float uu = mipmapEnable ? u : (u + 1.0f);
+
+    // --- PROTECCIÓN CONTRA DESBORDAMIENTO (Auto-crecimiento de RAM) ---
+    if (p + 16 >= (int)_array.size()) {
+        size_t newSize = std::max((size_t)_array.size() * 2, (size_t)p + 64);
+        _array.resize(newSize);
+        this->size = (int)newSize;
+    }
+    // ------------------------------------------------------------------
 
     if (useCompactFormat360) {
         // --- FORMATO COMPACTO DE 16 BYTES (Estilo Sodium / Xbox 360) ---

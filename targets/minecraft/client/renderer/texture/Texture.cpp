@@ -78,6 +78,7 @@ void Texture::_init(const std::string& name, int mode, int width, int height,
         glId = glGenTextures();
 
         glBindTexture(type, glId);
+        PlatformRenderer.TextureBind(glId);
         glTexParameteri(type, GL_TEXTURE_MIN_FILTER, minFilter);
         glTexParameteri(type, GL_TEXTURE_MAG_FILTER, magFilter);
         glTexParameteri(type, GL_TEXTURE_WRAP_S, wrapMode);
@@ -548,6 +549,8 @@ void Texture::bind(int mipMapIndex) {
 
     glActiveTexture(GL_TEXTURE0 + mipMapIndex);
     glBindTexture(type, glId);
+    PlatformRenderer.TextureBind(glId); // <--- AGREGAR ESTA LÍNEA
+    PlatformRenderer.StateSetTextureEnable(true); // <--- AGREGAR ESTA LÍNEA
     if (!updated) {
         updateOnGPU();
     }
