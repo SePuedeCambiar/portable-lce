@@ -20,10 +20,11 @@ void main() {
         texColor = texture(uTexture, inUV);
     }
 
-    if (texColor.a < 0.1) {
+    if (texColor.a < 0.05) {
         discard;
     }
 
-    vec4 vertColor = (inColor == vec4(0.0)) ? vec4(1.0) : inColor;
+    // Swizzle .abgr nativo de Minecraft / Little Endian
+    vec4 vertColor = (inColor == vec4(0.0)) ? vec4(1.0) : inColor.abgr;
     outColor = texColor * vertColor * pc.uBaseColor;
 }

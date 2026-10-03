@@ -18,8 +18,6 @@ void main() {
     vec4 worldPos = vec4(inPos + pc.uChunkOffset, 1.0);
     gl_Position = pc.uMVP * worldPos;
 
-    gl_Position = pc.uMVP * worldPos; // Sin el '-gl_Position.y'
-
     outUV = inUV;
     outColor = inColor;
 }

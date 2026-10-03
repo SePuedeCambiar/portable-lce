@@ -25,6 +25,14 @@ IPlatformRenderer& PlatformRenderer_get() {
 }
 #endif
 
+// Matriz de corrección de profundidad para Vulkan (OpenGL [-1,1] -> Vulkan [0,1])
+static const glm::mat4 s_vkClipCorrection = glm::mat4(
+    1.0f,  0.0f, 0.0f, 0.0f,
+    0.0f,  1.0f, 0.0f, 0.0f,
+    0.0f,  0.0f, 0.5f, 0.0f,
+    0.0f,  0.0f, 0.5f, 1.0f
+);
+
 struct PushConstants {
     glm::mat4 uMVP;
     glm::vec4 uBaseColor;
@@ -171,8 +179,7 @@ static SwapChainSupportDetails querySwapChainSupport(VkPhysicalDevice device, Vk
 }
 
 static VkShaderModule createShaderModule(VkDevice device, const uint32_t* code, size_t sizeBytes) {
-    VkShaderModuleCreateInfo createInfo{};
-    createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    VkShaderModuleCreateInfo createInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     createInfo.codeSize = sizeBytes;
     createInfo.pCode = code;
 
@@ -212,6 +219,12 @@ void VKRenderer::endSingleTimeCommands(VkCommandBuffer commandBuffer) {
 
 void VKRenderer::Initialise() {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) return;
+
+    SDL_DisplayMode dm;
+    if (SDL_GetDesktopDisplayMode(0, &dm) == 0) {
+        m_windowWidth = dm.w;
+        m_windowHeight = dm.h;
+    }
 
     Uint32 windowFlags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_SHOWN;
     m_window = SDL_CreateWindow("Minecraft Console Edition (Vulkan Backend)",
@@ -314,6 +327,8 @@ void VKRenderer::Initialise() {
 
     int w, h;
     SDL_Vulkan_GetDrawableSize(m_window, &w, &h);
+    m_windowWidth = w;
+    m_windowHeight = h;
     m_swapchainExtent = { static_cast<uint32_t>(w), static_cast<uint32_t>(h) };
     m_swapchainImageFormat = surfaceFormat.format;
 
@@ -434,9 +449,7 @@ void VKRenderer::Initialise() {
         VK_CHECK(vkCreateFence(m_device, &fenceInfo, nullptr, &m_inFlightFences[i]));
     }
 
-    // ============================================================================
-    // DESCRIPTOR SET LAYOUT & DESCRIPTOR POOL PARA TEXTURAS
-    // ============================================================================
+    // Descriptores
     VkDescriptorSetLayoutBinding samplerLayoutBinding{};
     samplerLayoutBinding.binding = 0;
     samplerLayoutBinding.descriptorCount = 1;
@@ -448,31 +461,15 @@ void VKRenderer::Initialise() {
     layoutInfo.pBindings = &samplerLayoutBinding;
     VK_CHECK(vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_descriptorSetLayout));
 
-    VkDescriptorPoolSize poolSize{};
-    poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSize.descriptorCount = 2048;
-
-    VkDescriptorPoolCreateInfo descPoolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    descPoolInfo.poolSizeCount = 1;
-    descPoolInfo.pPoolSizes = &poolSize;
-    descPoolInfo.maxSets = 2048;
-    descPoolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2048};
+    VkDescriptorPoolCreateInfo descPoolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, 2048, 1, &poolSize};
     VK_CHECK(vkCreateDescriptorPool(m_device, &descPoolInfo, nullptr, &m_descriptorPool));
 
-    // Pipeline Layout (PushConstants + DescriptorSet)
-    VkPushConstantRange pushConstantRange{};
-    pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-    pushConstantRange.offset = 0;
-    pushConstantRange.size = sizeof(PushConstants);
-
-    VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    pipelineLayoutInfo.setLayoutCount = 1;
-    pipelineLayoutInfo.pSetLayouts = &m_descriptorSetLayout;
-    pipelineLayoutInfo.pushConstantRangeCount = 1;
-    pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
+    VkPushConstantRange pushConstantRange{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants)};
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &m_descriptorSetLayout, 1, &pushConstantRange};
     VK_CHECK(vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout));
 
-    // Shaders y Pipeline
+    // Pipeline
     VkShaderModule vertModule = createShaderModule(m_device, vert_spv, sizeof(vert_spv));
     VkShaderModule fragModule = createShaderModule(m_device, frag_spv, sizeof(frag_spv));
 
@@ -538,7 +535,7 @@ void VKRenderer::Initialise() {
     vkDestroyShaderModule(m_device, fragModule, nullptr);
     vkDestroyShaderModule(m_device, vertModule, nullptr);
 
-    // Dynamic VBO (8 MB)
+    // Dynamic VBO
     VkBufferCreateInfo vboInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, DYNAMIC_VERTEX_BUFFER_SIZE, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE};
     VK_CHECK(vkCreateBuffer(m_device, &vboInfo, nullptr, &m_dynamicVertexBuffer));
 
@@ -574,7 +571,6 @@ void VKRenderer::Initialise() {
     memcpy(eboMapped, quadIndices.data(), quadIndices.size() * sizeof(uint32_t));
     vkUnmapMemory(m_device, m_globalEBOMemory);
 
-    // Textura blanca por defecto (1x1 pixel blanco para cuando no hay textura activa)
     uint32_t whitePixel = 0xFFFFFFFF;
     TextureData(1, 1, &whitePixel, 0);
     m_defaultWhiteTexture = m_textures[1];
@@ -614,15 +610,16 @@ void VKRenderer::StartFrame() {
 
     vkCmdBeginRenderPass(cmd, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
-    // Viewport con altura negativa: Rasterización 1:1 idéntica a OpenGL
-VkViewport viewport{
-    0.0f, 
-    (float)m_swapchainExtent.height, // Comienza abajo
-    (float)m_swapchainExtent.width, 
-    -(float)m_swapchainExtent.height, // Altura negativa
-    0.0f, 
-    1.0f
-};
+    // Viewport estándar nativo (Alineación 1:1 con las matrices de Minecraft)
+    // VIEWPORT NATIVO VULKAN (Pone la pantalla al derecho e idéntica a OpenGL)
+    VkViewport viewport{
+        0.0f,
+        (float)m_swapchainExtent.height,   // Comienza en la base de la pantalla
+        (float)m_swapchainExtent.width,
+        -(float)m_swapchainExtent.height,  // Altura negativa: voltea la imagen al derecho
+        0.0f,
+        1.0f
+    };
     vkCmdSetViewport(cmd, 0, 1, &viewport);
 
     VkRect2D scissor{{0, 0}, m_swapchainExtent};
@@ -632,7 +629,7 @@ VkViewport viewport{
 }
 
 // ============================================================================
-// DIBUJO CON TEXTURAS VULKAN
+// DIBUJO CON TEXTURAS Y CORRECCIÓN DE CLIP EN VULKAN
 // ============================================================================
 void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVertexType vType, ePixelShaderType psType) {
     if (!m_frameStarted || count <= 0 || !dataIn) return;
@@ -642,17 +639,46 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
 
     if (m_dynamicVertexOffset + bytes > DYNAMIC_VERTEX_BUFFER_SIZE) return;
 
+    // --- TELEMETRÍA DE DIAGNÓSTICO VULKAN (Primeras 10 llamadas) ---
+    static int s_dumpCount = 0;
+    if (s_dumpCount < 10) {
+        s_dumpCount++;
+        float* f = (float*)dataIn;
+        uint32_t* u = (uint32_t*)dataIn;
+        glm::mat4 mvp = s_proj.cur() * s_mv.cur();
+        
+        printf("\n[VK_PROBE #%d] Prim:%d Count:%d Stride:%zu TexId:%d HasTex:%d\n", 
+               s_dumpCount, (int)ptype, count, stride, 
+               m_boundTextureId, (m_textures.find(m_boundTextureId) != m_textures.end() ? 1 : 0));
+        printf("  MVP Row0: [%.4f, %.4f, %.4f, %.4f]\n", mvp[0][0], mvp[1][0], mvp[2][0], mvp[3][0]);
+        printf("  MVP Row1: [%.4f, %.4f, %.4f, %.4f]\n", mvp[0][1], mvp[1][1], mvp[2][1], mvp[3][1]);
+        printf("  MVP Row2: [%.4f, %.4f, %.4f, %.4f]\n", mvp[0][2], mvp[1][2], mvp[2][2], mvp[3][2]);
+        printf("  MVP Row3: [%.4f, %.4f, %.4f, %.4f]\n", mvp[0][3], mvp[1][3], mvp[2][3], mvp[3][3]);
+        printf("  BaseColor: [%.2f, %.2f, %.2f, %.2f]\n", m_baseColor.r, m_baseColor.g, m_baseColor.b, m_baseColor.a);
+        printf("  V0: Pos(%.1f, %.1f, %.1f) UV(%.4f, %.4f) Col(0x%08X)\n", f[0], f[1], f[2], f[3], f[4], u[5]);
+        if (count > 1) printf("  V1: Pos(%.1f, %.1f, %.1f) UV(%.4f, %.4f) Col(0x%08X)\n", f[8], f[9], f[10], f[11], f[12], u[13]);
+        if (count > 2) printf("  V2: Pos(%.1f, %.1f, %.1f) UV(%.4f, %.4f) Col(0x%08X)\n", f[16], f[17], f[18], f[19], f[20], u[21]);
+        if (count > 3) printf("  V3: Pos(%.1f, %.1f, %.1f) UV(%.4f, %.4f) Col(0x%08X)\n", f[24], f[25], f[26], f[27], f[28], u[29]);
+        fflush(stdout);
+    }
+    // ----------------------------------------------------------------
+
     memcpy((char*)m_dynamicVertexMapped + m_dynamicVertexOffset, dataIn, bytes);
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_graphicsPipeline);
 
-    // Enlazar Descriptor Set de la textura activa
     VkDescriptorSet currentSet = m_defaultWhiteTexture.descriptorSet;
     int hasTex = 0;
-    if (m_textureEnabled && m_boundTextureId > 0 && m_textures.find(m_boundTextureId) != m_textures.end()) {
-        currentSet = m_textures[m_boundTextureId].descriptorSet;
-        hasTex = 1;
+    if (m_textureEnabled && m_boundTextureId > 0) {
+        auto it = m_textures.find(m_boundTextureId);
+        if (it != m_textures.end() && it->second.descriptorSet != VK_NULL_HANDLE) {
+            currentSet = it->second.descriptorSet;
+            hasTex = 1;
+        } else if (!m_textures.empty()) {
+            currentSet = m_textures.begin()->second.descriptorSet;
+            hasTex = 1;
+        }
     }
 
     if (currentSet != VK_NULL_HANDLE) {
@@ -660,7 +686,7 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     }
 
     PushConstants pc;
-    pc.uMVP = s_proj.cur() * s_mv.cur();
+    pc.uMVP = s_vkClipCorrection * (s_proj.cur() * s_mv.cur());
     pc.uBaseColor = m_baseColor;
     pc.uChunkOffset = m_chunkOffset;
     pc.uHasTexture = hasTex;
@@ -794,7 +820,18 @@ void VKRenderer::SetWindowSize(int w, int h) { m_windowWidth = w; m_windowHeight
 void VKRenderer::SetFullscreen(bool fs) {}
 bool VKRenderer::IsWidescreen() { return true; }
 bool VKRenderer::IsHiDef() { return true; }
-void VKRenderer::GetFramebufferSize(int& width, int& height) { width = m_windowWidth; height = m_windowHeight; }
+
+void VKRenderer::GetFramebufferSize(int& width, int& height) {
+    if (m_window) {
+        int w, h;
+        SDL_Vulkan_GetDrawableSize(m_window, &w, &h);
+        m_windowWidth = w;
+        m_windowHeight = h;
+    }
+    width = m_windowWidth;
+    height = m_windowHeight;
+}
+
 bool VKRenderer::ShouldClose() { return m_shouldClose; }
 void VKRenderer::Close() { m_shouldClose = true; }
 void VKRenderer::UpdateGamma(unsigned short usGamma) {}
@@ -836,26 +873,28 @@ void VKRenderer::CBuffTick() {}
 void VKRenderer::CBuffDeferredModeStart() {}
 void VKRenderer::CBuffDeferredModeEnd() {}
 
-// ============================================================================
-// CARGA Y GESTIÓN DE TEXTURAS EN VRAM
-// ============================================================================
 int VKRenderer::TextureCreate() { 
-    return s_nextTexId++; 
+    int id = s_nextTexId++;
+    m_boundTextureId = id; // Auto-vincular para que el siguiente TextureData() sepa su ID exacto
+    return id; 
 }
+
+
 void VKRenderer::TextureFree(int idx) {
     auto it = m_textures.find(idx);
     if (it != m_textures.end()) {
-        vkDeviceWaitIdle(m_device);
-        if (it->second.sampler) vkDestroySampler(m_device, it->second.sampler, nullptr);
-        if (it->second.view) vkDestroyImageView(m_device, it->second.view, nullptr);
-        if (it->second.image) vkDestroyImage(m_device, it->second.image, nullptr);
-        if (it->second.memory) vkFreeMemory(m_device, it->second.memory, nullptr);
+        if (m_device) {
+            vkDeviceWaitIdle(m_device);
+            if (it->second.sampler) vkDestroySampler(m_device, it->second.sampler, nullptr);
+            if (it->second.view) vkDestroyImageView(m_device, it->second.view, nullptr);
+            if (it->second.image) vkDestroyImage(m_device, it->second.image, nullptr);
+            if (it->second.memory) vkFreeMemory(m_device, it->second.memory, nullptr);
+        }
         m_textures.erase(it);
     }
 }
-void VKRenderer::TextureBind(int idx) { 
-    m_boundTextureId = idx; 
-}
+
+void VKRenderer::TextureBind(int idx) { m_boundTextureId = idx; }
 void VKRenderer::TextureBindVertex(int idx, bool scaleLight) {}
 void VKRenderer::TextureSetTextureLevels(int levels) {}
 int VKRenderer::TextureGetTextureLevels() { return 1; }
@@ -863,10 +902,13 @@ int VKRenderer::TextureGetTextureLevels() { return 1; }
 void VKRenderer::TextureData(int width, int height, void* data, int level, eTextureFormat format) {
     if (width <= 0 || height <= 0 || !data) return;
 
+    // PROTECCIÓN CRÍTICA: Solo el nivel 0 crea la textura base en alta resolución.
+    // Los niveles de mipmap secundarios no deben destruir la imagen de alta calidad.
+    if (level != 0) return;
+
     int texId = (m_boundTextureId > 0) ? m_boundTextureId : 1;
     VkDeviceSize imageSize = width * height * 4;
 
-    // Buffer de staging temporal
     VkBuffer stagingBuffer;
     VkDeviceMemory stagingBufferMemory;
     VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE};
@@ -884,7 +926,16 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
     memcpy(mapped, data, imageSize);
     vkUnmapMemory(m_device, stagingBufferMemory);
 
-    // Crear VkImage
+    // Si la textura ya existía, liberamos la versión anterior
+    auto it = m_textures.find(texId);
+    if (it != m_textures.end()) {
+        vkDeviceWaitIdle(m_device);
+        if (it->second.sampler) vkDestroySampler(m_device, it->second.sampler, nullptr);
+        if (it->second.view) vkDestroyImageView(m_device, it->second.view, nullptr);
+        if (it->second.image) vkDestroyImage(m_device, it->second.image, nullptr);
+        if (it->second.memory) vkFreeMemory(m_device, it->second.memory, nullptr);
+    }
+
     VKTexture tex;
     tex.width = width;
     tex.height = height;
@@ -911,7 +962,6 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
     VK_CHECK(vkAllocateMemory(m_device, &allocInfo, nullptr, &tex.memory));
     VK_CHECK(vkBindImageMemory(m_device, tex.image, tex.memory, 0));
 
-    // Copiar Staging -> VkImage con SingleTimeCommandBuffer
     VkCommandBuffer cmd = beginSingleTimeCommands();
 
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -939,7 +989,6 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
     vkDestroyBuffer(m_device, stagingBuffer, nullptr);
     vkFreeMemory(m_device, stagingBufferMemory, nullptr);
 
-    // Crear ImageView
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = tex.image;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -947,16 +996,14 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
     viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     VK_CHECK(vkCreateImageView(m_device, &viewInfo, nullptr, &tex.view));
 
-    // Crear Sampler con filtro pixelado de Minecraft
     VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     samplerInfo.magFilter = VK_FILTER_NEAREST;
     samplerInfo.minFilter = VK_FILTER_NEAREST;
-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     VK_CHECK(vkCreateSampler(m_device, &samplerInfo, nullptr, &tex.sampler));
 
-    // Asignar Descriptor Set
     VkDescriptorSetAllocateInfo descAllocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     descAllocInfo.descriptorPool = m_descriptorPool;
     descAllocInfo.descriptorSetCount = 1;
@@ -979,7 +1026,61 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
     m_textures[texId] = tex;
 }
 
-void VKRenderer::TextureDataUpdate(int xoffset, int yoffset, int width, int height, void* data, int level) {}
+void VKRenderer::TextureDataUpdate(int xoffset, int yoffset, int width, int height, void* data, int level) {
+    if (width <= 0 || height <= 0 || !data) return;
+
+    int texId = (m_boundTextureId > 0) ? m_boundTextureId : 1;
+    auto it = m_textures.find(texId);
+    if (it == m_textures.end()) {
+        TextureData(width, height, data, level, TEXTURE_FORMAT_RxGyBzAw);
+        return;
+    }
+
+    VkDeviceSize imageSize = width * height * 4;
+    VkBuffer stagingBuffer;
+    VkDeviceMemory stagingMemory;
+    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE};
+    VK_CHECK(vkCreateBuffer(m_device, &bufferInfo, nullptr, &stagingBuffer));
+
+    VkMemoryRequirements memReqs;
+    vkGetBufferMemoryRequirements(m_device, stagingBuffer, &memReqs);
+    VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, memReqs.size,
+                                   findMemoryType(m_physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+    VK_CHECK(vkAllocateMemory(m_device, &allocInfo, nullptr, &stagingMemory));
+    VK_CHECK(vkBindBufferMemory(m_device, stagingBuffer, stagingMemory, 0));
+
+    void* mapped = nullptr;
+    vkMapMemory(m_device, stagingMemory, 0, imageSize, 0, &mapped);
+    memcpy(mapped, data, imageSize);
+    vkUnmapMemory(m_device, stagingMemory);
+
+    VkCommandBuffer cmd = beginSingleTimeCommands();
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.image = it->second.image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageOffset = { xoffset, yoffset, 0 };
+    region.imageExtent = { (uint32_t)width, (uint32_t)height, 1 };
+    vkCmdCopyBufferToImage(cmd, stagingBuffer, it->second.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    endSingleTimeCommands(cmd);
+    vkDestroyBuffer(m_device, stagingBuffer, nullptr);
+    vkFreeMemory(m_device, stagingMemory, nullptr);
+}
+
 void VKRenderer::TextureSetParam(int param, int value) {}
 void VKRenderer::TextureDynamicUpdateStart() {}
 void VKRenderer::TextureDynamicUpdateEnd() {}

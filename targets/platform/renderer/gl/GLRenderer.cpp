@@ -891,6 +891,29 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         return;
     }
 
+    // --- TELEMETRÍA DE DIAGNÓSTICO OPENGL (Primeras 10 llamadas) ---
+    static int s_dumpCount = 0;
+    if (s_dumpCount < 10) {
+        s_dumpCount++;
+        float* f = (float*)dataIn;
+        uint32_t* u = (uint32_t*)dataIn;
+        glm::mat4 mvp = s_proj.cur() * s_mv.cur();
+        
+        printf("\n[GL_PROBE #%d] Prim:%d Count:%d Stride:%zu TexActive:%d\n", 
+               s_dumpCount, (int)ptype, count, stride, (s_rs.useTexture ? 1 : 0));
+        printf("  MVP Row0: [%.4f, %.4f, %.4f, %.4f]\n", mvp[0][0], mvp[1][0], mvp[2][0], mvp[3][0]);
+        printf("  MVP Row1: [%.4f, %.4f, %.4f, %.4f]\n", mvp[0][1], mvp[1][1], mvp[2][1], mvp[3][1]);
+        printf("  MVP Row2: [%.4f, %.4f, %.4f, %.4f]\n", mvp[0][2], mvp[1][2], mvp[2][2], mvp[3][2]);
+        printf("  MVP Row3: [%.4f, %.4f, %.4f, %.4f]\n", mvp[0][3], mvp[1][3], mvp[2][3], mvp[3][3]);
+        printf("  BaseColor: [%.2f, %.2f, %.2f, %.2f]\n", s_rs.baseColor.r, s_rs.baseColor.g, s_rs.baseColor.b, s_rs.baseColor.a);
+        printf("  V0: Pos(%.1f, %.1f, %.1f) UV(%.4f, %.4f) Col(0x%08X)\n", f[0], f[1], f[2], f[3], f[4], u[5]);
+        if (count > 1) printf("  V1: Pos(%.1f, %.1f, %.1f) UV(%.4f, %.4f) Col(0x%08X)\n", f[8], f[9], f[10], f[11], f[12], u[13]);
+        if (count > 2) printf("  V2: Pos(%.1f, %.1f, %.1f) UV(%.4f, %.4f) Col(0x%08X)\n", f[16], f[17], f[18], f[19], f[20], u[21]);
+        if (count > 3) printf("  V3: Pos(%.1f, %.1f, %.1f) UV(%.4f, %.4f) Col(0x%08X)\n", f[24], f[25], f[26], f[27], f[28], u[29]);
+        fflush(stdout);
+    }
+    // ----------------------------------------------------------------
+
     pushRenderState();
 
     if (s_currentBoundVAO != s_sVAO_std) {
