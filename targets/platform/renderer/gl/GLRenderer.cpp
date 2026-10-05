@@ -55,17 +55,29 @@
 #include "app/common/Iggy/include/gdraw.h"
 #include "minecraft/util/Log.h"
 
-static thread_local bool s_recIsCompressed = false;
+// ============================================================================
+// FRAME ANATOMY DUMP - OPENGL (ACTIVADO CON TECLA P EN JUEGO)
+// ============================================================================
+static bool s_glPendingDump = false;
+static bool s_glDumpThisFrame = false;
+static int s_glDrawIndex = 0;
 
+static void LogGLDraw(const char* type, int count, int tex, glm::vec4 col, glm::vec3 off, bool depthMask, int chunkId = -1) {
+    if (!s_glDumpThisFrame) return;
+    s_glDrawIndex++;
+    printf("[GL_WORLD_FRAME | Draw #%03d] %s | ChkId:%d | Verts:%d | Tex:%d | DM:%d | Col:(%.2f,%.2f,%.2f,%.2f) | Off:(%.1f,%.1f,%.1f)\n",
+           s_glDrawIndex, type, chunkId, count, tex, (int)depthMask, col.r, col.g, col.b, col.a, off.x, off.y, off.z);
+    fflush(stdout);
+}
+
+static thread_local bool s_recIsCompressed = false;
 static GLuint s_globalEBO = 0;
 static const int MAX_GLOBAL_VERTICES = 262144;
 
-// Contadores globales de diagnóstico
 static std::atomic<int> g_vboCount{0};
 static std::atomic<int> g_vaoCount{0};
 static std::atomic<int> g_texCount{0};
 
-// Caché de estados para erradicar el VAO Thrashing
 static GLuint s_currentBoundVAO = 0;
 static int s_currentGreedyMode = -1;
 
@@ -74,9 +86,8 @@ IPlatformRenderer& PlatformRenderer_get() {
     static GLRenderer instance;
     return instance;
 }
-}  // namespace platform_internal
+}
 
-// MARK: Shaders
 #define CPP_GLSL_INCLUDE
 #ifdef GLES
 static const char* VERT_SRC =
@@ -95,13 +106,11 @@ static const char* FRAG_SRC =
 #endif
 #undef CPP_GLSL_INCLUDE
 
-// MARK: OpenGL state
 static SDL_Window* s_window = nullptr;
 static SDL_GLContext s_glContext = nullptr;
 static bool s_shouldClose = false;
 
 static int s_windowWidth = 1280;
-
 static int s_windowHeight = 720;
 static int s_reqWidth = 0;
 static int s_reqHeight = 0;
@@ -598,7 +607,7 @@ static std::unordered_map<int, ChunkBuffer> s_chunkPool;
 static int s_nextListBase = 1;
 static std::vector<ChunkBuffer> s_pendingDestructions;
 static std::mutex s_destructionMtx;
-static std::shared_mutex s_poolMtx; // Concurrencia de lectura ultrarrápida
+static std::shared_mutex s_poolMtx;
 
 static thread_local int s_recListId = -1;
 static thread_local std::vector<uint8_t> s_recVerts;
@@ -627,7 +636,6 @@ void GLRenderer::Initialise() {
         return;
     }
 
-    // 1. OBTENCIÓN DE LA RESOLUCIÓN NATIVA REAL DE LA PANTALLA
     SDL_DisplayMode dm;
     int desktopW = 1280;
     int desktopH = 720;
@@ -636,17 +644,13 @@ void GLRenderer::Initialise() {
         desktopH = dm.h;
     }
 
-    // 2. CÁLCULO INTELIGENTE DE RESOLUCIÓN
     if (s_reqWidth > 0 && s_reqHeight > 0) {
         s_windowWidth = s_reqWidth;
         s_windowHeight = s_reqHeight;
     } else if (s_fullscreen) {
-        // Pantalla completa: Usar el 100% nativo del monitor (ej. 1366x768)
         s_windowWidth = desktopW;
         s_windowHeight = desktopH;
     } else {
-        // Modo ventana: Si la pantalla es de 1366x768 o similar, ajustar al 88%
-        // para que quepa perfectamente con los bordes y barra de tareas
         if (desktopW <= 1366 || desktopH <= 768) {
             s_windowWidth = (int)(desktopW * 0.88f);
             s_windowHeight = (int)(desktopH * 0.88f);
@@ -675,21 +679,14 @@ void GLRenderer::Initialise() {
     s_window = SDL_CreateWindow("Minecraft Console Edition",
                                 SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                 s_windowWidth, s_windowHeight, wf);
-    if (!s_window) {
-        fprintf(stderr, "[4J_Render] Window: %s\n", SDL_GetError());
-        return;
-    }
+    if (!s_window) return;
 
     s_glContext = SDL_GL_CreateContext(s_window);
-    if (!s_glContext) {
-        fprintf(stderr, "[4J_Render] Context: %s\n", SDL_GetError());
-        return;
-    }
+    if (!s_glContext) return;
 #ifndef GLES
     gl3_load();
 #endif
 
-    // Píxeles reales del Framebuffer (garantiza nitidez nativa 1:1)
     int fw, fh;
     SDL_GL_GetDrawableSize(s_window, &fw, &fh);
     onFramebufferResize(fw, fh);
@@ -781,11 +778,18 @@ void GLRenderer::InitialiseContext() {
 }
 
 void GLRenderer::StartFrame() {
+    if (s_glPendingDump) {
+        s_glDumpThisFrame = true;
+        s_glPendingDump = false;
+        s_glDrawIndex = 0;
+        printf("\n==================== INICIO DEL FRAME DUMP (TECLA P EN OPENGL) ====================\n");
+        fflush(stdout);
+    }
+
     Set_matrixDirty();
     s_currentBoundVAO = 0;
     s_currentGreedyMode = -1;
     
-    // Leer el tamaño real de los píxeles de la GPU
     int w, h;
     SDL_GL_GetDrawableSize(s_window, &w, &h);
     s_windowWidth = w > 0 ? w : 1;
@@ -793,8 +797,9 @@ void GLRenderer::StartFrame() {
     glViewport(0, 0, s_windowWidth, s_windowHeight);
 }
 
+
 void GLRenderer::Present() {
-    // 1. Limpieza diferida de VBOs/VAOs sin bloquear el hilo de dibujo
+    // 1. Limpieza diferida de VBOs/VAOs
     std::vector<ChunkBuffer> toDestroy;
     {
         std::lock_guard<std::mutex> lk_del(s_destructionMtx);
@@ -807,34 +812,37 @@ void GLRenderer::Present() {
         cb.destroy();
     }
 
-    // 2. Procesamiento de Eventos SDL y Cambio Dinámico de Resolución
+    // 2. Procesamiento de Eventos SDL y captura con tecla 'P'
     if (!s_window) return;
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_QUIT || ev.window.event == SDL_WINDOWEVENT_CLOSE) {
             s_shouldClose = true;
+        } else if (ev.type == SDL_KEYDOWN) {
+            if (ev.key.keysym.sym == SDLK_p) {
+                s_glPendingDump = true;
+                s_glDrawIndex = 0;
+                printf("\n==================== INICIO DEL FRAME DUMP (TECLA P EN OPENGL) ====================\n");
+                fflush(stdout);
+            }
         } else if (ev.type == SDL_WINDOWEVENT &&
                   (ev.window.event == SDL_WINDOWEVENT_RESIZED ||
                    ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
                    ev.window.event == SDL_WINDOWEVENT_MAXIMIZED ||
                    ev.window.event == SDL_WINDOWEVENT_RESTORED)) {
-            // Lee los píxeles reales del framebuffer (1366x768 nativo o cualquier monitor)
             int dw, dh;
             SDL_GL_GetDrawableSize(s_window, &dw, &dh);
             onFramebufferResize(dw, dh);
         }
     }
 
-    // 3. Diagnóstico (lo dejamos comentado para mantener la consola limpia)
-    /*
-    static int frameCounter = 0;
-    if (++frameCounter % 120 == 0) {
-        printf("GPU Resources -> VBOs: %d | VAOs: %d | Texs: %d | Pool: %zu\n",
-               g_vboCount.load(), g_vaoCount.load(), g_texCount.load(), s_chunkPool.size());
+    if (s_glDumpThisFrame) {
+        printf("==================== FIN DEL FRAME DUMP (OPENGL | Total: %d) ====================\n\n", s_glDrawIndex);
+        fflush(stdout);
+        s_glDumpThisFrame = false; // Solo captura ese frame exacto
     }
-    */
 
-    // 4. Presentar a pantalla (Swap Buffers)
+    // 3. Presentar a pantalla (Swap Buffers)
     SDL_GL_SwapWindow(s_window);
 }
 
@@ -891,28 +899,7 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         return;
     }
 
-    // --- TELEMETRÍA DE DIAGNÓSTICO OPENGL (Primeras 10 llamadas) ---
-    static int s_dumpCount = 0;
-    if (s_dumpCount < 10) {
-        s_dumpCount++;
-        float* f = (float*)dataIn;
-        uint32_t* u = (uint32_t*)dataIn;
-        glm::mat4 mvp = s_proj.cur() * s_mv.cur();
-        
-        printf("\n[GL_PROBE #%d] Prim:%d Count:%d Stride:%zu TexActive:%d\n", 
-               s_dumpCount, (int)ptype, count, stride, (s_rs.useTexture ? 1 : 0));
-        printf("  MVP Row0: [%.4f, %.4f, %.4f, %.4f]\n", mvp[0][0], mvp[1][0], mvp[2][0], mvp[3][0]);
-        printf("  MVP Row1: [%.4f, %.4f, %.4f, %.4f]\n", mvp[0][1], mvp[1][1], mvp[2][1], mvp[3][1]);
-        printf("  MVP Row2: [%.4f, %.4f, %.4f, %.4f]\n", mvp[0][2], mvp[1][2], mvp[2][2], mvp[3][2]);
-        printf("  MVP Row3: [%.4f, %.4f, %.4f, %.4f]\n", mvp[0][3], mvp[1][3], mvp[2][3], mvp[3][3]);
-        printf("  BaseColor: [%.2f, %.2f, %.2f, %.2f]\n", s_rs.baseColor.r, s_rs.baseColor.g, s_rs.baseColor.b, s_rs.baseColor.a);
-        printf("  V0: Pos(%.1f, %.1f, %.1f) UV(%.4f, %.4f) Col(0x%08X)\n", f[0], f[1], f[2], f[3], f[4], u[5]);
-        if (count > 1) printf("  V1: Pos(%.1f, %.1f, %.1f) UV(%.4f, %.4f) Col(0x%08X)\n", f[8], f[9], f[10], f[11], f[12], u[13]);
-        if (count > 2) printf("  V2: Pos(%.1f, %.1f, %.1f) UV(%.4f, %.4f) Col(0x%08X)\n", f[16], f[17], f[18], f[19], f[20], u[21]);
-        if (count > 3) printf("  V3: Pos(%.1f, %.1f, %.1f) UV(%.4f, %.4f) Col(0x%08X)\n", f[24], f[25], f[26], f[27], f[28], u[29]);
-        fflush(stdout);
-    }
-    // ----------------------------------------------------------------
+    LogGLDraw("DrawVertices", count, s_rs.activeTexture, s_rs.baseColor, s_chunkOffset, s_gl_state.depthMask);
 
     pushRenderState();
 
@@ -952,6 +939,7 @@ void GLRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
 
     glBindBuffer(GL_ARRAY_BUFFER, 0);  
 }
+
 
 void GLRenderer::ReadPixels(int x, int y, int w, int h, void* buf) {
     if (!buf) return;
@@ -1033,9 +1021,7 @@ void GLRenderer::CBuffClear(int index) {
     }
 }
 
-// BUCLE DE DIBUJO OPTIMIZADO: Cero contención y cero VAO Thrashing
 bool GLRenderer::CBuffCall(int index, bool) {
-    // 1. Acceso de solo lectura compartido y sin bloqueos exclusivos
     std::shared_lock<std::shared_mutex> lk_pool(s_poolMtx);
     
     auto it = s_chunkPool.find(index);
@@ -1046,7 +1032,10 @@ bool GLRenderer::CBuffCall(int index, bool) {
     ChunkBuffer& cb = it->second;
     cb.lastUsedFrame = SDL_GetTicks();
 
-    // 2. Inicialización diferida del VBO/VAO si aún no está en GPU
+    int totalVerts = 0;
+    for (const auto& dc : cb.draws) totalVerts += dc.count;
+    LogGLDraw("CBuffCall   ", totalVerts, s_rs.activeTexture, s_rs.baseColor, s_chunkOffset, s_gl_state.depthMask, index);
+
     if (!cb.vboReady) {
         if (cb.rawVerts.empty()) return false;
         
@@ -1066,7 +1055,6 @@ bool GLRenderer::CBuffCall(int index, bool) {
             bindStdAttribs();
         }
         
-        // VINCULAR EBO PERMANENTEMENTE EN EL VAO (Cero llamadas en cada frame)
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_globalEBO);
 
         glBindVertexArray(0);
@@ -1080,20 +1068,17 @@ bool GLRenderer::CBuffCall(int index, bool) {
 
     pushRenderState();
     
-    // 3. Caché de greedy mode uniforme
     int targetGreedy = cb.isCompressed ? 1 : 0;
     if (s_currentGreedyMode != targetGreedy) {
         glUniform1i(s_shader.uGreedyMode, targetGreedy);
         s_currentGreedyMode = targetGreedy;
     }
 
-    // 4. Evitar re-enlazar si el VAO ya está en uso
     if (s_currentBoundVAO != cb.vao) {
         glBindVertexArray(cb.vao);
         s_currentBoundVAO = cb.vao;
     }
     
-    // 5. Dibujar en ráfaga (el EBO ya está retenido por el VAO)
     for (const auto& dc : cb.draws) {
         if (dc.wasQuad) {
             GLsizei indexCount = (dc.count / 4) * 6;
@@ -1103,7 +1088,6 @@ bool GLRenderer::CBuffCall(int index, bool) {
         }
     }
     
-    // NO DESVINCULAMOS A CERO AQUÍ: Esto permite que los sub-chunks se dibujen consecutivamente
     return true;
 }
 
@@ -1175,7 +1159,18 @@ void GLRenderer::Set_matrixDirty() {
         s_boundProgram = s_shader.prog;
     }
 }
-void GLRenderer::Clear(int f) { glClear(f); }
+
+void GLRenderer::Clear(int f) { 
+    if (s_glDumpThisFrame) {
+        printf("[GL_WORLD_FRAME] Clear(flags=0x%08X) | DepthClear:%d | ColorClear:%d\n",
+               f, (f & 0x100) ? 1 : 0, (f & 0x4000) ? 1 : 0);
+        fflush(stdout);
+    }
+    glClear(f); 
+}
+
+
+
 void GLRenderer::SetClearColour(const float c[4]) {
     glClearColor(c[0], c[1], c[2], c[3]);
 }
@@ -1212,7 +1207,7 @@ void GLRenderer::StateSetLineWidth(float w) {
     (void)w;
 #endif
 }
-void GLRenderer::StateSetWriteEnable(bool r, bool g, bool b, bool a) { glShadowSetColorMask(r, g, b, a); }
+void GLRenderer::StateSetWriteEnable(bool r, bool green, bool b, bool a) { glShadowSetColorMask(r, green, b, a); }
 void GLRenderer::StateSetDepthTestEnable(bool e) { glShadowSetDepthTest(e); }
 void GLRenderer::StateSetAlphaTestEnable(bool e) {
     float v = e ? 0.1f : 0.f;

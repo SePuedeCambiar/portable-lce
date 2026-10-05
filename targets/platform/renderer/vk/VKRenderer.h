@@ -7,6 +7,8 @@
 #include <array>
 #include <memory>
 #include <unordered_map>
+#include <shared_mutex>
+#include <mutex>
 #include "glm/glm.hpp"
 
 struct VKTexture {
@@ -17,6 +19,26 @@ struct VKTexture {
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
     int width = 0;
     int height = 0;
+};
+
+struct VKChunkDrawCall {
+    int prim;
+    int first;
+    int count;
+    bool wasQuad;
+};
+
+struct VKChunkBuffer {
+    VkBuffer vbo = VK_NULL_HANDLE;
+    VkDeviceMemory vboMemory = VK_NULL_HANDLE;
+    VkDeviceSize bufferSize = 0;
+    std::vector<VKChunkDrawCall> draws;
+    std::vector<uint8_t> rawVerts;
+    bool valid = false;
+    bool vboReady = false;
+    bool isCompressed = false;
+
+    void destroy(VkDevice device);
 };
 
 class VKRenderer : public IPlatformRenderer {
@@ -51,10 +73,7 @@ public:
     virtual void MatrixRotate(float angle, float x, float y, float z) override;
     virtual void MatrixScale(float x, float y, float z) override;
     virtual void MatrixPerspective(float fovy, float aspect, float zNear, float zFar) override;
-
-    
     virtual void MatrixOrthogonal(float left, float right, float bottom, float top, float zNear, float zFar) override;
-
     virtual void MatrixPop() override;
     virtual void MatrixPush() override;
     virtual void MatrixMult(float* mat) override;
@@ -146,6 +165,14 @@ public:
     virtual void EndEvent() override;
 
 private:
+    int m_terrainAtlasId = 1;
+
+    VkFormat findSupportedFormat(const std::vector<VkFormat>& candidates, VkImageTiling tiling, VkFormatFeatureFlags features);
+    VkFormat findDepthFormat();
+    void createDepthResources();
+    void cleanupDepthResources();
+    void createDefaultWhiteTexture();
+
     VkCommandBuffer beginSingleTimeCommands();
     void endSingleTimeCommands(VkCommandBuffer commandBuffer);
 
@@ -163,30 +190,47 @@ private:
     VkFormat m_swapchainImageFormat;
     VkExtent2D m_swapchainExtent;
 
+    // Depth Buffer
+    VkFormat m_depthFormat = VK_FORMAT_D32_SFLOAT;
+    VkImage m_depthImage = VK_NULL_HANDLE;
+    VkDeviceMemory m_depthImageMemory = VK_NULL_HANDLE;
+    VkImageView m_depthImageView = VK_NULL_HANDLE;
+
     VkRenderPass m_renderPass = VK_NULL_HANDLE;
     std::vector<VkFramebuffer> m_swapchainFramebuffers;
     VkCommandPool m_commandPool = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> m_commandBuffers;
 
-    // Descriptores y Pipeline
+    // Pipelines
     VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_graphicsPipeline = VK_NULL_HANDLE;
+    VkPipeline m_pipelineOpaque = VK_NULL_HANDLE;
+    VkPipeline m_pipelineTransparent = VK_NULL_HANDLE;
 
-    // Gestor de Texturas
+    // Separación de Unidades de Textura (Unit 0 = Atlas/GUI, Unit 1 = Lightmap)
     std::unordered_map<int, VKTexture> m_textures;
-    int m_boundTextureId = -1;
+    int m_boundTextureId = 1;
+    int m_boundLightmapId = -1;
     VKTexture m_defaultWhiteTexture;
+    std::mutex m_textureMtx;
+    std::mutex m_queueMtx;
 
-    // Buffer dinámico de vértices
+    // Chunks (CBuff)
+    std::unordered_map<int, VKChunkBuffer> m_chunkPool;
+    std::vector<VKChunkBuffer> m_pendingDestructions;
+    std::shared_mutex m_poolMtx;
+    std::mutex m_destructionMtx;
+    int m_nextListBase = 1;
+
+    // Dynamic VBO
     VkBuffer m_dynamicVertexBuffer = VK_NULL_HANDLE;
     VkDeviceMemory m_dynamicVertexMemory = VK_NULL_HANDLE;
     void* m_dynamicVertexMapped = nullptr;
     VkDeviceSize m_dynamicVertexOffset = 0;
-    const VkDeviceSize DYNAMIC_VERTEX_BUFFER_SIZE = 8 * 1024 * 1024;
+    const VkDeviceSize DYNAMIC_VERTEX_BUFFER_SIZE = 16 * 1024 * 1024;
 
-    // Index Buffer global para quads
+    // Index Buffer global (Quads)
     VkBuffer m_globalEBO = VK_NULL_HANDLE;
     VkDeviceMemory m_globalEBOMemory = VK_NULL_HANDLE;
 
@@ -198,10 +242,19 @@ private:
     uint32_t m_imageIndex = 0;
     bool m_frameStarted = false;
 
+    // Estados
     float m_clearColor[4] = {0.08f, 0.08f, 0.12f, 1.0f};
     glm::vec4 m_baseColor = {1.0f, 1.0f, 1.0f, 1.0f};
     glm::vec3 m_chunkOffset = {0.0f, 0.0f, 0.0f};
     bool m_textureEnabled = true;
+    bool m_depthMaskEnabled = true;
+    bool m_depthTestEnabled = true;
+    bool m_blendEnabled = true;
+
+    // Estados de Blending y Viñeta
+    int m_blendSrc = 1;
+    int m_blendDst = 0;
+    bool m_isVignettePass = false;
 
     bool m_shouldClose = false;
     int m_windowWidth = 1280;

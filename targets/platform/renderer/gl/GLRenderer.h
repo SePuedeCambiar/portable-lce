@@ -12,14 +12,14 @@ extern IPlatformRenderer& PlatformRenderer;
 class GLRenderer : public IPlatformRenderer {
 public:
     // Core & Lifecycle
-    void Initialise();
-    void InitialiseContext();
-    void Shutdown() override; // CORREGIDO: era voidL, ahora es void y tiene override
-    void Close();
-    bool ShouldClose();
+    void Initialise() override;
+    void InitialiseContext() override;
+    void Shutdown() override;
+    void Close() override;
+    [[nodiscard]] bool ShouldClose() override;
     void Tick() override;
     void Suspend() override;
-    bool Suspended() override;
+    [[nodiscard]] bool Suspended() override;
     void Resume() override;
 
     // Window
@@ -69,42 +69,41 @@ public:
     void StateSetTextureEnable(bool enable) override;
     void StateSetActiveTexture(int tex) override;
 
-
     // Textures
-    int TextureCreate() override;
+    [[nodiscard]] int TextureCreate() override;
     void TextureFree(int idx) override;
     void TextureBind(int idx) override;
     void TextureBindVertex(int idx, bool scaleLight = false) override;
     void TextureSetTextureLevels(int levels) override;
-    int TextureGetTextureLevels() override;
+    [[nodiscard]] int TextureGetTextureLevels() override;
     void TextureData(int width, int height, void* data, int level, eTextureFormat format) override;
     void TextureDataUpdate(int xoffset, int yoffset, int width, int height, void* data, int level) override;
     void TextureSetParam(int param, int value) override;
     void TextureDynamicUpdateStart() override;
     void TextureDynamicUpdateEnd() override;
-    int LoadTextureData(const char* szFilename, D3DXIMAGE_INFO* pSrcInfo, int** ppDataOut) override;
-    int LoadTextureData(std::uint8_t* pbData, std::uint32_t byteCount, D3DXIMAGE_INFO* pSrcInfo, int** ppDataOut) override;
-    int SaveTextureData(const char* szFilename, D3DXIMAGE_INFO* pSrcInfo, int* ppDataOut) override;
-    int SaveTextureDataToMemory(void* pOutput, int outputCapacity, int* outputLength, int width, int height, int* ppDataIn) override;
+    [[nodiscard]] int LoadTextureData(const char* szFilename, D3DXIMAGE_INFO* pSrcInfo, int** ppDataOut) override;
+    [[nodiscard]] int LoadTextureData(std::uint8_t* pbData, std::uint32_t byteCount, D3DXIMAGE_INFO* pSrcInfo, int** ppDataOut) override;
+    [[nodiscard]] int SaveTextureData(const char* szFilename, D3DXIMAGE_INFO* pSrcInfo, int* ppDataOut) override;
+    [[nodiscard]] int SaveTextureDataToMemory(void* pOutput, int outputCapacity, int* outputLength, int width, int height, int* ppDataIn) override;
     void ReadPixels(int x, int y, int w, int h, void* buf) override;
     void TextureGetStats() override;
-    void* TextureGetTexture(int idx) override;
+    [[nodiscard]] void* TextureGetTexture(int idx) override;
     
     void SetAtlasSize(int width, int height) override; 
 
     // Command Buffers
-    int CBuffCreate(int count) override;
+    [[nodiscard]] int CBuffCreate(int count) override;
     void CBuffDelete(int first, int count) override;
     void CBuffDeleteAll() override;
     void CBuffStart(int index, bool full) override;
     void CBuffClear(int index) override;
     void CBuffEnd() override;
-    bool CBuffCall(int index, bool full) override;
+    [[nodiscard]] bool CBuffCall(int index, bool full) override;
     void CBuffTick() override;
     void CBuffDeferredModeStart() override;
     void CBuffDeferredModeEnd() override;
     void flushIggyCache() override;
-    int CBuffSize(int index) override;
+    [[nodiscard]] int CBuffSize(int index) override;
     void CBuffLockStaticCreations() override;
 
     // Capturing & Events
@@ -129,11 +128,10 @@ public:
     void MatrixPop() override;
     void MatrixPush() override;
     void MatrixMult(float* mat) override;
-    const float* MatrixGet(int type) override;
+    [[nodiscard]] const float* MatrixGet(int type) override;
     void Set_matrixDirty() override;
 
     void UpdateGamma(unsigned short usGamma) override;
-    bool IsWidescreen() override;
-    bool IsHiDef() override;
-    // GetFramebufferSize ya estaba declarado arriba, se eliminó la duplicada de aquí.
+    [[nodiscard]] bool IsWidescreen() override;
+    [[nodiscard]] bool IsHiDef() override;
 };

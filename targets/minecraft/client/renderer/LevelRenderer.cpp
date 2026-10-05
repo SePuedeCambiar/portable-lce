@@ -1991,16 +1991,32 @@ void LevelRenderer::renderAdvancedClouds(float alpha) {
 // CLIPPING VECTORIAL P-VERTEX (8X MÁS RÁPIDO QUE EVALUAR 8 VÉRTICES)
 // ============================================================================
 static inline bool clipAABB(const float* bb, const float* frustum) {
-    for (int i = 0; i < 6; ++i, frustum += 4) {
+    // Evaluamos los 4 planos laterales (Izquierda, Derecha, Abajo, Arriba)
+    // que son idénticos entre OpenGL y Vulkan
+    for (int i = 0; i < 4; ++i, frustum += 4) {
         float px = (frustum[0] > 0.0f) ? bb[3] : bb[0];
         float py = (frustum[1] > 0.0f) ? bb[4] : bb[1];
         float pz = (frustum[2] > 0.0f) ? bb[5] : bb[2];
-        if ((frustum[0] * px + frustum[1] * py + frustum[2] * pz + frustum[3]) <= 0.0f) {
+        if ((frustum[0] * px + frustum[1] * py + frustum[2] * pz + frustum[3]) < -0.5f) {
             return false;
         }
     }
+
+    // Para el plano Lejano (Far) aplicamos un margen seguro de tolerancia
+    {
+        float px = (frustum[0] > 0.0f) ? bb[3] : bb[0];
+        float py = (frustum[1] > 0.0f) ? bb[4] : bb[1];
+        float pz = (frustum[2] > 0.0f) ? bb[5] : bb[2];
+        if ((frustum[0] * px + frustum[1] * py + frustum[2] * pz + frustum[3]) < -2.0f) {
+            return false;
+        }
+        frustum += 4;
+    }
+
+    // El plano Cerca (Near) en Vulkan no debe descartar chunks adyacentes a la cámara
     return true;
 }
+
 
 void LevelRenderer::cull(Culler* culler, float a) {
     int playerIndex = mc->player->GetXboxPad();

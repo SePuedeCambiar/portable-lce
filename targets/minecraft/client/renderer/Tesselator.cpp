@@ -19,11 +19,10 @@ thread_local std::unique_ptr<Tesselator> Tesselator::m_tlsInstance;
 
 Tesselator* Tesselator::getInstance() { 
     if (!m_tlsInstance) {
-        CreateNewThreadStorage(2 * 1024 * 1024);
+        CreateNewThreadStorage(4 * 1024 * 1024); // 4MB por hilo para chunks densos
     }
     return m_tlsInstance.get(); 
 }
-
 
 void Tesselator::CreateNewThreadStorage(int bytes) {
     Tesselator::m_tlsInstance = std::unique_ptr<Tesselator>(new Tesselator(bytes / 4));
@@ -42,6 +41,7 @@ Tesselator::Tesselator(int size) {
     vboMode = false;
     vboId = 0;
     vboCounts = 10;
+    vboIds = nullptr;
 
     u = v = 0;
     col = 0;
@@ -54,8 +54,8 @@ Tesselator::Tesselator(int size) {
     mipmapEnable = true;
     useProjectedTexturePixelShader = false;
 
-    this->size = size;
-    _array.resize(size);
+    this->size = (size < 65536) ? 65536 : size;
+    _array.resize(this->size);
 
     vboMode = USE_VBO;
     if (vboMode) {
@@ -67,7 +67,7 @@ Tesselator::Tesselator(int size) {
 Tesselator::~Tesselator() {
     if (vboMode && vboIds != nullptr) {
         glDeleteBuffers(vboCounts, (GLuint*)vboIds);
-        free(vboIds); 
+        delete vboIds; // Corrección: delete en vez de free()
         vboIds = nullptr;
     }
 
@@ -86,20 +86,19 @@ void Tesselator::end() {
     if (vertices > 0) {
         int vertexCount = vertices;
 
-        // Selección automática del formato de vértice (16 bytes vs 32 bytes)
+        // Selección del formato de vértice (16 bytes vs 32 bytes)
         IPlatformRenderer::eVertexType vertexType = useCompactFormat360
             ? IPlatformRenderer::VERTEX_TYPE_COMPRESSED
             : (useProjectedTexturePixelShader
                 ? IPlatformRenderer::VERTEX_TYPE_PF3_TF2_CB4_NB4_XW1_TEXGEN
                 : IPlatformRenderer::VERTEX_TYPE_PF3_TF2_CB4_NB4_XW1);
 
+        // Sanitización de color segura sin punteros flotantes
         if (!useCompactFormat360 && !hasColor) {
-            unsigned int* pColData = (unsigned int*)_array.data();
-            pColData += 5;
-            for (int i = 0; i < vertices; i++) {
-                if ((size_t)(i * 8 + 5) < _array.size()) {
-                    *pColData = 0x00000000;
-                    pColData += 8;
+            for (int i = 0; i < vertexCount; i++) {
+                size_t colIdx = (size_t)i * 8 + 5;
+                if (colIdx < _array.size()) {
+                    _array[colIdx] = 0x00000000;
                 }
             }
         }
@@ -200,31 +199,29 @@ void Tesselator::color(std::uint8_t r, std::uint8_t g, std::uint8_t b) {
 }
 
 // ============================================================================
-// VÉRTICE PRINCIPAL: SOPORTE DUAL (16 BYTES / 32 BYTES)
+// VÉRTICE PRINCIPAL CON PROTECCIÓN DE ALINEACIÓN Y REASIGNACIÓN DINÁMICA
 // ============================================================================
 void Tesselator::vertexUV(float x, float y, float z, float u, float v) {
     count++;
     float uu = mipmapEnable ? u : (u + 1.0f);
 
-    // --- PROTECCIÓN CONTRA DESBORDAMIENTO (Auto-crecimiento de RAM) ---
-    if (p + 16 >= (int)_array.size()) {
-        size_t newSize = std::max((size_t)_array.size() * 2, (size_t)p + 64);
-        _array.resize(newSize);
-        this->size = (int)newSize;
+    // Expansión automática segura: Siempre aseguramos espacio para al menos 16 palabras más
+    if ((size_t)(p + 16) >= _array.size()) {
+        size_t newCapacity = std::max(_array.size() * 2, (size_t)p + 1024);
+        _array.resize(newCapacity);
+        this->size = (int)newCapacity;
     }
-    // ------------------------------------------------------------------
 
     if (useCompactFormat360) {
-        // --- FORMATO COMPACTO DE 16 BYTES (Estilo Sodium / Xbox 360) ---
-        // Empaquetamos directamente en memoria contigua alineada
+        // Formato compacto de 16 bytes (4 enteros de 32 bits = 8 int16_t)
         int16_t* p16 = reinterpret_cast<int16_t*>(&_array[p]);
 
-        // 1. Posición Local (Offset 0..5, 6 bytes): Escalado x1024.0
+        // 1. Posición escalada x1024.0
         p16[0] = static_cast<int16_t>(std::round((x + xo) * 1024.0f));
         p16[1] = static_cast<int16_t>(std::round((y + yo) * 1024.0f));
         p16[2] = static_cast<int16_t>(std::round((z + zo) * 1024.0f));
 
-        // 2. Color BGR565 (Offset 6..7, 2 bytes)
+        // 2. Color BGR565
         if (hasColor) {
             uint8_t r = static_cast<uint8_t>((col >> 24) & 0xFF);
             uint8_t g = static_cast<uint8_t>((col >> 16) & 0xFF);
@@ -232,15 +229,14 @@ void Tesselator::vertexUV(float x, float y, float z, float u, float v) {
             uint16_t bgr565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
             p16[3] = static_cast<int16_t>(static_cast<int32_t>(bgr565) - 32768);
         } else {
-            // Blanco completo (0xFFFF en BGR565 con offset de consola)
             p16[3] = static_cast<int16_t>(65535 - 32768);
         }
 
-        // 3. Coordenadas UV (Offset 8..11, 4 bytes): Escalado x8192.0
+        // 3. Coordenadas UV escaladas x8192.0
         p16[4] = static_cast<int16_t>(std::round(uu * 8192.0f));
         p16[5] = static_cast<int16_t>(std::round(v * 8192.0f));
 
-        // 4. Lightmap Coordinates (Offset 12..15, 4 bytes)
+        // 4. Lightmap
         if (hasTexture2) {
             p16[6] = static_cast<int16_t>((_tex2 & 0xffff) + 8);
             p16[7] = static_cast<int16_t>(((_tex2 >> 16) & 0xffff) + 8);
@@ -249,9 +245,9 @@ void Tesselator::vertexUV(float x, float y, float z, float u, float v) {
             p16[7] = -512;
         }
 
-        p += 4; // 4 palabras de 32 bits = 16 bytes exactos
+        p += 4; // 16 bytes
     } else {
-        // --- FORMATO ESTÁNDAR DE 32 BYTES (Legacy / Fallback) ---
+        // Formato estándar de 32 bytes (8 enteros de 32 bits)
         float* fdata = reinterpret_cast<float*>(&_array[p]);
         fdata[0] = x + xo;
         fdata[1] = y + yo;
@@ -267,20 +263,13 @@ void Tesselator::vertexUV(float x, float y, float z, float u, float v) {
             pShort[0] = static_cast<int16_t>((_tex2 & 0xffff) + 8);
             pShort[1] = static_cast<int16_t>(((_tex2 >> 16) & 0xffff) + 8);
         } else {
-            *reinterpret_cast<uint32_t*>(&_array[p + 7]) = 0xfe00fe00;
+            _array[p + 7] = 0xfe00fe00;
         }
 
-        p += 8; // 8 palabras de 32 bits = 32 bytes
+        p += 8; // 32 bytes
     }
 
     vertices++;
-
-    // Despacho de seguridad si el buffer dinámico se llena
-    int strideWords = useCompactFormat360 ? 4 : 8;
-    if (vertices % 4 == 0 && p >= size - (strideWords * 4)) {
-        end();
-        tesselating = true;
-    }
 }
 
 void Tesselator::vertex(float x, float y, float z) {

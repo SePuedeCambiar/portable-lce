@@ -17,6 +17,7 @@ int glGenTextures_4J() {
 }
 
 void glGenTextures_4J(int n, unsigned int* textures) {
+    if (!textures) return;
     for (int i = 0; i < n; i++) {
         textures[i] = (unsigned int)PlatformRenderer.TextureCreate();
     }
@@ -27,6 +28,7 @@ void glDeleteTextures_4J(int id) {
 }
 
 void glDeleteTextures_4J(int n, const unsigned int* textures) {
+    if (!textures) return;
     for (int i = 0; i < n; i++) {
         PlatformRenderer.TextureFree((int)textures[i]);
     }
@@ -59,6 +61,7 @@ void glTexImage2D_4J(int target, int level, int internalformat, int width,
 }
 
 void glLight_4J(int light, int pname, FloatBuffer* params) {
+    if (!params) return;
     const float* p = params->_getDataPointer();
     int idx = (light == 0x4001) ? 1 : 0;
     if (pname == 0x1203) {
@@ -71,6 +74,7 @@ void glLight_4J(int light, int pname, FloatBuffer* params) {
 }
 
 void glLightModel_4J(int pname, FloatBuffer* params) {
+    if (!params) return;
     if (pname == 0x0B53) {
         const float* p = params->_getDataPointer();
         PlatformRenderer.StateSetLightAmbientColour(p[0], p[1], p[2]);
@@ -78,6 +82,7 @@ void glLightModel_4J(int pname, FloatBuffer* params) {
 }
 
 void glFog_4J(int pname, FloatBuffer* params) {
+    if (!params) return;
     const float* p = params->_getDataPointer();
     if (pname == 0x0B66) {
         PlatformRenderer.StateSetFogColour(p[0], p[1], p[2]);
@@ -85,6 +90,7 @@ void glFog_4J(int pname, FloatBuffer* params) {
 }
 
 void glGetFloat_4J(int pname, FloatBuffer* params) {
+    if (!params) return;
     const float* m = PlatformRenderer.MatrixGet(pname);
     if (m) {
         memcpy(params->_getDataPointer(), m, 16 * sizeof(float));
@@ -116,19 +122,108 @@ void glVertexPointer_4J(int, int, FloatBuffer*) {}
 void glEndList_4J(int) {}
 void glTexGen_4J(int, int, FloatBuffer*) {}
 
-extern "C" void glBindTexture(unsigned int target, unsigned int texture) {
+// ============================================================================
+// INTERCEPCIONES C DIRECTAS DE OPENGL A VULKAN PLATFORM RENDERER
+// ============================================================================
+extern "C" {
+
+void glBindTexture(unsigned int target, unsigned int texture) {
     PlatformRenderer.TextureBind((int)texture);
     PlatformRenderer.StateSetTextureEnable(texture != 0);
 }
 
-extern "C" void glEnable(unsigned int cap) {
-    if (cap == 0x0DE1) { // GL_TEXTURE_2D
-        PlatformRenderer.StateSetTextureEnable(true);
+void glEnable(unsigned int cap) {
+    switch (cap) {
+        case 0x0DE1: // GL_TEXTURE_2D
+            PlatformRenderer.StateSetTextureEnable(true);
+            break;
+        case 0x0B71: // GL_DEPTH_TEST
+            PlatformRenderer.StateSetDepthTestEnable(true);
+            break;
+        case 0x0BE2: // GL_BLEND
+            PlatformRenderer.StateSetBlendEnable(true);
+            break;
+        case 0x0B44: // GL_CULL_FACE
+            PlatformRenderer.StateSetFaceCull(true);
+            break;
+        case 0x0B50: // GL_LIGHTING
+            PlatformRenderer.StateSetLightingEnable(true);
+            break;
+        case 0x0B60: // GL_FOG
+            PlatformRenderer.StateSetFogEnable(true);
+            break;
+        case 0x0BC0: // GL_ALPHA_TEST
+            PlatformRenderer.StateSetAlphaTestEnable(true);
+            break;
+        default:
+            break;
     }
 }
 
-extern "C" void glDisable(unsigned int cap) {
-    if (cap == 0x0DE1) { // GL_TEXTURE_2D
-        PlatformRenderer.StateSetTextureEnable(false);
+void glDisable(unsigned int cap) {
+    switch (cap) {
+        case 0x0DE1: // GL_TEXTURE_2D
+            PlatformRenderer.StateSetTextureEnable(false);
+            break;
+        case 0x0B71: // GL_DEPTH_TEST
+            PlatformRenderer.StateSetDepthTestEnable(false);
+            break;
+        case 0x0BE2: // GL_BLEND
+            PlatformRenderer.StateSetBlendEnable(false);
+            break;
+        case 0x0B44: // GL_CULL_FACE
+            PlatformRenderer.StateSetFaceCull(false);
+            break;
+        case 0x0B50: // GL_LIGHTING
+            PlatformRenderer.StateSetLightingEnable(false);
+            break;
+        case 0x0B60: // GL_FOG
+            PlatformRenderer.StateSetFogEnable(false);
+            break;
+        case 0x0BC0: // GL_ALPHA_TEST
+            PlatformRenderer.StateSetAlphaTestEnable(false);
+            break;
+        default:
+            break;
     }
 }
+
+void glDepthMask(unsigned char flag) {
+    PlatformRenderer.StateSetDepthMask(flag != 0);
+}
+
+void glDepthFunc(unsigned int func) {
+    PlatformRenderer.StateSetDepthFunc((int)func);
+}
+
+void glBlendFunc(unsigned int sfactor, unsigned int dfactor) {
+    PlatformRenderer.StateSetBlendFunc((int)sfactor, (int)dfactor);
+}
+
+void glClear(unsigned int mask) {
+    PlatformRenderer.Clear((int)mask);
+}
+
+void glClearColor(float red, float green, float blue, float alpha) {
+    float c[4] = {red, green, blue, alpha};
+    PlatformRenderer.SetClearColour(c);
+}
+
+void glAlphaFunc(unsigned int func, float ref) {
+    PlatformRenderer.StateSetAlphaFunc((int)func, ref);
+}
+
+void glPolygonOffset(float factor, float units) {
+    PlatformRenderer.StateSetDepthSlopeAndBias(factor, units);
+}
+
+void glFrontFace(unsigned int mode) {
+    // GL_CW = 0x0900, GL_CCW = 0x0901
+    PlatformRenderer.StateSetFaceCullCW(mode == 0x0900);
+}
+
+void glColorMask(unsigned char red, unsigned char green, unsigned char blue, unsigned char alpha) {
+    PlatformRenderer.StateSetWriteEnable(red != 0, green != 0, blue != 0, alpha != 0);
+}
+
+} // extern "C"
