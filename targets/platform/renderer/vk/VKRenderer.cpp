@@ -17,9 +17,9 @@
 #include "shaders/frag_spv.h"
 
 // ============================================================================
-// FRAME ANATOMY DUMP - VULKAN (MEDICIÓN DENTRO DEL MUNDO REAL)
+// FRAME ANATOMY DUMP - VULKAN (MEDICIÓN PERFECTA CON TECLA P)
 // ============================================================================
-static int s_vkInGameFrames = 0;
+static bool s_vkPendingDump = false;
 static bool s_vkDumpThisFrame = false;
 static int s_vkDrawIndex = 0;
 static bool s_vkWorldDetected = false;
@@ -27,8 +27,8 @@ static bool s_vkWorldDetected = false;
 static void LogVKDraw(const char* type, int count, int tex, glm::vec4 col, glm::vec3 off, bool depthMask, int chunkId = -1) {
     if (!s_vkDumpThisFrame) return;
     s_vkDrawIndex++;
-    printf("[VK_WORLD_FRAME #%d | Draw #%03d] %s | ChkId:%d | Verts:%d | Tex:%d | DM:%d | Col:(%.2f,%.2f,%.2f,%.2f) | Off:(%.1f,%.1f,%.1f)\n",
-           s_vkInGameFrames, s_vkDrawIndex, type, chunkId, count, tex, (int)depthMask, col.r, col.g, col.b, col.a, off.x, off.y, off.z);
+    printf("[VK_WORLD_FRAME | Draw #%03d] %s | ChkId:%d | Verts:%d | Tex:%d | DM:%d | Col:(%.2f,%.2f,%.2f,%.2f) | Off:(%.1f,%.1f,%.1f)\n",
+           s_vkDrawIndex, type, chunkId, count, tex, (int)depthMask, col.r, col.g, col.b, col.a, off.x, off.y, off.z);
     fflush(stdout);
 }
 
@@ -842,14 +842,13 @@ void VKRenderer::Tick() {}
 void VKRenderer::StartFrame() {
     if (!m_device || !m_swapchain) return;
 
-    if (s_vkWorldDetected) {
-        s_vkInGameFrames++;
-        s_vkDumpThisFrame = (s_vkInGameFrames == 20);
-        if (s_vkDumpThisFrame) {
-            s_vkDrawIndex = 0;
-            printf("\n==================== INICIO DEL FRAME DUMP EN EL MUNDO 3D (VULKAN) ====================\n");
-            fflush(stdout);
-        }
+    // Si se presionó P, este frame se registrará completo
+    if (s_vkPendingDump) {
+        s_vkDumpThisFrame = true;
+        s_vkPendingDump = false;
+        s_vkDrawIndex = 0;
+        printf("\n==================== INICIO DEL FRAME DUMP (TECLA P EN VULKAN) ====================\n");
+        fflush(stdout);
     }
 
     std::vector<VKChunkBuffer> toDestroy;
@@ -911,8 +910,12 @@ void VKRenderer::StartFrame() {
 void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVertexType vType, ePixelShaderType psType) {
     if (count <= 0 || !dataIn) return;
 
-    if (m_isVignettePass) {
-        return;
+    // BLOQUEO DE LA VIÑETA OPACO:
+    // Si es un quad de 4 vértices sin profundidad con blend GL_ZERO o textura de viñeta,
+    // evitamos que tape el mundo 3D en pantalla.
+    bool allowDepthWrite = m_depthTestEnabled && m_depthMaskEnabled;
+    if (count == 4 && !allowDepthWrite && (m_isVignettePass || m_blendSrc == 0 || m_boundTextureId == 121)) {
+        return; // ¡No tapar la pantalla!
     }
 
     bool wasQuad = (ptype == PRIMITIVE_TYPE_QUAD_LIST || (int)ptype == 0x0007);
@@ -928,15 +931,12 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         return;
     }
 
-    LogVKDraw("DrawVertices", count, m_boundTextureId, m_baseColor, m_chunkOffset, m_depthMaskEnabled);
-
     if (!m_frameStarted) return;
     if (m_dynamicVertexOffset + bytes > DYNAMIC_VERTEX_BUFFER_SIZE) return;
 
     memcpy((char*)m_dynamicVertexMapped + m_dynamicVertexOffset, dataIn, bytes);
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
-    bool allowDepthWrite = m_depthTestEnabled && m_depthMaskEnabled;
     VkPipeline targetPipeline = allowDepthWrite ? m_pipelineOpaque : m_pipelineTransparent;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, targetPipeline);
 
@@ -980,24 +980,22 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
 void VKRenderer::Present() {
     if (!m_window) return;
 
-    // Procesamiento de eventos SDL y detección de tecla 'P'
+    // 1. Procesamiento de eventos SDL y detección de tecla 'P'
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_QUIT || ev.window.event == SDL_WINDOWEVENT_CLOSE) {
             m_shouldClose = true;
         } else if (ev.type == SDL_KEYDOWN) {
             if (ev.key.keysym.sym == SDLK_p) {
-                s_vkDumpThisFrame = true;
-                s_vkDrawIndex = 0;
-                printf("\n==================== INICIO DEL FRAME DUMP MANUAL (TECLA P EN JUEGO) ====================\n");
-                fflush(stdout);
+                // Avisamos a StartFrame que capture el próximo frame completo
+                s_vkPendingDump = true;
             }
         }
     }
 
-    // Cierre del volcado al terminar el frame
+    // 2. Cierre del volcado si este frame fue el que se capturó
     if (s_vkDumpThisFrame) {
-        printf("==================== FIN DEL FRAME DUMP (VULKAN | Total: %d) ====================\n\n", s_vkDrawIndex);
+        printf("==================== FIN DEL FRAME DUMP (VULKAN | Total Draws: %d) ====================\n\n", s_vkDrawIndex);
         fflush(stdout);
         s_vkDumpThisFrame = false; // Solo captura ese frame exacto
     }
@@ -1271,6 +1269,7 @@ bool VKRenderer::CBuffCall(int index, bool full) {
     for (const auto& dc : cb.draws) totalVerts += dc.count;
     LogVKDraw("CBuffCall   ", totalVerts, m_boundTextureId, m_baseColor, m_chunkOffset, m_depthMaskEnabled, index);
 
+    // Subida diferida a VRAM en GPU si aún no se ha subido
     if (!cb.vboReady) {
         if (cb.rawVerts.empty() || cb.draws.empty()) return false;
 
@@ -1302,9 +1301,12 @@ bool VKRenderer::CBuffCall(int index, bool full) {
     // Los bloques sólidos usan el pipeline opaco que prueba y escribe profundidad
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineOpaque);
 
-    // SELECCIÓN SEGURA DE TEXTURA:
-    // Los chunks usan SIEMPRE el atlas de bloques (m_terrainAtlasId). Jamás un mapa de luz de 16x16.
-    int terrainTexId = (m_terrainAtlasId > 0) ? m_terrainAtlasId : 1;
+    // SELECCIÓN SEGURA DEL ATLAS DE BLOQUES (UNIDAD 0):
+    // 1. Usar m_boundTextureId si es válida y no es el Lightmap
+    // 2. Si no, usar m_terrainAtlasId detectado
+    int terrainTexId = (m_boundTextureId > 0 && m_boundTextureId != m_boundLightmapId) 
+                       ? m_boundTextureId 
+                       : m_terrainAtlasId;
 
     VkDescriptorSet currentSet = m_defaultWhiteTexture.descriptorSet;
     int hasTex = 0;
@@ -1316,7 +1318,7 @@ bool VKRenderer::CBuffCall(int index, bool full) {
             currentSet = texIt->second.descriptorSet;
             hasTex = 1;
         } else if (!m_textures.empty()) {
-            // Fallback: Buscar la primera textura grande (atlas) disponible
+            // Fallback: Buscar la primera textura grande (atlas de bloques) disponible en VRAM
             for (const auto& pair : m_textures) {
                 if (pair.second.width >= 256 && pair.second.descriptorSet != VK_NULL_HANDLE) {
                     currentSet = pair.second.descriptorSet;
@@ -1436,10 +1438,13 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
     tex.width = width;
     tex.height = height;
 
-    // DETECCIÓN AUTOMÁTICA DEL ATLAS DE BLOQUES (terrain.png siempre es >= 256x256)
+    // Log de telemetría de texturas
+    printf("[Vulkan Texture Loaded] ID: %d | %dx%d\n", texId, width, height);
+
+    // DETECCIÓN AUTOMÁTICA DEL ATLAS DE BLOQUES (terrain.png es >= 256x256)
     if (width >= 256 && height >= 256) {
         m_terrainAtlasId = texId;
-        printf("[Vulkan] Atlas de bloques detectado con exito: TexId=%d (%dx%d)\n", texId, width, height);
+        printf("[Vulkan] Atlas de bloques asignado: TexId=%d (%dx%d)\n", texId, width, height);
     }
 
     VkImageCreateInfo imgInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -1629,8 +1634,10 @@ void VKRenderer::StateSetDepthTestEnable(bool enable) {
 void VKRenderer::StateSetBlendFunc(int src, int dst) {
     m_blendSrc = src;
     m_blendDst = dst;
-    m_isVignettePass = (src == 0 && (dst == 0x0307 || dst == 775));
+    // Si la fuente es GL_ZERO (0), es el pase de viñeta que oscurece la pantalla
+    m_isVignettePass = (src == 0);
 }
+
 
 void VKRenderer::StateSetBlendFactor(unsigned int colour) {}
 void VKRenderer::StateSetAlphaFunc(int func, float param) {}

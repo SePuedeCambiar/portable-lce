@@ -122,14 +122,35 @@ void glVertexPointer_4J(int, int, FloatBuffer*) {}
 void glEndList_4J(int) {}
 void glTexGen_4J(int, int, FloatBuffer*) {}
 
+// Registro de unidad activa: 0 = GL_TEXTURE0 (Atlas de Bloques), 1 = GL_TEXTURE1 (Lightmap)
+static int s_currentActiveTextureUnit = 0;
+
 // ============================================================================
 // INTERCEPCIONES C DIRECTAS DE OPENGL A VULKAN PLATFORM RENDERER
 // ============================================================================
 extern "C" {
 
+void glActiveTexture(unsigned int texture) {
+    // GL_TEXTURE0 = 0x84C0, GL_TEXTURE1 = 0x84C1 (o índices 0 y 1)
+    s_currentActiveTextureUnit = (texture == 0x84C1 || texture == 1) ? 1 : 0;
+    PlatformRenderer.StateSetActiveTexture(s_currentActiveTextureUnit);
+}
+
+void glClientActiveTexture(unsigned int texture) {
+    (void)texture;
+}
+
 void glBindTexture(unsigned int target, unsigned int texture) {
-    PlatformRenderer.TextureBind((int)texture);
-    PlatformRenderer.StateSetTextureEnable(texture != 0);
+    if (s_currentActiveTextureUnit == 1) {
+        // Unidad 1: Lightmap dinámico
+        PlatformRenderer.TextureBindVertex((int)texture);
+        // ¡CRÍTICO!: Regla de 4J: Volver de inmediato a la Unidad 0 para los bloques
+        s_currentActiveTextureUnit = 0;
+    } else {
+        // Unidad 0: Atlas de bloques (terrain.png), texturas de mobs, cielo, GUI
+        PlatformRenderer.TextureBind((int)texture);
+        PlatformRenderer.StateSetTextureEnable(texture != 0);
+    }
 }
 
 void glEnable(unsigned int cap) {
