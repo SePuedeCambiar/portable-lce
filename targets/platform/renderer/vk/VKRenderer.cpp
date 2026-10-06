@@ -128,7 +128,7 @@ const std::vector<const char*> deviceExtensions = {
     VK_KHR_SWAPCHAIN_EXTENSION_NAME
 };
 
-const int MAX_FRAMES_IN_FLIGHT = 2;
+const int MAX_FRAMES_IN_FLIGHT = 1;
 static std::atomic<int> s_nextTexId{10};
 
 static uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t typeFilter, VkMemoryPropertyFlags properties) {
@@ -937,7 +937,18 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     memcpy((char*)m_dynamicVertexMapped + m_dynamicVertexOffset, dataIn, bytes);
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
-    VkPipeline targetPipeline = allowDepthWrite ? m_pipelineOpaque : m_pipelineTransparent;
+
+    VkPipeline targetPipeline;
+    if (!m_depthTestEnabled) {
+        targetPipeline = m_pipelineNoDepth;        // Cielo y HUD (Sin depth test)
+    } else if (allowDepthWrite) {
+        targetPipeline = m_pipelineOpaque;         // Bloques sólidos
+    } else {
+        targetPipeline = m_pipelineTransparent;    // Agua, hielo, partículas
+    }
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, targetPipeline);
+
+
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, targetPipeline);
 
     VkDescriptorSet currentSet = m_defaultWhiteTexture.descriptorSet;
@@ -980,24 +991,33 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
 void VKRenderer::Present() {
     if (!m_window) return;
 
-    // 1. Procesamiento de eventos SDL y detección de tecla 'P'
-    SDL_Event ev;
-    while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT || ev.window.event == SDL_WINDOWEVENT_CLOSE) {
+    // 1. Detección no destructiva de la tecla 'P' (NO consume eventos de ratón/WASD)
+    const Uint8* keyState = SDL_GetKeyboardState(nullptr);
+    static bool s_pWasPressed = false;
+    if (keyState[SDL_SCANCODE_P]) {
+        if (!s_pWasPressed) {
+            s_vkPendingDump = true;
+            s_pWasPressed = true;
+        }
+    } else {
+        s_pWasPressed = false;
+    }
+
+    // 2. Comprobar si se cerró la ventana usando PEEK (sin vaciar la cola de Minecraft)
+    SDL_PumpEvents();
+    SDL_Event evs[8];
+    int count = SDL_PeepEvents(evs, 8, SDL_PEEKEVENT, SDL_FIRSTEVENT, SDL_LASTEVENT);
+    for (int i = 0; i < count; i++) {
+        if (evs[i].type == SDL_QUIT || (evs[i].type == SDL_WINDOWEVENT && evs[i].window.event == SDL_WINDOWEVENT_CLOSE)) {
             m_shouldClose = true;
-        } else if (ev.type == SDL_KEYDOWN) {
-            if (ev.key.keysym.sym == SDLK_p) {
-                // Avisamos a StartFrame que capture el próximo frame completo
-                s_vkPendingDump = true;
-            }
         }
     }
 
-    // 2. Cierre del volcado si este frame fue el que se capturó
+    // 3. Cierre del dump de telemetría si se capturó este frame
     if (s_vkDumpThisFrame) {
         printf("==================== FIN DEL FRAME DUMP (VULKAN | Total Draws: %d) ====================\n\n", s_vkDrawIndex);
         fflush(stdout);
-        s_vkDumpThisFrame = false; // Solo captura ese frame exacto
+        s_vkDumpThisFrame = false;
     }
 
     if (!m_frameStarted) return;
@@ -1098,8 +1118,10 @@ void VKRenderer::Shutdown() {
         if (m_globalEBO) vkDestroyBuffer(m_device, m_globalEBO, nullptr);
         if (m_globalEBOMemory) vkFreeMemory(m_device, m_globalEBOMemory, nullptr);
 
+        // Destrucción de la tríada de pipelines de Vulkan
         if (m_pipelineOpaque) vkDestroyPipeline(m_device, m_pipelineOpaque, nullptr);
         if (m_pipelineTransparent) vkDestroyPipeline(m_device, m_pipelineTransparent, nullptr);
+        if (m_pipelineNoDepth) vkDestroyPipeline(m_device, m_pipelineNoDepth, nullptr); // <-- NUEVO
         if (m_pipelineLayout) vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
 
         for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
@@ -1162,7 +1184,12 @@ void VKRenderer::MatrixMode(int type) {
 }
 void VKRenderer::MatrixSetIdentity() { activeStack().load(glm::mat4(1.f)); }
 void VKRenderer::MatrixTranslate(float x, float y, float z) { activeStack().mul(glm::translate(glm::mat4(1.f), {x, y, z})); }
-void VKRenderer::MatrixRotate(float angle, float x, float y, float z) { activeStack().mul(glm::rotate(glm::mat4(1.f), glm::radians(angle), {x, y, z})); }
+
+void VKRenderer::MatrixRotate(float angle, float x, float y, float z) {
+    // 4J pasa el ángulo ya en radianes: pasar 'angle' directo sin glm::radians()
+    activeStack().mul(glm::rotate(glm::mat4(1.f), angle, {x, y, z}));
+}
+
 void VKRenderer::MatrixScale(float x, float y, float z) { activeStack().mul(glm::scale(glm::mat4(1.f), {x, y, z})); }
 void VKRenderer::MatrixPerspective(float fovy, float aspect, float zNear, float zFar) { s_proj.cur() = glm::perspective(glm::radians(fovy), aspect, zNear, zFar); }
 void VKRenderer::MatrixOrthogonal(float left, float right, float bottom, float top, float zNear, float zFar) { s_proj.cur() = glm::ortho(left, right, bottom, top, zNear, zFar); }

@@ -207,6 +207,7 @@ private:
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_pipelineOpaque = VK_NULL_HANDLE;
     VkPipeline m_pipelineTransparent = VK_NULL_HANDLE;
+    VkPipeline m_pipelineNoDepth = VK_NULL_HANDLE;
 
     // Separación de Unidades de Textura (Unit 0 = Atlas/GUI, Unit 1 = Lightmap)
     std::unordered_map<int, VKTexture> m_textures;
