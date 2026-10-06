@@ -349,7 +349,7 @@ void Chunk::rebuild() {
                 glNewList(lists + currentLayer, GL_COMPILE);
                 glDepthMask(true);
                 // ACTIVAMOS FORMATO COMPACTO DE 16 BYTES
-                t->useCompactVertices(true); 
+                t->useCompactVertices(false); 
                 t->begin();
                 t->offset((float)(-this->x), (float)(-this->y), (float)(-this->z));
             }
@@ -648,7 +648,7 @@ void Chunk::rebuild() {
             t->end();
             bounds.addBounds(t->bounds);
             glEndList();
-            t->useCompactVertices(true); // Mantenemos el formato compacto consistente
+            t->useCompactVertices(false); // Mantenemos el formato compacto consistente
             t->offset(0, 0, 0);
         }
         

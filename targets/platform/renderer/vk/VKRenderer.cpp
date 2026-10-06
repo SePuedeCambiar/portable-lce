@@ -1256,7 +1256,7 @@ void VKRenderer::CBuffEnd() {
 bool VKRenderer::CBuffCall(int index, bool full) {
     if (!m_frameStarted) return false;
 
-    // Confirmación de que el motor está dibujando el mundo real
+    // Confirmación de que el motor está despachando chunks en el mundo
     s_vkWorldDetected = true;
 
     std::shared_lock<std::shared_mutex> lk_pool(m_poolMtx);
@@ -1269,7 +1269,7 @@ bool VKRenderer::CBuffCall(int index, bool full) {
     for (const auto& dc : cb.draws) totalVerts += dc.count;
     LogVKDraw("CBuffCall   ", totalVerts, m_boundTextureId, m_baseColor, m_chunkOffset, m_depthMaskEnabled, index);
 
-    // Subida diferida a VRAM en GPU si aún no se ha subido
+    // 1. Subida perezosa (Lazy upload) de la malla del chunk a VRAM si aún no está lista
     if (!cb.vboReady) {
         if (cb.rawVerts.empty() || cb.draws.empty()) return false;
 
@@ -1298,12 +1298,13 @@ bool VKRenderer::CBuffCall(int index, bool full) {
     if (cb.vbo == VK_NULL_HANDLE || cb.draws.empty()) return true;
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
-    // Los bloques sólidos usan el pipeline opaco que prueba y escribe profundidad
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineOpaque);
 
-    // SELECCIÓN SEGURA DEL ATLAS DE BLOQUES (UNIDAD 0):
-    // 1. Usar m_boundTextureId si es válida y no es el Lightmap
-    // 2. Si no, usar m_terrainAtlasId detectado
+    // 2. Selección de Pipeline: Sólido para terreno opaco, Transparente para agua/hielo
+    bool allowDepthWrite = m_depthTestEnabled && m_depthMaskEnabled;
+    VkPipeline targetPipeline = allowDepthWrite ? m_pipelineOpaque : m_pipelineTransparent;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, targetPipeline);
+
+    // 3. SELECCIÓN BLINDADA DEL ATLAS DE BLOQUES (UNIDAD 0)
     int terrainTexId = (m_boundTextureId > 0 && m_boundTextureId != m_boundLightmapId) 
                        ? m_boundTextureId 
                        : m_terrainAtlasId;
@@ -1313,43 +1314,56 @@ bool VKRenderer::CBuffCall(int index, bool full) {
 
     {
         std::lock_guard<std::mutex> lk(m_textureMtx);
+
+        // Prioridad 1: Buscar la textura solicitada
         auto texIt = m_textures.find(terrainTexId);
         if (texIt != m_textures.end() && texIt->second.descriptorSet != VK_NULL_HANDLE) {
             currentSet = texIt->second.descriptorSet;
             hasTex = 1;
-        } else if (!m_textures.empty()) {
-            // Fallback: Buscar la primera textura grande (atlas de bloques) disponible en VRAM
+        } 
+        // Prioridad 2: Buscar directamente por m_terrainAtlasId si terrainTexId era distinto
+        else if (m_terrainAtlasId > 0) {
+            auto atlasIt = m_textures.find(m_terrainAtlasId);
+            if (atlasIt != m_textures.end() && atlasIt->second.descriptorSet != VK_NULL_HANDLE) {
+                currentSet = atlasIt->second.descriptorSet;
+                hasTex = 1;
+            }
+        }
+
+        // Prioridad 3 (Fallback definitivo): Buscar la textura más grande en memoria (Atlas >= 256x256)
+        if (!hasTex && !m_textures.empty()) {
+            int bestArea = 0;
             for (const auto& pair : m_textures) {
-                if (pair.second.width >= 256 && pair.second.descriptorSet != VK_NULL_HANDLE) {
+                int area = pair.second.width * pair.second.height;
+                if (area >= (256 * 256) && area > bestArea && pair.second.descriptorSet != VK_NULL_HANDLE) {
+                    bestArea = area;
                     currentSet = pair.second.descriptorSet;
                     hasTex = 1;
-                    break;
                 }
-            }
-            if (!hasTex) {
-                currentSet = m_textures.begin()->second.descriptorSet;
-                hasTex = 1;
             }
         }
     }
 
+    // 4. Enlazar el DescriptorSet del atlas
     if (currentSet != VK_NULL_HANDLE) {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &currentSet, 0, nullptr);
     }
 
+    // 5. Configurar Push Constants
     PushConstants pc;
     pc.uMVP = s_vkClipCorrection * (s_proj.cur() * s_mv.cur());
-    // Blanco puro (1,1,1,1) para no quemar los bloques con el negro del cielo
-    pc.uBaseColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
+    pc.uBaseColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f); // Base neutra para respetar colores de AO y biomas
     pc.uChunkOffset = m_chunkOffset;
     pc.uHasTexture = hasTex;
 
     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants), &pc);
 
+    // 6. Enlazar Vertex Buffer del chunk e Index Buffer de Quads global
     VkDeviceSize offsets[] = {0};
     vkCmdBindVertexBuffers(cmd, 0, 1, &cb.vbo, offsets);
     vkCmdBindIndexBuffer(cmd, m_globalEBO, 0, VK_INDEX_TYPE_UINT32);
 
+    // 7. Despacho de las llamadas de dibujo del chunk
     for (const auto& dc : cb.draws) {
         if (dc.count <= 0) continue;
         if (dc.wasQuad) {
@@ -1402,28 +1416,33 @@ void VKRenderer::TextureSetTextureLevels(int levels) {}
 int VKRenderer::TextureGetTextureLevels() { return 1; }
 
 void VKRenderer::TextureData(int width, int height, void* data, int level, eTextureFormat format) {
-    if (width <= 0 || height <= 0 || !data || level != 0) return;
+    // CORRECCIÓN: Permitir data == nullptr (Minecraft reserva el atlas vacío antes de llenarlo)
+    if (width <= 0 || height <= 0 || level != 0) return;
 
     std::lock_guard<std::mutex> lk(m_textureMtx);
     int texId = (m_boundTextureId > 0) ? m_boundTextureId : s_nextTexId++;
-    VkDeviceSize imageSize = width * height * 4;
+    VkDeviceSize imageSize = (VkDeviceSize)width * height * 4;
 
-    VkBuffer stagingBuffer;
-    VkDeviceMemory stagingBufferMemory;
-    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE};
-    VK_CHECK(vkCreateBuffer(m_device, &bufferInfo, nullptr, &stagingBuffer));
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingBufferMemory = VK_NULL_HANDLE;
 
-    VkMemoryRequirements memReqs;
-    vkGetBufferMemoryRequirements(m_device, stagingBuffer, &memReqs);
-    VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, memReqs.size,
-                                   findMemoryType(m_physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
-    VK_CHECK(vkAllocateMemory(m_device, &allocInfo, nullptr, &stagingBufferMemory));
-    VK_CHECK(vkBindBufferMemory(m_device, stagingBuffer, stagingBufferMemory, 0));
+    // Solo usar staging buffer si vienen píxeles reales de CPU
+    if (data != nullptr) {
+        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE};
+        VK_CHECK(vkCreateBuffer(m_device, &bufferInfo, nullptr, &stagingBuffer));
 
-    void* mapped = nullptr;
-    vkMapMemory(m_device, stagingBufferMemory, 0, imageSize, 0, &mapped);
-    memcpy(mapped, data, imageSize);
-    vkUnmapMemory(m_device, stagingBufferMemory);
+        VkMemoryRequirements memReqs;
+        vkGetBufferMemoryRequirements(m_device, stagingBuffer, &memReqs);
+        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, memReqs.size,
+                                       findMemoryType(m_physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+        VK_CHECK(vkAllocateMemory(m_device, &allocInfo, nullptr, &stagingBufferMemory));
+        VK_CHECK(vkBindBufferMemory(m_device, stagingBuffer, stagingBufferMemory, 0));
+
+        void* mapped = nullptr;
+        vkMapMemory(m_device, stagingBufferMemory, 0, imageSize, 0, &mapped);
+        memcpy(mapped, data, imageSize);
+        vkUnmapMemory(m_device, stagingBufferMemory);
+    }
 
     auto it = m_textures.find(texId);
     if (it != m_textures.end()) {
@@ -1438,13 +1457,12 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
     tex.width = width;
     tex.height = height;
 
-    // Log de telemetría de texturas
-    printf("[Vulkan Texture Loaded] ID: %d | %dx%d\n", texId, width, height);
+    printf("[Vulkan Texture] Creada ID: %d | %dx%d (%s)\n", texId, width, height, data ? "Con Datos" : "Lienzo Vacío");
 
-    // DETECCIÓN AUTOMÁTICA DEL ATLAS DE BLOQUES (terrain.png es >= 256x256)
+    // DETECCIÓN DEFINITIVA DEL ATLAS DE BLOQUES (terrain.png es >= 256x256)
     if (width >= 256 && height >= 256) {
         m_terrainAtlasId = texId;
-        printf("[Vulkan] Atlas de bloques asignado: TexId=%d (%dx%d)\n", texId, width, height);
+        printf("[Vulkan] >>> ATLAS DE BLOQUES REGISTRADO: TexId=%d (%dx%d) <<<\n", texId, width, height);
     }
 
     VkImageCreateInfo imgInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -1462,39 +1480,55 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
     imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
 
     VK_CHECK(vkCreateImage(m_device, &imgInfo, nullptr, &tex.image));
+
+    VkMemoryRequirements memReqs;
     vkGetImageMemoryRequirements(m_device, tex.image, &memReqs);
 
-    allocInfo.allocationSize = memReqs.size;
-    allocInfo.memoryTypeIndex = findMemoryType(m_physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, memReqs.size,
+                                   findMemoryType(m_physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
     VK_CHECK(vkAllocateMemory(m_device, &allocInfo, nullptr, &tex.memory));
     VK_CHECK(vkBindImageMemory(m_device, tex.image, tex.memory, 0));
 
     VkCommandBuffer cmd = beginSingleTimeCommands();
 
-    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.image = tex.image;
-    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    barrier.srcAccessMask = 0;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    if (data != nullptr) {
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.image = tex.image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-    VkBufferImageCopy region{};
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = { (uint32_t)width, (uint32_t)height, 1 };
-    vkCmdCopyBufferToImage(cmd, stagingBuffer, tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = { (uint32_t)width, (uint32_t)height, 1 };
+        vkCmdCopyBufferToImage(cmd, stagingBuffer, tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    } else {
+        // Si no hay datos, hacemos la transición directa a SHADER_READ_ONLY para que TextureDataUpdate escriba en ella
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.image = tex.image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    }
 
     endSingleTimeCommands(cmd);
 
-    vkDestroyBuffer(m_device, stagingBuffer, nullptr);
-    vkFreeMemory(m_device, stagingBufferMemory, nullptr);
+    if (stagingBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(m_device, stagingBuffer, nullptr);
+        vkFreeMemory(m_device, stagingBufferMemory, nullptr);
+    }
 
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = tex.image;
