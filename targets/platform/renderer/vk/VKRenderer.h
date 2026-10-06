@@ -74,6 +74,7 @@ public:
     virtual void MatrixScale(float x, float y, float z) override;
     virtual void MatrixPerspective(float fovy, float aspect, float zNear, float zFar) override;
     virtual void MatrixOrthogonal(float left, float right, float bottom, float top, float zNear, float zFar) override;
+
     virtual void MatrixPop() override;
     virtual void MatrixPush() override;
     virtual void MatrixMult(float* mat) override;
@@ -210,6 +211,7 @@ private:
     VkPipeline m_pipelineOpaque = VK_NULL_HANDLE;
     VkPipeline m_pipelineTransparent = VK_NULL_HANDLE;
     VkPipeline m_pipelineNoDepth = VK_NULL_HANDLE;
+    VkPipeline m_pipelineAdditive = VK_NULL_HANDLE; // <--- Declarado aquí
 
     // Separación de Unidades de Textura (Unit 0 = Atlas/GUI, Unit 1 = Lightmap)
     std::unordered_map<int, VKTexture> m_textures;

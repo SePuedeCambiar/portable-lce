@@ -795,7 +795,7 @@ void VKRenderer::Initialise() {
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineTransparent));
 
-    // 3. PIPELINE SIN PROFUNDIDAD (Para Sol, Estrellas y HUD 2D)
+    // 3. PIPELINE SIN PROFUNDIDAD (Para HUD 2D)
     VkPipelineDepthStencilStateCreateInfo depthNone{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthNone.depthTestEnable = VK_FALSE;
     depthNone.depthWriteEnable = VK_FALSE;
@@ -804,17 +804,40 @@ void VKRenderer::Initialise() {
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineNoDepth));
 
     // 4. PIPELINE PARA LÍNEAS (Para el recuadro de bloque seleccionado y caña de pescar)
-    // NOTA: En Vulkan, para topologías de líneas, polygonMode DEBE ser VK_POLYGON_MODE_FILL
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL; 
     rasterizer.lineWidth = 1.0f;
-    pipelineInfo.pDepthStencilState = &depthTrans; // <--- ¡Prueba profundidad para ocultar aristas traseras!
+    pipelineInfo.pDepthStencilState = &depthTrans; // Prueba profundidad para ocultar aristas traseras
+    pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineLines));
 
     // 5. PIPELINE PARA TRIANGLE FAN (Para la cúpula continua y horizonte del Cielo)
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    pipelineInfo.pDepthStencilState = &depthNone;
+    pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineTriangleFan));
+
+    // 6. PIPELINE ADITIVO (Para el Sol, Estrellas, Luna y Rayos de Beacons - Elimina el recuadro negro)
+    VkPipelineColorBlendAttachmentState blendAdditive{};
+    blendAdditive.colorWriteMask = 0xF;
+    blendAdditive.blendEnable = VK_TRUE;
+    blendAdditive.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    blendAdditive.dstColorBlendFactor = VK_BLEND_FACTOR_ONE; // Suma color al cielo sin tapar
+    blendAdditive.colorBlendOp = VK_BLEND_OP_ADD;
+    blendAdditive.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blendAdditive.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blendAdditive.alphaBlendOp = VK_BLEND_OP_ADD;
+
+    VkPipelineColorBlendStateCreateInfo colorBlendingAdditive{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    colorBlendingAdditive.attachmentCount = 1;
+    colorBlendingAdditive.pAttachments = &blendAdditive;
+
+    pipelineInfo.pDepthStencilState = &depthNone;
+    pipelineInfo.pColorBlendState = &colorBlendingAdditive;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineAdditive));
 
     // Restaurar configuración base
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -863,7 +886,7 @@ void VKRenderer::Initialise() {
 
     m_baseColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
 
-    printf("[Vulkan] Inicialización de pipelines (Opaco, Transparente, NoDepth, Líneas, TriangleFan) completada.\n");
+    printf("[Vulkan] Inicialización de 6 pipelines (Opaco, Transparente, NoDepth, Líneas, TriangleFan, Aditivo) completada.\n");
 }
 
 void VKRenderer::InitialiseContext() {}
@@ -979,6 +1002,8 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         return;
     }
 
+    LogVKDraw("DrawVertices", count, m_boundTextureId, m_baseColor, glm::vec3(0.0f), m_depthMaskEnabled);
+
     if (!m_frameStarted) return;
     if (m_dynamicVertexOffset + bytes > DYNAMIC_VERTEX_BUFFER_SIZE) return;
 
@@ -987,13 +1012,17 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
 
-    // 4. SELECCIÓN DE PIPELINE SEGÚN TOPOLOGÍA (Líneas, Fans, NoDepth, Opaque)
+    // 4. SELECCIÓN DE PIPELINE (Aditivo para Sol/Estrellas, Líneas, Fans, NoDepth, Opaque)
     int ptypeVal = (int)ptype;
     bool isLine = (ptypeVal == 1 || ptypeVal == 3);      // GL_LINES (1) o GL_LINE_STRIP (3)
     bool isFan  = (ptypeVal == 2 || ptypeVal == 6);      // GL_TRIANGLE_FAN (Cúpula del cielo)
 
     VkPipeline targetPipeline = m_pipelineTransparent;
-    if (isLine && m_pipelineLines != VK_NULL_HANDLE) {
+
+    // PRIORIDAD 1: Mezcla Aditiva (GL_ONE = 1) para el Sol, la Luna y las Estrellas
+    if (m_blendDst == 1 && m_pipelineAdditive != VK_NULL_HANDLE) {
+        targetPipeline = m_pipelineAdditive;
+    } else if (isLine && m_pipelineLines != VK_NULL_HANDLE) {
         targetPipeline = m_pipelineLines;              // Recuadro del bloque seleccionado
     } else if (isFan && m_pipelineTriangleFan != VK_NULL_HANDLE) {
         targetPipeline = m_pipelineTriangleFan;        // Cúpula continua del Cielo
@@ -1179,12 +1208,13 @@ void VKRenderer::Shutdown() {
         if (m_globalEBO) vkDestroyBuffer(m_device, m_globalEBO, nullptr);
         if (m_globalEBOMemory) vkFreeMemory(m_device, m_globalEBOMemory, nullptr);
 
-        // Destrucción de la tríada de pipelines de Vulkan
+        // Destrucción limpia de los 6 pipelines de Vulkan
         if (m_pipelineOpaque) vkDestroyPipeline(m_device, m_pipelineOpaque, nullptr);
         if (m_pipelineTransparent) vkDestroyPipeline(m_device, m_pipelineTransparent, nullptr);
         if (m_pipelineNoDepth) vkDestroyPipeline(m_device, m_pipelineNoDepth, nullptr);
-            if (m_pipelineLines) vkDestroyPipeline(m_device, m_pipelineLines, nullptr);
-            if (m_pipelineTriangleFan) vkDestroyPipeline(m_device, m_pipelineTriangleFan, nullptr);
+        if (m_pipelineLines) vkDestroyPipeline(m_device, m_pipelineLines, nullptr);
+        if (m_pipelineTriangleFan) vkDestroyPipeline(m_device, m_pipelineTriangleFan, nullptr);
+        if (m_pipelineAdditive) vkDestroyPipeline(m_device, m_pipelineAdditive, nullptr);
         if (m_pipelineLayout) vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
 
         for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
