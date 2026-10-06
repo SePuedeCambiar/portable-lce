@@ -523,8 +523,11 @@ void VKRenderer::Initialise() {
         queueCreateInfos.push_back(queueCreateInfo);
     }
 
+    // Activamos capacidades avanzadas de líneas y polígonos soportadas por Intel Mesa
     VkPhysicalDeviceFeatures deviceFeatures{};
     deviceFeatures.samplerAnisotropy = VK_TRUE;
+    deviceFeatures.fillModeNonSolid = VK_TRUE;
+    deviceFeatures.wideLines = VK_TRUE;
 
     VkDeviceCreateInfo deviceCreateInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     deviceCreateInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
@@ -739,7 +742,7 @@ void VKRenderer::Initialise() {
     std::vector<VkDynamicState> dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dynamicState{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0, (uint32_t)dynamicStates.size(), dynamicStates.data()};
 
-    // 1. PIPELINE OPACO (Para bloques sólidos - Escribe en Depth Buffer, SIN BLEND / SÓLIDO)
+    // 1. PIPELINE OPACO (Para bloques sólidos - Escribe en Depth Buffer, SÓLIDO)
     VkPipelineDepthStencilStateCreateInfo depthOpaque{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthOpaque.depthTestEnable = VK_TRUE;
     depthOpaque.depthWriteEnable = VK_TRUE;
@@ -747,7 +750,7 @@ void VKRenderer::Initialise() {
 
     VkPipelineColorBlendAttachmentState blendOpaque{};
     blendOpaque.colorWriteMask = 0xF;
-    blendOpaque.blendEnable = VK_FALSE; // <--- Sólido absoluto, sin transparencia invisible
+    blendOpaque.blendEnable = VK_FALSE;
 
     VkPipelineColorBlendStateCreateInfo colorBlendingOpaque{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     colorBlendingOpaque.attachmentCount = 1;
@@ -768,7 +771,7 @@ void VKRenderer::Initialise() {
     pipelineInfo.renderPass = m_renderPass;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineOpaque));
 
-    // 2. PIPELINE TRANSPARENTE/CIELO (Para Cielo, agua, HUD - NO bloquea profundidad, CON BLEND)
+    // 2. PIPELINE TRANSPARENTE (Para agua, hielo, nubes - Prueba depth, no bloquea)
     VkPipelineDepthStencilStateCreateInfo depthTrans{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthTrans.depthTestEnable = VK_TRUE;
     depthTrans.depthWriteEnable = VK_FALSE;
@@ -791,6 +794,31 @@ void VKRenderer::Initialise() {
     pipelineInfo.pDepthStencilState = &depthTrans;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineTransparent));
+
+    // 3. PIPELINE SIN PROFUNDIDAD (Para Sol, Estrellas y HUD 2D)
+    VkPipelineDepthStencilStateCreateInfo depthNone{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    depthNone.depthTestEnable = VK_FALSE;
+    depthNone.depthWriteEnable = VK_FALSE;
+
+    pipelineInfo.pDepthStencilState = &depthNone;
+    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineNoDepth));
+
+    // 4. PIPELINE PARA LÍNEAS (Para el recuadro de bloque seleccionado y caña de pescar)
+    // NOTA: En Vulkan, para topologías de líneas, polygonMode DEBE ser VK_POLYGON_MODE_FILL
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL; 
+    rasterizer.lineWidth = 1.0f;
+    pipelineInfo.pDepthStencilState = &depthTrans; // <--- ¡Prueba profundidad para ocultar aristas traseras!
+    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineLines));
+
+    // 5. PIPELINE PARA TRIANGLE FAN (Para la cúpula continua y horizonte del Cielo)
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineTriangleFan));
+
+    // Restaurar configuración base
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
 
     vkDestroyShaderModule(m_device, fragModule, nullptr);
     vkDestroyShaderModule(m_device, vertModule, nullptr);
@@ -833,7 +861,9 @@ void VKRenderer::Initialise() {
 
     createDefaultWhiteTexture();
 
-    printf("[Vulkan] Inicialización dual de profundidad y mezcla completada.\n");
+    m_baseColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
+
+    printf("[Vulkan] Inicialización de pipelines (Opaco, Transparente, NoDepth, Líneas, TriangleFan) completada.\n");
 }
 
 void VKRenderer::InitialiseContext() {}
@@ -842,7 +872,7 @@ void VKRenderer::Tick() {}
 void VKRenderer::StartFrame() {
     if (!m_device || !m_swapchain) return;
 
-    // Si se presionó P, este frame se registrará completo
+    // 1. Si se presionó P, este frame se registrará completo en la terminal
     if (s_vkPendingDump) {
         s_vkDumpThisFrame = true;
         s_vkPendingDump = false;
@@ -851,6 +881,7 @@ void VKRenderer::StartFrame() {
         fflush(stdout);
     }
 
+    // 2. Destrucción segura y diferida de chunks antiguos
     std::vector<VKChunkBuffer> toDestroy;
     {
         std::lock_guard<std::mutex> lk(m_destructionMtx);
@@ -863,6 +894,7 @@ void VKRenderer::StartFrame() {
         cb.destroy(m_device);
     }
 
+    // 3. Sincronización con la GPU y adquisición de imagen del swapchain
     vkWaitForFences(m_device, 1, &m_inFlightFences[m_currentFrame], VK_TRUE, UINT64_MAX);
     VkResult result = vkAcquireNextImageKHR(m_device, m_swapchain, UINT64_MAX,
                                             m_imageAvailableSemaphores[m_currentFrame],
@@ -870,27 +902,43 @@ void VKRenderer::StartFrame() {
     if (result == VK_ERROR_OUT_OF_DATE_KHR) return;
 
     vkResetFences(m_device, 1, &m_inFlightFences[m_currentFrame]);
-    m_dynamicVertexOffset = 0;
 
+    // 4. RESET CRÍTICO DE ESTADO PARA EL NUEVO FRAME:
+    // Evita que el cielo herede las coordenadas del último chunk del frame anterior
+    m_dynamicVertexOffset = 0;
+    m_chunkOffset = glm::vec3(0.0f);
+
+    // 5. Reinicio y comienzo del Command Buffer del frame
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
     vkResetCommandBuffer(cmd, 0);
 
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
 
+    // 6. Apertura del RenderPass principal con Color de Cielo Seguro
     VkRenderPassBeginInfo renderPassInfo{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     renderPassInfo.renderPass = m_renderPass;
     renderPassInfo.framebuffer = m_swapchainFramebuffers[m_imageIndex];
     renderPassInfo.renderArea.extent = m_swapchainExtent;
 
     std::array<VkClearValue, 2> clearValues{};
-    clearValues[0].color = {{m_clearColor[0], m_clearColor[1], m_clearColor[2], m_clearColor[3]}};
+
+    // PROTECCIÓN CONTRA PARPADEO NEGRO:
+    // Si m_clearColor es negro puro (0,0,0), usamos el azul de cielo clásico (0.46, 0.71, 1.0)
+    // para que el fondo nunca nazca negro entre fotogramas.
+    if (m_clearColor[0] == 0.0f && m_clearColor[1] == 0.0f && m_clearColor[2] == 0.0f) {
+        clearValues[0].color = {{0.46f, 0.71f, 1.0f, 1.0f}};
+    } else {
+        clearValues[0].color = {{m_clearColor[0], m_clearColor[1], m_clearColor[2], m_clearColor[3]}};
+    }
     clearValues[1].depthStencil = {1.0f, 0};
+
     renderPassInfo.clearValueCount = static_cast<uint32_t>(clearValues.size());
     renderPassInfo.pClearValues = clearValues.data();
 
     vkCmdBeginRenderPass(cmd, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
+    // 7. Configuración de Viewport dinámico (con Y invertida nativa de Vulkan) y Scissor
     VkViewport viewport{
         0.0f,
         (float)m_swapchainExtent.height,
@@ -910,12 +958,11 @@ void VKRenderer::StartFrame() {
 void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVertexType vType, ePixelShaderType psType) {
     if (count <= 0 || !dataIn) return;
 
-    // BLOQUEO DE LA VIÑETA OPACO:
-    // Si es un quad de 4 vértices sin profundidad con blend GL_ZERO o textura de viñeta,
-    // evitamos que tape el mundo 3D en pantalla.
     bool allowDepthWrite = m_depthTestEnabled && m_depthMaskEnabled;
+
+    // 1. Filtro de seguridad de la viñeta
     if (count == 4 && !allowDepthWrite && (m_isVignettePass || m_blendSrc == 0 || m_boundTextureId == 121)) {
-        return; // ¡No tapar la pantalla!
+        return; // No tapar la pantalla
     }
 
     bool wasQuad = (ptype == PRIMITIVE_TYPE_QUAD_LIST || (int)ptype == 0x0007);
@@ -924,6 +971,7 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
 
     s_recIsCompressed = (vType == VERTEX_TYPE_COMPRESSED);
 
+    // 2. Si estamos grabando una lista de chunks (CBuff), acumular en memoria y salir
     if (s_recListId >= 0) {
         int first = (int)(s_recVerts.size() / stride);
         s_recVerts.insert(s_recVerts.end(), (const uint8_t*)dataIn, (const uint8_t*)dataIn + bytes);
@@ -934,23 +982,32 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     if (!m_frameStarted) return;
     if (m_dynamicVertexOffset + bytes > DYNAMIC_VERTEX_BUFFER_SIZE) return;
 
+    // 3. Copiar vértices al Dynamic VBO
     memcpy((char*)m_dynamicVertexMapped + m_dynamicVertexOffset, dataIn, bytes);
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
 
-    VkPipeline targetPipeline;
-    if (!m_depthTestEnabled) {
-        targetPipeline = m_pipelineNoDepth;        // Cielo y HUD (Sin depth test)
-    } else if (allowDepthWrite) {
-        targetPipeline = m_pipelineOpaque;         // Bloques sólidos
-    } else {
-        targetPipeline = m_pipelineTransparent;    // Agua, hielo, partículas
+    // 4. SELECCIÓN DE PIPELINE SEGÚN TOPOLOGÍA (Líneas, Fans, NoDepth, Opaque)
+    int ptypeVal = (int)ptype;
+    bool isLine = (ptypeVal == 1 || ptypeVal == 3);      // GL_LINES (1) o GL_LINE_STRIP (3)
+    bool isFan  = (ptypeVal == 2 || ptypeVal == 6);      // GL_TRIANGLE_FAN (Cúpula del cielo)
+
+    VkPipeline targetPipeline = m_pipelineTransparent;
+    if (isLine && m_pipelineLines != VK_NULL_HANDLE) {
+        targetPipeline = m_pipelineLines;              // Recuadro del bloque seleccionado
+    } else if (isFan && m_pipelineTriangleFan != VK_NULL_HANDLE) {
+        targetPipeline = m_pipelineTriangleFan;        // Cúpula continua del Cielo
+    } else if (!m_depthTestEnabled && m_pipelineNoDepth != VK_NULL_HANDLE) {
+        targetPipeline = m_pipelineNoDepth;            // Sol, Estrellas, HUD 2D
+    } else if (allowDepthWrite && m_pipelineOpaque != VK_NULL_HANDLE) {
+        targetPipeline = m_pipelineOpaque;             // Geometría sólida
     }
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, targetPipeline);
 
+    if (targetPipeline != VK_NULL_HANDLE) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, targetPipeline);
+    }
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, targetPipeline);
-
+    // 5. Selección y enlace de texturas
     VkDescriptorSet currentSet = m_defaultWhiteTexture.descriptorSet;
     int hasTex = 0;
     if (m_textureEnabled && m_boundTextureId > 0) {
@@ -966,18 +1023,21 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &currentSet, 0, nullptr);
     }
 
+    // 6. Push Constants (Matrices MVP, color base real y offsets)
     PushConstants pc;
     pc.uMVP = s_vkClipCorrection * (s_proj.cur() * s_mv.cur());
-    pc.uBaseColor = (m_baseColor.r == 0.0f && m_baseColor.g == 0.0f && m_baseColor.b == 0.0f)
-                    ? glm::vec4(1.0f) : m_baseColor;
-    pc.uChunkOffset = m_chunkOffset;
+    // Respetar el color real recibido de glColor4f/glColor3f (sin forzar blanco)
+    pc.uBaseColor = m_baseColor;
+    pc.uChunkOffset = glm::vec3(0.0f); // El cielo, la mano y la UI NO llevan offset de chunk
     pc.uHasTexture = hasTex;
 
     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants), &pc);
 
+    // 7. Enlazar Vertex Buffer dinámico
     VkDeviceSize offsets[] = { m_dynamicVertexOffset };
     vkCmdBindVertexBuffers(cmd, 0, 1, &m_dynamicVertexBuffer, offsets);
 
+    // 8. Dibujar según la topología
     if (wasQuad) {
         vkCmdBindIndexBuffer(cmd, m_globalEBO, 0, VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(cmd, (count / 4) * 6, 1, 0, 0, 0);
@@ -985,6 +1045,7 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         vkCmdDraw(cmd, count, 1, 0, 0);
     }
 
+    // 9. Avanzar el offset alineado a 64 bytes
     m_dynamicVertexOffset += (bytes + 63) & ~63;
 }
 
@@ -1121,7 +1182,9 @@ void VKRenderer::Shutdown() {
         // Destrucción de la tríada de pipelines de Vulkan
         if (m_pipelineOpaque) vkDestroyPipeline(m_device, m_pipelineOpaque, nullptr);
         if (m_pipelineTransparent) vkDestroyPipeline(m_device, m_pipelineTransparent, nullptr);
-        if (m_pipelineNoDepth) vkDestroyPipeline(m_device, m_pipelineNoDepth, nullptr); // <-- NUEVO
+        if (m_pipelineNoDepth) vkDestroyPipeline(m_device, m_pipelineNoDepth, nullptr);
+            if (m_pipelineLines) vkDestroyPipeline(m_device, m_pipelineLines, nullptr);
+            if (m_pipelineTriangleFan) vkDestroyPipeline(m_device, m_pipelineTriangleFan, nullptr);
         if (m_pipelineLayout) vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
 
         for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
@@ -1283,7 +1346,6 @@ void VKRenderer::CBuffEnd() {
 bool VKRenderer::CBuffCall(int index, bool full) {
     if (!m_frameStarted) return false;
 
-    // Confirmación de que el motor está despachando chunks en el mundo
     s_vkWorldDetected = true;
 
     std::shared_lock<std::shared_mutex> lk_pool(m_poolMtx);
@@ -1296,7 +1358,7 @@ bool VKRenderer::CBuffCall(int index, bool full) {
     for (const auto& dc : cb.draws) totalVerts += dc.count;
     LogVKDraw("CBuffCall   ", totalVerts, m_boundTextureId, m_baseColor, m_chunkOffset, m_depthMaskEnabled, index);
 
-    // 1. Subida perezosa (Lazy upload) de la malla del chunk a VRAM si aún no está lista
+    // 1. Subida perezosa de la malla a VRAM si aún no está lista
     if (!cb.vboReady) {
         if (cb.rawVerts.empty() || cb.draws.empty()) return false;
 
@@ -1326,71 +1388,59 @@ bool VKRenderer::CBuffCall(int index, bool full) {
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
 
-    // 2. Selección de Pipeline: Sólido para terreno opaco, Transparente para agua/hielo
+    // 2. Selección de Pipeline: Sólido para terreno opaco, Transparente para agua o cielo
     bool allowDepthWrite = m_depthTestEnabled && m_depthMaskEnabled;
     VkPipeline targetPipeline = allowDepthWrite ? m_pipelineOpaque : m_pipelineTransparent;
+    if (!m_depthTestEnabled && m_pipelineNoDepth != VK_NULL_HANDLE) {
+        targetPipeline = m_pipelineNoDepth;
+    }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, targetPipeline);
 
-    // 3. SELECCIÓN BLINDADA DEL ATLAS DE BLOQUES (UNIDAD 0)
-    int terrainTexId = (m_boundTextureId > 0 && m_boundTextureId != m_boundLightmapId) 
-                       ? m_boundTextureId 
-                       : m_terrainAtlasId;
-
+    // 3. Selección de Textura: Si glDisable(GL_TEXTURE_2D) está activo (Cielo/Estrellas), no usar textura
     VkDescriptorSet currentSet = m_defaultWhiteTexture.descriptorSet;
     int hasTex = 0;
 
-    {
-        std::lock_guard<std::mutex> lk(m_textureMtx);
+    if (m_textureEnabled) {
+        int terrainTexId = (m_boundTextureId > 0 && m_boundTextureId != m_boundLightmapId) 
+                           ? m_boundTextureId 
+                           : m_terrainAtlasId;
 
-        // Prioridad 1: Buscar la textura solicitada
+        std::lock_guard<std::mutex> lk(m_textureMtx);
         auto texIt = m_textures.find(terrainTexId);
         if (texIt != m_textures.end() && texIt->second.descriptorSet != VK_NULL_HANDLE) {
             currentSet = texIt->second.descriptorSet;
             hasTex = 1;
-        } 
-        // Prioridad 2: Buscar directamente por m_terrainAtlasId si terrainTexId era distinto
-        else if (m_terrainAtlasId > 0) {
+        } else if (m_terrainAtlasId > 0) {
             auto atlasIt = m_textures.find(m_terrainAtlasId);
             if (atlasIt != m_textures.end() && atlasIt->second.descriptorSet != VK_NULL_HANDLE) {
                 currentSet = atlasIt->second.descriptorSet;
                 hasTex = 1;
             }
         }
-
-        // Prioridad 3 (Fallback definitivo): Buscar la textura más grande en memoria (Atlas >= 256x256)
-        if (!hasTex && !m_textures.empty()) {
-            int bestArea = 0;
-            for (const auto& pair : m_textures) {
-                int area = pair.second.width * pair.second.height;
-                if (area >= (256 * 256) && area > bestArea && pair.second.descriptorSet != VK_NULL_HANDLE) {
-                    bestArea = area;
-                    currentSet = pair.second.descriptorSet;
-                    hasTex = 1;
-                }
-            }
-        }
     }
 
-    // 4. Enlazar el DescriptorSet del atlas
     if (currentSet != VK_NULL_HANDLE) {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &currentSet, 0, nullptr);
     }
 
-    // 5. Configurar Push Constants
+    // 4. Push Constants:
+    // Si la textura está apagada (Cielo, Estrellas), usar m_baseColor de glColor3f.
+    // Si es un chunk con texturas, usar blanco neutro (1,1,1,1).
     PushConstants pc;
     pc.uMVP = s_vkClipCorrection * (s_proj.cur() * s_mv.cur());
-    pc.uBaseColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f); // Base neutra para respetar colores de AO y biomas
-    pc.uChunkOffset = m_chunkOffset;
+    pc.uBaseColor = m_textureEnabled ? glm::vec4(1.0f, 1.0f, 1.0f, 1.0f) : m_baseColor;
+    
+    // Si el índice es menor a 1000 (skyList, starList, darkList), NO sumar offset de chunk
+    pc.uChunkOffset = (index < 1000) ? glm::vec3(0.0f) : m_chunkOffset;
     pc.uHasTexture = hasTex;
 
     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants), &pc);
 
-    // 6. Enlazar Vertex Buffer del chunk e Index Buffer de Quads global
+    // 5. Enlazar buffers y despachar draws
     VkDeviceSize offsets[] = {0};
     vkCmdBindVertexBuffers(cmd, 0, 1, &cb.vbo, offsets);
     vkCmdBindIndexBuffer(cmd, m_globalEBO, 0, VK_INDEX_TYPE_UINT32);
 
-    // 7. Despacho de las llamadas de dibujo del chunk
     for (const auto& dc : cb.draws) {
         if (dc.count <= 0) continue;
         if (dc.wasQuad) {
@@ -1403,6 +1453,7 @@ bool VKRenderer::CBuffCall(int index, bool full) {
 
     return true;
 }
+
 
 void VKRenderer::CBuffTick() {}
 void VKRenderer::CBuffDeferredModeStart() {}

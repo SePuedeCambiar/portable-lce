@@ -20,12 +20,11 @@ void main() {
 
     outUV = inUV;
 
-    // Fallback de color idéntico a Minecraft:
-    // Si el color viene en 0, usamos uBaseColor.
-    // Si viene con color, desempaquetamos Little-Endian .abgr
+    // Si el vértice no tiene color (0,0,0,0), usamos uBaseColor.
+    // Si tiene color, desempaquetamos Little-Endian .abgr de Minecraft
     if (inColor == vec4(0.0)) {
-        outColor = (pc.uBaseColor == vec4(0.0)) ? vec4(1.0) : pc.uBaseColor;
+        outColor = pc.uBaseColor;
     } else {
-        outColor = vec4(inColor.a, inColor.b, inColor.g, inColor.r);
+        outColor = inColor.abgr;
     }
 }

@@ -247,4 +247,20 @@ void glColorMask(unsigned char red, unsigned char green, unsigned char blue, uns
     PlatformRenderer.StateSetWriteEnable(red != 0, green != 0, blue != 0, alpha != 0);
 }
 
+void glColor4f(float red, float green, float blue, float alpha) {
+    PlatformRenderer.StateSetColour(red, green, blue, alpha);
+}
+
+void glColor3f(float red, float green, float blue) {
+    PlatformRenderer.StateSetColour(red, green, blue, 1.0f);
+}
+
+void glColor4ub(unsigned char red, unsigned char green, unsigned char blue, unsigned char alpha) {
+    PlatformRenderer.StateSetColour(red / 255.0f, green / 255.0f, blue / 255.0f, alpha / 255.0f);
+}
+
+void glColor3ub(unsigned char red, unsigned char green, unsigned char blue) {
+    PlatformRenderer.StateSetColour(red / 255.0f, green / 255.0f, blue / 255.0f, 1.0f);
+}
+
 } // extern "C"

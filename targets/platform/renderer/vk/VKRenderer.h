@@ -205,6 +205,8 @@ private:
     VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_pipelineLines = VK_NULL_HANDLE;
+    VkPipeline m_pipelineTriangleFan = VK_NULL_HANDLE;
     VkPipeline m_pipelineOpaque = VK_NULL_HANDLE;
     VkPipeline m_pipelineTransparent = VK_NULL_HANDLE;
     VkPipeline m_pipelineNoDepth = VK_NULL_HANDLE;

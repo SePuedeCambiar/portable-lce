@@ -19,16 +19,11 @@ void main() {
         texColor = texture(uTexture, inUV);
     }
 
-    // Solo descartar si es realmente un recorte transparente (como hojas o cristal)
+    // Descartar píxeles 100% transparentes (hojas, flores)
     if (pc.uHasTexture != 0 && texColor.a < 0.05) {
         discard;
     }
 
-    // Si la textura es negra o no tiene luz pero el vértice tiene color, usamos el color del bloque
-    vec4 c = texColor * inColor;
-    if (c.rgb == vec3(0.0) && inColor.rgb != vec3(0.0)) {
-        c.rgb = inColor.rgb;
-    }
-
-    outColor = vec4(c.rgb, 1.0);
+    // Combinación preservando el canal Alpha (imprescindible para el cielo y estrellas)
+    outColor = texColor * inColor;
 }
