@@ -664,11 +664,20 @@ int LevelRenderer::renderChunks(int from, int to, int layer, double alpha) {
     mc->gameRenderer->turnOnLightLayer(alpha);
     std::shared_ptr<LivingEntity> player = mc->cameraTargetPlayer;
     double xOff = player->xOld + (player->x - player->xOld) * alpha;
-    double yOff = player->yOld + (player->y - player->yOld) * alpha;
+    double yOld = player->yOld + (player->y - player->yOld) * alpha;
     double zOff = player->zOld + (player->z - player->zOld) * alpha;
 
     glPushMatrix();
-    glTranslatef((float)-xOff, (float)-yOff, (float)-zOff);
+    glTranslatef((float)-xOff, (float)-yOld, (float)-zOff);
+
+    // ========================================================================
+    // CORRECCIÓN CRÍTICA DE CAPAS:
+    // Informar a Vulkan de forma directa:
+    // Si layer == 1 -> Activa Blend (Agua/Hielo) y apaga DepthMask.
+    // Si layer == 0 -> Apaga Blend (Sólido) y activa DepthMask.
+    // ========================================================================
+    PlatformRenderer.StateSetBlendEnable(layer == 1);
+    PlatformRenderer.StateSetDepthMask(layer == 0);
 
     bool first = true;
     int count = 0;
@@ -689,7 +698,7 @@ int LevelRenderer::renderChunks(int from, int to, int layer, double alpha) {
     {
         FRAME_PROFILE_SCOPE(ChunkCollect);
         float camX = (float)xOff;
-        float camY = (float)yOff;
+        float camY = (float)yOld;
         float camZ = (float)zOff;
 
         // Pase lineal O(N): Calculamos distancia UNA SOLA VEZ por chunk visible
@@ -740,6 +749,11 @@ int LevelRenderer::renderChunks(int from, int to, int layer, double alpha) {
     }
 
     glPopMatrix();
+
+    // Restaurar estados normales al terminar el pase de chunks
+    PlatformRenderer.StateSetBlendEnable(false);
+    PlatformRenderer.StateSetDepthMask(true);
+
     mc->gameRenderer->turnOffLightLayer(alpha);
 
     return count;
@@ -1991,29 +2005,30 @@ void LevelRenderer::renderAdvancedClouds(float alpha) {
 // CLIPPING VECTORIAL P-VERTEX (8X MÁS RÁPIDO QUE EVALUAR 8 VÉRTICES)
 // ============================================================================
 static inline bool clipAABB(const float* bb, const float* frustum) {
-    // Evaluamos los 4 planos laterales (Izquierda, Derecha, Abajo, Arriba)
-    // que son idénticos entre OpenGL y Vulkan
+    // CORRECCIÓN: Margen de seguridad amplio (-8.0f) para evitar que los chunks de agua
+    // y terreno desaparezcan en los bordes de la pantalla al girar la cámara.
+    const float SAFETY_MARGIN = -8.0f;
+
     for (int i = 0; i < 4; ++i, frustum += 4) {
         float px = (frustum[0] > 0.0f) ? bb[3] : bb[0];
         float py = (frustum[1] > 0.0f) ? bb[4] : bb[1];
         float pz = (frustum[2] > 0.0f) ? bb[5] : bb[2];
-        if ((frustum[0] * px + frustum[1] * py + frustum[2] * pz + frustum[3]) < -0.5f) {
+        if ((frustum[0] * px + frustum[1] * py + frustum[2] * pz + frustum[3]) < SAFETY_MARGIN) {
             return false;
         }
     }
 
-    // Para el plano Lejano (Far) aplicamos un margen seguro de tolerancia
+    // Plano Lejano (Far) con margen de tolerancia generoso
     {
         float px = (frustum[0] > 0.0f) ? bb[3] : bb[0];
         float py = (frustum[1] > 0.0f) ? bb[4] : bb[1];
         float pz = (frustum[2] > 0.0f) ? bb[5] : bb[2];
-        if ((frustum[0] * px + frustum[1] * py + frustum[2] * pz + frustum[3]) < -2.0f) {
+        if ((frustum[0] * px + frustum[1] * py + frustum[2] * pz + frustum[3]) < -10.0f) {
             return false;
         }
         frustum += 4;
     }
 
-    // El plano Cerca (Near) en Vulkan no debe descartar chunks adyacentes a la cámara
     return true;
 }
 

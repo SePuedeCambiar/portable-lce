@@ -230,7 +230,8 @@ void Chunk::rebuild() {
 
                 if (tile->isSolidRender()) {
                     int id = tile->id;
-                    bool isComplex = (id == 2 || id == 17 || id == 18 || id == 23 || 
+                    // id == 2 (Pasto) fuera de isComplex: 1 sola cara sólida, sin Z-fighting
+                    bool isComplex = (id == 17 || id == 18 || id == 23 || 
                                       id == 61 || id == 62 || id == 86 || id == 91 || 
                                       id == 155 || id == 158 || id == 161 || id == 162 || id == 170);
                     
@@ -348,7 +349,6 @@ void Chunk::rebuild() {
                 started = true;
                 glNewList(lists + currentLayer, GL_COMPILE);
                 glDepthMask(true);
-                // ACTIVAMOS FORMATO COMPACTO DE 16 BYTES
                 t->useCompactVertices(false); 
                 t->begin();
                 t->offset((float)(-this->x), (float)(-this->y), (float)(-this->z));
@@ -386,7 +386,11 @@ void Chunk::rebuild() {
                             grid[gridIdx].tileId = tileId;
                             grid[gridIdx].texture = tileRenderer.getTexture(tile, &region, x0 + x, y, z0 + z, face);
                             grid[gridIdx].lightColor = tileRenderer.getLightColor(tile, &region, x0 + x, ny, z0 + z);
-                            grid[gridIdx].tileColor = tile->getColor(&region, x0 + x, y, z0 + z);
+                            
+                            // CORRECCIÓN COLOR EJE Y: Si es pasto y es la cara de abajo (face == 0), tierra neutra.
+                            int col = (tileId == 2 && face == 0) ? 0xffffff : tile->getColor(&region, x0 + x, y, z0 + z);
+                            grid[gridIdx].tileColor = col;
+                            
                             grid[gridIdx].merged = false;
                             hasData = true;
                         }
@@ -425,7 +429,6 @@ void Chunk::rebuild() {
                             float v1 = current.texture ? current.texture->getV1() : 0.0f;
                             t->tex2(current.lightColor);
 
-                            // EMISIÓN LIMPIA DE UVs DE 16 BYTES (Sin factor *10 desbordante)
                             for (int cv = 0; cv < height; cv++) {
                                 for (int cu = 0; cu < width; cu++) {
                                     float cx = (float)(x0 + u + cu), cz = (float)(z0 + v + cv), cy = (float)y;
@@ -472,7 +475,11 @@ void Chunk::rebuild() {
                             grid[gridIdx].tileId = tileId;
                             grid[gridIdx].texture = tileRenderer.getTexture(tile, &region, x0 + x, worldY, z0 + z, face);
                             grid[gridIdx].lightColor = tileRenderer.getLightColor(tile, &region, x0 + x, worldY, nz);
-                            grid[gridIdx].tileColor = tile->getColor(&region, x0 + x, worldY, z0 + z);
+                            
+                            // CORRECCIÓN COLOR EJE Z: Si es pasto, las caras laterales usan 0xffffff (tierra marrón natural)
+                            int col = (tileId == 2) ? 0xffffff : tile->getColor(&region, x0 + x, worldY, z0 + z);
+                            grid[gridIdx].tileColor = col;
+                            
                             grid[gridIdx].merged = false;
                             hasData = true;
                         }
@@ -511,7 +518,6 @@ void Chunk::rebuild() {
                             float v1 = current.texture ? current.texture->getV1() : 0.0f;
                             t->tex2(current.lightColor);
 
-                            // EMISIÓN LIMPIA DE UVs DE 16 BYTES
                             for (int cv = 0; cv < height; cv++) {
                                 for (int cu = 0; cu < width; cu++) {
                                     float cx = (float)(x0 + u + cu), cy = (float)(y0 + v + cv), cz = (float)(z0 + z);
@@ -558,7 +564,11 @@ void Chunk::rebuild() {
                             grid[gridIdx].tileId = tileId;
                             grid[gridIdx].texture = tileRenderer.getTexture(tile, &region, x0 + x, worldY, z0 + z, face);
                             grid[gridIdx].lightColor = tileRenderer.getLightColor(tile, &region, nx, worldY, z0 + z);
-                            grid[gridIdx].tileColor = tile->getColor(&region, x0 + x, worldY, z0 + z);
+                            
+                            // CORRECCIÓN COLOR EJE X: Si es pasto, caras laterales en 0xffffff
+                            int col = (tileId == 2) ? 0xffffff : tile->getColor(&region, x0 + x, worldY, z0 + z);
+                            grid[gridIdx].tileColor = col;
+                            
                             grid[gridIdx].merged = false;
                             hasData = true;
                         }
@@ -597,7 +607,6 @@ void Chunk::rebuild() {
                             float v1 = current.texture ? current.texture->getV1() : 0.0f;
                             t->tex2(current.lightColor);
 
-                            // EMISIÓN LIMPIA DE UVs DE 16 BYTES
                             for (int cv = 0; cv < height; cv++) {
                                 for (int cu = 0; cu < width; cu++) {
                                     float cx = (float)(x0 + x), cy = (float)(y0 + v + cv), cz = (float)(z0 + u + cu);
@@ -648,7 +657,7 @@ void Chunk::rebuild() {
             t->end();
             bounds.addBounds(t->bounds);
             glEndList();
-            t->useCompactVertices(false); // Mantenemos el formato compacto consistente
+            t->useCompactVertices(false);
             t->offset(0, 0, 0);
         }
         
@@ -684,6 +693,7 @@ void Chunk::rebuild() {
     else levelRenderer->setGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_NOTSKYLIT);
     levelRenderer->setGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_COMPILED);
 }
+
 
 float Chunk::distanceToSqr(std::shared_ptr<Entity> player) const {
     float xd = (float)(player->x - xm);

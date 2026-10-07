@@ -150,14 +150,18 @@ void glClientActiveTexture(unsigned int texture) {
 void glBindTexture(unsigned int target, unsigned int texture) {
     (void)target;
     if (s_currentActiveTextureUnit == 1) {
-        // Unidad 1: Lightmap dinámico (antorchas y ciclo día/noche)
+        // Unidad 1: Lightmap dinámico
         PlatformRenderer.TextureBindVertex((int)texture);
+        // ¡REGLA CRÍTICA NATIVA DE 4J!: Volver de inmediato a la Unidad 0
+        s_currentActiveTextureUnit = 0;
+        PlatformRenderer.StateSetActiveTexture(0);
     } else {
-        // Unidad 0: Atlas de bloques (terrain.png), texturas de mobs, cielo, GUI
+        // Unidad 0: Atlas de bloques, menús, fuentes, UI
         PlatformRenderer.TextureBind((int)texture);
         PlatformRenderer.StateSetTextureEnable(texture != 0);
     }
 }
+
 
 void glTexSubImage2D(unsigned int target, int level, int xoffset, int yoffset,
                      int width, int height, unsigned int format, unsigned int type,

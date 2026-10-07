@@ -166,7 +166,7 @@ public:
     virtual void EndEvent() override;
 
 private:
-    int m_terrainAtlasId = 0; // <--- SPRINT 1: Inicializado en 0 (sin atlas falso asignado)
+    int m_terrainAtlasId = 0;
 
     VkFormat findSupportedFormat(const std::vector<VkFormat>& candidates, VkImageTiling tiling, VkFormatFeatureFlags features);
     VkFormat findDepthFormat();
@@ -213,11 +213,15 @@ private:
     VkPipeline m_pipelineNoDepth = VK_NULL_HANDLE;
     VkPipeline m_pipelineAdditive = VK_NULL_HANDLE;
 
+    // PIPELINES DEDICADOS PARA CHUNKS DEL MUNDO (CULL_BACK_BIT para descartar caras duplicadas)
+    VkPipeline m_pipelineChunkOpaque = VK_NULL_HANDLE;
+    VkPipeline m_pipelineChunkTransparent = VK_NULL_HANDLE;
+
     // Separación de Unidades de Textura (Unit 0 = Atlas/GUI, Unit 1 = Lightmap)
     std::unordered_map<int, VKTexture> m_textures;
     int m_boundTextureId = 0;
     int m_boundLightmapId = -1;
-    int m_activeTextureUnit = 0; // <--- SPRINT 1: Control de unidad activa
+    int m_activeTextureUnit = 0;
     VKTexture m_defaultWhiteTexture;
     std::mutex m_textureMtx;
     std::mutex m_queueMtx;

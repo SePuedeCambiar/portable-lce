@@ -733,7 +733,7 @@ void VKRenderer::Initialise() {
     VkPipelineRasterizationStateCreateInfo rasterizer{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
     rasterizer.lineWidth = 1.0f;
-    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    rasterizer.cullMode = VK_CULL_MODE_NONE; // Por defecto NONE para menús 2D y HUD
     rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
 
     VkPipelineMultisampleStateCreateInfo multisampling{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
@@ -742,7 +742,7 @@ void VKRenderer::Initialise() {
     std::vector<VkDynamicState> dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dynamicState{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0, (uint32_t)dynamicStates.size(), dynamicStates.data()};
 
-    // 1. PIPELINE OPACO (Para bloques sólidos - Escribe en Depth Buffer, SÓLIDO)
+    // 1. PIPELINE OPACO (Para UI, entidades, fallback 2D - CULL NONE)
     VkPipelineDepthStencilStateCreateInfo depthOpaque{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthOpaque.depthTestEnable = VK_TRUE;
     depthOpaque.depthWriteEnable = VK_TRUE;
@@ -769,9 +769,10 @@ void VKRenderer::Initialise() {
     pipelineInfo.pDynamicState = &dynamicState;
     pipelineInfo.layout = m_pipelineLayout;
     pipelineInfo.renderPass = m_renderPass;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineOpaque));
 
-    // 2. PIPELINE TRANSPARENTE (Para agua, hielo, nubes - Prueba depth, no bloquea)
+    // 2. PIPELINE TRANSPARENTE (Para UI con alfa, partículas, fallback - CULL NONE)
     VkPipelineDepthStencilStateCreateInfo depthTrans{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthTrans.depthTestEnable = VK_TRUE;
     depthTrans.depthWriteEnable = VK_FALSE;
@@ -793,37 +794,60 @@ void VKRenderer::Initialise() {
 
     pipelineInfo.pDepthStencilState = &depthTrans;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineTransparent));
 
-    // 3. PIPELINE SIN PROFUNDIDAD (Para HUD 2D)
+    // ========================================================================
+    // PIPELINES DEDICADOS PARA CHUNKS 3D (Descarta caras duplicadas de hierba y caña)
+    // ========================================================================
+    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+
+    // Chunk Opaco (Terreno sólido, bloques, hierba sólida)
+    pipelineInfo.pDepthStencilState = &depthOpaque;
+    pipelineInfo.pColorBlendState = &colorBlendingOpaque;
+    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineChunkOpaque));
+
+    // Chunk Transparente (Agua y Hielo)
+    pipelineInfo.pDepthStencilState = &depthTrans;
+    pipelineInfo.pColorBlendState = &colorBlendingTrans;
+    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineChunkTransparent));
+
+    // Restaurar inmediatamente a NONE para los pipelines restantes
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    // ========================================================================
+
+    // 3. PIPELINE SIN PROFUNDIDAD (Para HUD 2D, menús)
     VkPipelineDepthStencilStateCreateInfo depthNone{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthNone.depthTestEnable = VK_FALSE;
     depthNone.depthWriteEnable = VK_FALSE;
 
     pipelineInfo.pDepthStencilState = &depthNone;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineNoDepth));
 
     // 4. PIPELINE PARA LÍNEAS (Para el recuadro de bloque seleccionado y caña de pescar)
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL; 
     rasterizer.lineWidth = 1.0f;
-    pipelineInfo.pDepthStencilState = &depthTrans; // Prueba profundidad para ocultar aristas traseras
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    pipelineInfo.pDepthStencilState = &depthTrans;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineLines));
 
     // 5. PIPELINE PARA TRIANGLE FAN (Para la cúpula continua y horizonte del Cielo)
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
     pipelineInfo.pDepthStencilState = &depthNone;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineTriangleFan));
 
-    // 6. PIPELINE ADITIVO (Para el Sol, Estrellas, Luna y Rayos de Beacons - Elimina el recuadro negro)
+    // 6. PIPELINE ADITIVO (Para el Sol, Estrellas, Luna y Rayos de Beacons)
     VkPipelineColorBlendAttachmentState blendAdditive{};
     blendAdditive.colorWriteMask = 0xF;
     blendAdditive.blendEnable = VK_TRUE;
     blendAdditive.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-    blendAdditive.dstColorBlendFactor = VK_BLEND_FACTOR_ONE; // Suma color al cielo sin tapar
+    blendAdditive.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
     blendAdditive.colorBlendOp = VK_BLEND_OP_ADD;
     blendAdditive.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
     blendAdditive.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
@@ -837,11 +861,13 @@ void VKRenderer::Initialise() {
     pipelineInfo.pColorBlendState = &colorBlendingAdditive;
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineAdditive));
 
     // Restaurar configuración base
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
 
     vkDestroyShaderModule(m_device, fragModule, nullptr);
     vkDestroyShaderModule(m_device, vertModule, nullptr);
@@ -886,7 +912,7 @@ void VKRenderer::Initialise() {
 
     m_baseColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
 
-    printf("[Vulkan] Inicialización de 6 pipelines (Opaco, Transparente, NoDepth, Líneas, TriangleFan, Aditivo) completada.\n");
+    printf("[Vulkan] Inicialización de 8 pipelines (Opaco, Transparente, ChunkOpaco, ChunkTransparente, NoDepth, Líneas, TriangleFan, Aditivo) completada.\n");
 }
 
 void VKRenderer::InitialiseContext() {}
@@ -983,7 +1009,7 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
 
     bool allowDepthWrite = m_depthTestEnabled && m_depthMaskEnabled;
 
-    // 1. Filtro de seguridad de la viñeta (eliminado el ID 121 hardcodeado para no tapar el agua)
+    // 1. Filtro de seguridad de la viñeta
     if (count == 4 && !allowDepthWrite && (m_isVignettePass || m_blendSrc == 0)) {
         return; // No tapar la pantalla si la viñeta intenta multiplicar por cero
     }
@@ -1012,27 +1038,23 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
 
-    // 4. SELECCIÓN DE PIPELINE CORREGIDA (Respetando transparencias y capas de agua)
+    // 4. SELECCIÓN DE PIPELINE (Por defecto transparente para UI, menús y partículas)
     int ptypeVal = (int)ptype;
     bool isLine = (ptypeVal == 1 || ptypeVal == 3);      // GL_LINES (1) o GL_LINE_STRIP (3)
     bool isFan  = (ptypeVal == 2 || ptypeVal == 6);      // GL_TRIANGLE_FAN (Cúpula del cielo)
 
-    VkPipeline targetPipeline = m_pipelineOpaque;
+    VkPipeline targetPipeline = m_pipelineTransparent;
 
-    // PRIORIDAD 1: Mezcla Aditiva (GL_ONE = 1) para el Sol, la Luna y las Estrellas
     if (m_blendDst == 1 && m_pipelineAdditive != VK_NULL_HANDLE) {
-        targetPipeline = m_pipelineAdditive;
+        targetPipeline = m_pipelineAdditive;          // Sol, estrellas, rayos de baliza
     } else if (isLine && m_pipelineLines != VK_NULL_HANDLE) {
-        targetPipeline = m_pipelineLines;              // Recuadro del bloque seleccionado
+        targetPipeline = m_pipelineLines;             // Recuadro del bloque seleccionado
     } else if (isFan && m_pipelineTriangleFan != VK_NULL_HANDLE) {
-        targetPipeline = m_pipelineTriangleFan;        // Cúpula continua del Cielo
+        targetPipeline = m_pipelineTriangleFan;       // Cúpula continua del Cielo
     } else if (!m_depthTestEnabled && m_pipelineNoDepth != VK_NULL_HANDLE) {
-        targetPipeline = m_pipelineNoDepth;            // HUD 2D, superposiciones en pantalla sin depth
-    } else if (m_blendEnabled && m_pipelineTransparent != VK_NULL_HANDLE) {
-        // CORRECCIÓN: Si el juego activa GL_BLEND, usar SIEMPRE pipeline con transparencia
-        targetPipeline = m_pipelineTransparent;
-    } else if (!allowDepthWrite && m_pipelineTransparent != VK_NULL_HANDLE) {
-        targetPipeline = m_pipelineTransparent;        // Partículas, agua translúcida
+        targetPipeline = m_pipelineNoDepth;           // HUD 2D, menús sin prueba de profundidad
+    } else if (allowDepthWrite && !m_blendEnabled && m_pipelineOpaque != VK_NULL_HANDLE) {
+        targetPipeline = m_pipelineOpaque;            // Geometría 100% sólida
     }
 
     if (targetPipeline != VK_NULL_HANDLE) {
@@ -1248,6 +1270,8 @@ void VKRenderer::Shutdown() {
         m_window = nullptr;
     }
     SDL_Quit();
+    if (m_pipelineChunkOpaque) vkDestroyPipeline(m_device, m_pipelineChunkOpaque, nullptr);
+    if (m_pipelineChunkTransparent) vkDestroyPipeline(m_device, m_pipelineChunkTransparent, nullptr);
 }
 
 void VKRenderer::Suspend() {}
@@ -1421,18 +1445,17 @@ bool VKRenderer::CBuffCall(int index, bool full) {
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
 
-    // 2. Selección de Pipeline con respeto estricto a las transparencias (Agua, Hielo, Cielo)
-    VkPipeline targetPipeline = m_pipelineOpaque;
+    // 2. SELECCIÓN DE PIPELINE PARA EL MUNDO 3D (CULL_MODE_BACK_BIT ACTIVO)
+    // Descarta las caras traseras duplicadas de la hierba alta, caña de azúcar y agua
+    VkPipeline targetPipeline = (m_pipelineChunkOpaque != VK_NULL_HANDLE) ? m_pipelineChunkOpaque : m_pipelineOpaque;
 
     if (!m_depthTestEnabled && m_pipelineNoDepth != VK_NULL_HANDLE) {
-        targetPipeline = m_pipelineNoDepth;
-    } else if (m_blendEnabled && m_pipelineTransparent != VK_NULL_HANDLE) {
-        // CORRECCIÓN CRÍTICA: Si glEnable(GL_BLEND) está activo (Capa translúcida de agua/hielo),
-        // USAR SIEMPRE el pipeline transparente con mezcla Alfa, evitando muros opacos de agua.
-        targetPipeline = m_pipelineTransparent;
-    } else if (!m_depthMaskEnabled && m_pipelineTransparent != VK_NULL_HANDLE) {
-        // Si glDepthMask(false) está activo (nubes o cielo)
-        targetPipeline = m_pipelineTransparent;
+        targetPipeline = m_pipelineNoDepth; // Cielo y estrellas (listas internas < 1000)
+    } else if (m_blendEnabled) {
+        // Capa 1: Agua y Hielo (Mezcla Alpha activa, Depth-write = FALSE)
+        targetPipeline = (m_pipelineChunkTransparent != VK_NULL_HANDLE) ? m_pipelineChunkTransparent : m_pipelineTransparent;
+    } else if (!m_depthMaskEnabled) {
+        targetPipeline = (m_pipelineChunkTransparent != VK_NULL_HANDLE) ? m_pipelineChunkTransparent : m_pipelineTransparent;
     }
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, targetPipeline);
@@ -1442,8 +1465,7 @@ bool VKRenderer::CBuffCall(int index, bool full) {
     int hasTex = 0;
 
     if (m_textureEnabled) {
-        // MEJORA SPRINT 1: Si es un chunk de terreno real (index >= 1000) y tenemos una textura
-        // válida en la Unidad 0, fijamos con certeza matemática que esta ID es el Atlas de Bloques real.
+        // Fijamos que la textura activa en Unidad 0 durante CBuffCall es el Atlas de Bloques
         if (index >= 1000 && m_boundTextureId > 0 && m_boundTextureId != m_boundLightmapId) {
             m_terrainAtlasId = m_boundTextureId;
         }
@@ -1471,8 +1493,6 @@ bool VKRenderer::CBuffCall(int index, bool full) {
     }
 
     // 4. Push Constants:
-    // Si la textura está apagada (Cielo, Estrellas), usar m_baseColor de glColor3f.
-    // Si es un chunk con texturas, usar blanco neutro (1,1,1,1).
     PushConstants pc;
     pc.uMVP = s_vkClipCorrection * (s_proj.cur() * s_mv.cur());
     pc.uBaseColor = m_textureEnabled ? glm::vec4(1.0f, 1.0f, 1.0f, 1.0f) : m_baseColor;

@@ -1225,23 +1225,12 @@ void GameRenderer::DisableUpdateThread() {
 void GameRenderer::renderLevel(float a, int64_t until) {
     FRAME_PROFILE_SCOPE(World);
 
-    //	if (updateLightTexture) updateLightTexture();	// 4J - TODO -
-    // Java 1.0.1 has this line enabled, should check why - don't want to put it
-    // in now in case it breaks split-screen
-
     glEnable(GL_CULL_FACE);
     glEnable(GL_DEPTH_TEST);
 
-    // Is this the primary player? Only do the updating of chunks if it is. This
-    // controls the creation of render data for each chunk - all of this we are
-    // only going to do for the primary player, and the other players can just
-    // view whatever they have loaded in - we're sharing render data between
-    // players.
     bool updateChunks =
         (mc->player == mc->localplayers[PlatformInput.GetPrimaryPad()]);
 
-    //	if (mc->cameraTargetPlayer == nullptr)	// 4J - removed condition as we
-    // want to update this is mc->player changes for different local players
     {
         mc->cameraTargetPlayer = mc->player;
     }
@@ -1284,10 +1273,7 @@ void GameRenderer::renderLevel(float a, int64_t until) {
                     levelRenderer->renderHaloRing(a);
             }
         }
-        // 4jcraft: needs to be enabled for proper transparent texturing on low
-        // render dists this was done in renderSky() for the far and normal
-        // dists but was missing here, UPDATE: Also needed for the nether, so
-        // just enable it unconditionally
+
         glEnable(GL_ALPHA_TEST);
         glEnable(GL_FOG);
         setupFog(1, a);
@@ -1296,7 +1282,6 @@ void GameRenderer::renderLevel(float a, int64_t until) {
             glShadeModel(GL_SMOOTH);
         }
 
-        //		Culler *frustum = new FrustumCuller();
         FrustumCuller frustObj;
         Culler* frustum = &frustObj;
         frustum->prepare(xOff, yOff, zOff);
@@ -1307,7 +1292,7 @@ void GameRenderer::renderLevel(float a, int64_t until) {
         }
 
 #if !defined(MULTITHREAD_ENABLE)
-        if ((i == 0) && updateChunks)  // 4J - added updateChunks condition
+        if ((i == 0) && updateChunks)
         {
             int PIXPass = 0;
             do {
@@ -1329,15 +1314,12 @@ void GameRenderer::renderLevel(float a, int64_t until) {
             FRAME_PROFILE_SCOPE(WeatherSky);
             prepareAndRenderClouds(levelRenderer, a);
         }
-        Frustum::getFrustum();  // 4J added - re-calculate frustum as rendering
-                                // the clouds does a scale & recalculates one
-                                // that isn't any good for the rest of the level
-                                // rendering
+        Frustum::getFrustum();
 
         setupFog(0, a);
         glEnable(GL_FOG);
         mc->textures->bindTexture(
-            &TextureAtlas::LOCATION_BLOCKS);  // 4J was "/terrain.png"
+            &TextureAtlas::LOCATION_BLOCKS);
         Lighting::turnOff();
         levelRenderer->render(cameraEntity, 0, a, updateChunks);
 
@@ -1345,17 +1327,8 @@ void GameRenderer::renderLevel(float a, int64_t until) {
 
         if (cameraFlip == 0) {
             Lighting::turnOn();
-            // 4J - for entities, don't include the "a" factor that interpolates
-            // from the old to new position, as the AABBs for the entities are
-            // already fully at the new position This fixes flickering
-            // minecarts, and pigs that you are riding on
             frustum->prepare(cameraEntity->x, cameraEntity->y, cameraEntity->z);
-            // 4J Stu - When rendering entities, in the end if the dragon is
-            // hurt or we have a lot of entities we can end up wrapping our
-            // index into the temp Vec3 cache and overwrite the one that was
-            // storing the camera position Fix for #77745 - TU9: Content:
-            // Gameplay: Items and mobs not belonging to end world are
-            // disappearing when Enderdragon is damaged.
+
             Vec3 cameraPosTemp = cameraEntity->getPos(a);
             cameraPos.x = cameraPosTemp.x;
             cameraPos.y = cameraPosTemp.y;
@@ -1365,7 +1338,7 @@ void GameRenderer::renderLevel(float a, int64_t until) {
                 levelRenderer->renderEntities(&cameraPos, frustum, a);
             }
 
-            turnOnLightLayer(a);  // 4J - brought forward from 1.8.2
+            turnOnLightLayer(a);
             {
                 FRAME_PROFILE_SCOPE(Particle);
                 particleEngine->renderLit(cameraEntity, a,
@@ -1379,12 +1352,11 @@ void GameRenderer::renderLevel(float a, int64_t until) {
                                        ParticleEngine::OPAQUE_LIST);
             }
 
-            turnOffLightLayer(a);  // 4J - brought forward from 1.8.2
+            turnOffLightLayer(a);
 
             if ((mc->hitResult != nullptr) &&
                 cameraEntity->isUnderLiquid(Material::water) &&
-                cameraEntity->instanceof(
-                    eTYPE_PLAYER))  //&& !mc->options.hideGui)
+                cameraEntity->instanceof(eTYPE_PLAYER))
             {
                 std::shared_ptr<Player> player =
                     std::dynamic_pointer_cast<Player>(cameraEntity);
@@ -1404,42 +1376,23 @@ void GameRenderer::renderLevel(float a, int64_t until) {
         glEnable(GL_BLEND);
         glDisable(GL_CULL_FACE);
         mc->textures->bindTexture(
-            &TextureAtlas::LOCATION_BLOCKS);  // 4J was "/terrain.png"
-        // 4J - have changed this fancy rendering option to work with our
-        // command buffers. The original used to use frame buffer flags to
-        // disable writing to colour when doing the z-only pass, but that value
-        // gets obliterated by our command buffers. Using alpha blend function
-        // instead to achieve the same effect.
-        if (true)  // (mc->options->fancyGraphics)
-        {
-            if (mc->options->ambientOcclusion) {
-                glShadeModel(GL_SMOOTH);
-            }
+            &TextureAtlas::LOCATION_BLOCKS);
 
-            PlatformRenderer.StateSetBlendFunc(GL_ZERO, GL_ONE);
-            int visibleWaterChunks =
-                levelRenderer->render(cameraEntity, 1, a, updateChunks);
-
-            PlatformRenderer.StateSetBlendFunc(GL_SRC_ALPHA,
-                                               GL_ONE_MINUS_SRC_ALPHA);
-
-            if (visibleWaterChunks > 0) {
-                levelRenderer->render(
-                    cameraEntity, 1, a,
-                    updateChunks);  // 4J - chanaged, used to be
-                                    // renderSameAsLast but we don't support
-                                    // that anymore
-            }
-
-            glShadeModel(GL_FLAT);
-        } else {
-            levelRenderer->render(cameraEntity, 1, a, updateChunks);
+        // ====================================================================
+        // CORRECCIÓN CRÍTICA DE AGUA: UN SOLO PASE LIMPIO (Sin duplicados)
+        // ====================================================================
+        if (mc->options->ambientOcclusion) {
+            glShadeModel(GL_SMOOTH);
         }
 
-        // 4J - added - have split out translucent particle rendering so that it
-        // happens after the water is rendered, primarily for fireworks
+        PlatformRenderer.StateSetBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        levelRenderer->render(cameraEntity, 1, a, updateChunks);
+
+        glShadeModel(GL_FLAT);
+        // ====================================================================
+
         Lighting::turnOn();
-        turnOnLightLayer(a);  // 4J - brought forward from 1.8.2
+        turnOnLightLayer(a);
         {
             FRAME_PROFILE_SCOPE(Particle);
             particleEngine->renderLit(cameraEntity, a,
@@ -1453,15 +1406,14 @@ void GameRenderer::renderLevel(float a, int64_t until) {
                                    ParticleEngine::TRANSLUCENT_LIST);
         }
 
-        turnOffLightLayer(a);  // 4J - brought forward from 1.8.2
-        ////////////////////////// End of 4J added section
+        turnOffLightLayer(a);
 
         PlatformRenderer.StateSetDepthMask(true);
         glEnable(GL_CULL_FACE);
         glDisable(GL_BLEND);
 
         if ((zoom == 1) &&
-            cameraEntity->instanceof(eTYPE_PLAYER))  //&& !mc->options.hideGui)
+            cameraEntity->instanceof(eTYPE_PLAYER))
         {
             if (mc->hitResult != nullptr &&
                 !cameraEntity->isUnderLiquid(Material::water)) {
@@ -1472,12 +1424,6 @@ void GameRenderer::renderLevel(float a, int64_t until) {
                 glEnable(GL_ALPHA_TEST);
             }
         }
-
-        /* 4J - moved rain rendering to after clouds so that it alpha blends
-        onto them properly         renderSnowAndRain(a);
-
-        glDisable(GL_FOG);
-        */
 
         glEnable(GL_BLEND);
         PlatformRenderer.StateSetBlendFunc(GL_SRC_ALPHA, GL_ONE);
@@ -1494,8 +1440,6 @@ void GameRenderer::renderLevel(float a, int64_t until) {
             prepareAndRenderClouds(levelRenderer, a);
         }
 
-        // 4J - rain rendering moved here so that it renders after clouds & can
-        // blend properly onto them
         setupFog(0, a);
         glEnable(GL_FOG);
         {

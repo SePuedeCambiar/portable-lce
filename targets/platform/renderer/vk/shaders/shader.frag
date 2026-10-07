@@ -19,8 +19,9 @@ void main() {
         texColor = texture(uTexture, inUV);
     }
 
-    // CORRECCIÓN: Descarte estándar Alpha Test de Minecraft (0.1)
-    // Evita que los bordes semitransparentes del césped escriban basura en profundidad
+    // Descarte estándar de Alpha Test de Minecraft (0.1)
+    // Descarta el fondo invisible de la hierba alta, caña de azúcar, flores y hojas,
+    // permitiendo que el agua translúcida (que tiene alpha ~0.6) pase sin ser recortada.
     if (pc.uHasTexture != 0 && texColor.a < 0.1) {
         discard;
     }
