@@ -801,6 +801,7 @@ void VKRenderer::Initialise() {
     // PIPELINES DEDICADOS PARA CHUNKS 3D (Descarta caras duplicadas de hierba y caña)
     // ========================================================================
     rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; // <--- CORRECCIÓN: Voltear hacia afuera
 
     // Chunk Opaco (Terreno sólido, bloques, hierba sólida)
     pipelineInfo.pDepthStencilState = &depthOpaque;
