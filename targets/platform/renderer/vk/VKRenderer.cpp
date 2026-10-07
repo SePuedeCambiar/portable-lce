@@ -983,9 +983,9 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
 
     bool allowDepthWrite = m_depthTestEnabled && m_depthMaskEnabled;
 
-    // 1. Filtro de seguridad de la viñeta
-    if (count == 4 && !allowDepthWrite && (m_isVignettePass || m_blendSrc == 0 || m_boundTextureId == 121)) {
-        return; // No tapar la pantalla
+    // 1. Filtro de seguridad de la viñeta (eliminado el ID 121 hardcodeado para no tapar el agua)
+    if (count == 4 && !allowDepthWrite && (m_isVignettePass || m_blendSrc == 0)) {
+        return; // No tapar la pantalla si la viñeta intenta multiplicar por cero
     }
 
     bool wasQuad = (ptype == PRIMITIVE_TYPE_QUAD_LIST || (int)ptype == 0x0007);
@@ -1012,12 +1012,12 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
 
-    // 4. SELECCIÓN DE PIPELINE (Aditivo para Sol/Estrellas, Líneas, Fans, NoDepth, Opaque)
+    // 4. SELECCIÓN DE PIPELINE CORREGIDA (Respetando transparencias y capas de agua)
     int ptypeVal = (int)ptype;
     bool isLine = (ptypeVal == 1 || ptypeVal == 3);      // GL_LINES (1) o GL_LINE_STRIP (3)
     bool isFan  = (ptypeVal == 2 || ptypeVal == 6);      // GL_TRIANGLE_FAN (Cúpula del cielo)
 
-    VkPipeline targetPipeline = m_pipelineTransparent;
+    VkPipeline targetPipeline = m_pipelineOpaque;
 
     // PRIORIDAD 1: Mezcla Aditiva (GL_ONE = 1) para el Sol, la Luna y las Estrellas
     if (m_blendDst == 1 && m_pipelineAdditive != VK_NULL_HANDLE) {
@@ -1027,9 +1027,12 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     } else if (isFan && m_pipelineTriangleFan != VK_NULL_HANDLE) {
         targetPipeline = m_pipelineTriangleFan;        // Cúpula continua del Cielo
     } else if (!m_depthTestEnabled && m_pipelineNoDepth != VK_NULL_HANDLE) {
-        targetPipeline = m_pipelineNoDepth;            // Sol, Estrellas, HUD 2D
-    } else if (allowDepthWrite && m_pipelineOpaque != VK_NULL_HANDLE) {
-        targetPipeline = m_pipelineOpaque;             // Geometría sólida
+        targetPipeline = m_pipelineNoDepth;            // HUD 2D, superposiciones en pantalla sin depth
+    } else if (m_blendEnabled && m_pipelineTransparent != VK_NULL_HANDLE) {
+        // CORRECCIÓN: Si el juego activa GL_BLEND, usar SIEMPRE pipeline con transparencia
+        targetPipeline = m_pipelineTransparent;
+    } else if (!allowDepthWrite && m_pipelineTransparent != VK_NULL_HANDLE) {
+        targetPipeline = m_pipelineTransparent;        // Partículas, agua translúcida
     }
 
     if (targetPipeline != VK_NULL_HANDLE) {
@@ -1418,25 +1421,39 @@ bool VKRenderer::CBuffCall(int index, bool full) {
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
 
-    // 2. Selección de Pipeline: Sólido para terreno opaco, Transparente para agua o cielo
-    bool allowDepthWrite = m_depthTestEnabled && m_depthMaskEnabled;
-    VkPipeline targetPipeline = allowDepthWrite ? m_pipelineOpaque : m_pipelineTransparent;
+    // 2. Selección de Pipeline con respeto estricto a las transparencias (Agua, Hielo, Cielo)
+    VkPipeline targetPipeline = m_pipelineOpaque;
+
     if (!m_depthTestEnabled && m_pipelineNoDepth != VK_NULL_HANDLE) {
         targetPipeline = m_pipelineNoDepth;
+    } else if (m_blendEnabled && m_pipelineTransparent != VK_NULL_HANDLE) {
+        // CORRECCIÓN CRÍTICA: Si glEnable(GL_BLEND) está activo (Capa translúcida de agua/hielo),
+        // USAR SIEMPRE el pipeline transparente con mezcla Alfa, evitando muros opacos de agua.
+        targetPipeline = m_pipelineTransparent;
+    } else if (!m_depthMaskEnabled && m_pipelineTransparent != VK_NULL_HANDLE) {
+        // Si glDepthMask(false) está activo (nubes o cielo)
+        targetPipeline = m_pipelineTransparent;
     }
+
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, targetPipeline);
 
-    // 3. Selección de Textura: Si glDisable(GL_TEXTURE_2D) está activo (Cielo/Estrellas), no usar textura
+    // 3. Selección de Textura:
     VkDescriptorSet currentSet = m_defaultWhiteTexture.descriptorSet;
     int hasTex = 0;
 
     if (m_textureEnabled) {
-        int terrainTexId = (m_boundTextureId > 0 && m_boundTextureId != m_boundLightmapId) 
-                           ? m_boundTextureId 
-                           : m_terrainAtlasId;
+        // MEJORA SPRINT 1: Si es un chunk de terreno real (index >= 1000) y tenemos una textura
+        // válida en la Unidad 0, fijamos con certeza matemática que esta ID es el Atlas de Bloques real.
+        if (index >= 1000 && m_boundTextureId > 0 && m_boundTextureId != m_boundLightmapId) {
+            m_terrainAtlasId = m_boundTextureId;
+        }
+
+        int targetTexId = (m_boundTextureId > 0 && m_boundTextureId != m_boundLightmapId) 
+                          ? m_boundTextureId 
+                          : m_terrainAtlasId;
 
         std::lock_guard<std::mutex> lk(m_textureMtx);
-        auto texIt = m_textures.find(terrainTexId);
+        auto texIt = m_textures.find(targetTexId);
         if (texIt != m_textures.end() && texIt->second.descriptorSet != VK_NULL_HANDLE) {
             currentSet = texIt->second.descriptorSet;
             hasTex = 1;
@@ -1510,11 +1527,16 @@ void VKRenderer::TextureFree(int idx) {
     }
 }
 
+
 void VKRenderer::TextureBind(int idx) { 
-    if (idx > 0) {
-        m_boundTextureId = idx; 
+    if (idx <= 0) return;
+    if (m_activeTextureUnit == 1) {
+        m_boundLightmapId = idx;
+    } else {
+        m_boundTextureId = idx;
     }
 }
+
 
 void VKRenderer::TextureBindVertex(int idx, bool scaleLight) {
     m_boundLightmapId = idx;
@@ -1567,11 +1589,9 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
 
     printf("[Vulkan Texture] Creada ID: %d | %dx%d (%s)\n", texId, width, height, data ? "Con Datos" : "Lienzo Vacío");
 
-    // DETECCIÓN DEFINITIVA DEL ATLAS DE BLOQUES (terrain.png es >= 256x256)
-    if (width >= 256 && height >= 256) {
-        m_terrainAtlasId = texId;
-        printf("[Vulkan] >>> ATLAS DE BLOQUES REGISTRADO: TexId=%d (%dx%d) <<<\n", texId, width, height);
-    }
+    // CORRECCIÓN SPRINT 1: Eliminada la autodetección ciega (width >= 256).
+    // Evita que items, armaduras, menús o los 6 fondos del panorama sobreescriban el atlas.
+    // El atlas real de bloques se identificará automáticamente desde la Unidad 0 en CBuffCall.
 
     VkImageCreateInfo imgInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     imgInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -1645,12 +1665,20 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
     viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     VK_CHECK(vkCreateImageView(m_device, &viewInfo, nullptr, &tex.view));
 
+    // CORRECCIÓN SPRINT 1: Sampler con filtrado anisotrópico activado para eliminar el Texture Swimming
     VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    samplerInfo.magFilter = VK_FILTER_NEAREST;
+    samplerInfo.magFilter = VK_FILTER_NEAREST; // Píxeles nítidos estilo Minecraft clásico
     samplerInfo.minFilter = VK_FILTER_NEAREST;
     samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.maxAnisotropy = 4.0f; // Calibrado para Intel HD 620: estabiliza texels rasantes al caminar sin pérdida de FPS
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = 0.0f;
+    samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
     VK_CHECK(vkCreateSampler(m_device, &samplerInfo, nullptr, &tex.sampler));
 
     VkDescriptorSetAllocateInfo descAllocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -1808,7 +1836,10 @@ void VKRenderer::StateSetTexGenCol(int col, float x, float y, float z, float w, 
 void VKRenderer::StateSetStencil(int Function, std::uint8_t stencil_ref, std::uint8_t stencil_func_mask, std::uint8_t stencil_write_mask) {}
 void VKRenderer::StateSetForceLOD(int LOD) {}
 void VKRenderer::StateSetTextureEnable(bool enable) { m_textureEnabled = enable; }
-void VKRenderer::StateSetActiveTexture(int tex) {}
+void VKRenderer::StateSetActiveTexture(int tex) {
+    // 0x84C0 = GL_TEXTURE0, 0x84C1 = GL_TEXTURE1
+    m_activeTextureUnit = (tex == 1 || tex == 0x84C1) ? 1 : 0;
+}
 
 void VKRenderer::SetChunkOffset(float x, float y, float z) { m_chunkOffset = {x, y, z}; }
 void VKRenderer::SetAtlasSize(int width, int height) {}

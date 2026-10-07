@@ -20,11 +20,11 @@ void main() {
 
     outUV = inUV;
 
-    // Si el vértice no tiene color (0,0,0,0), usamos uBaseColor.
-    // Si tiene color, desempaquetamos Little-Endian .abgr de Minecraft
+    // CORRECCIÓN: Si el vértice no tiene color, usamos uBaseColor directo.
+    // Si tiene color (bioma, luz), lo MULTIPLICAMOS por uBaseColor para preservar el Alpha de la cámara/agua.
     if (inColor == vec4(0.0)) {
         outColor = pc.uBaseColor;
     } else {
-        outColor = inColor.abgr;
+        outColor = inColor.abgr * pc.uBaseColor;
     }
 }

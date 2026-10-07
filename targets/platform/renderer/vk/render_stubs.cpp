@@ -60,6 +60,13 @@ void glTexImage2D_4J(int target, int level, int internalformat, int width,
                                  IPlatformRenderer::TEXTURE_FORMAT_RxGyBzAw);
 }
 
+void glTexSubImage2D_4J(int target, int level, int xoffset, int yoffset,
+                        int width, int height, int format, int type,
+                        ByteBuffer* pixels) {
+    (void)target; (void)format; (void)type;
+    PlatformRenderer.TextureDataUpdate(xoffset, yoffset, width, height, getBytePtr(pixels), level);
+}
+
 void glLight_4J(int light, int pname, FloatBuffer* params) {
     if (!params) return;
     const float* p = params->_getDataPointer();
@@ -131,7 +138,7 @@ static int s_currentActiveTextureUnit = 0;
 extern "C" {
 
 void glActiveTexture(unsigned int texture) {
-    // GL_TEXTURE0 = 0x84C0, GL_TEXTURE1 = 0x84C1 (o índices 0 y 1)
+    // GL_TEXTURE0 = 0x84C0 (o índice 0), GL_TEXTURE1 = 0x84C1 (o índice 1)
     s_currentActiveTextureUnit = (texture == 0x84C1 || texture == 1) ? 1 : 0;
     PlatformRenderer.StateSetActiveTexture(s_currentActiveTextureUnit);
 }
@@ -141,11 +148,10 @@ void glClientActiveTexture(unsigned int texture) {
 }
 
 void glBindTexture(unsigned int target, unsigned int texture) {
+    (void)target;
     if (s_currentActiveTextureUnit == 1) {
-        // Unidad 1: Lightmap dinámico
+        // Unidad 1: Lightmap dinámico (antorchas y ciclo día/noche)
         PlatformRenderer.TextureBindVertex((int)texture);
-        // ¡CRÍTICO!: Regla de 4J: Volver de inmediato a la Unidad 0 para los bloques
-        s_currentActiveTextureUnit = 0;
     } else {
         // Unidad 0: Atlas de bloques (terrain.png), texturas de mobs, cielo, GUI
         PlatformRenderer.TextureBind((int)texture);
@@ -153,10 +159,26 @@ void glBindTexture(unsigned int target, unsigned int texture) {
     }
 }
 
+void glTexSubImage2D(unsigned int target, int level, int xoffset, int yoffset,
+                     int width, int height, unsigned int format, unsigned int type,
+                     const void* pixels) {
+    (void)target; (void)format; (void)type;
+    PlatformRenderer.TextureDataUpdate(xoffset, yoffset, width, height, (void*)pixels, level);
+}
+
+void glDeleteTextures(int n, const unsigned int* textures) {
+    if (!textures) return;
+    for (int i = 0; i < n; i++) {
+        PlatformRenderer.TextureFree((int)textures[i]);
+    }
+}
+
 void glEnable(unsigned int cap) {
     switch (cap) {
         case 0x0DE1: // GL_TEXTURE_2D
-            PlatformRenderer.StateSetTextureEnable(true);
+            if (s_currentActiveTextureUnit == 0) {
+                PlatformRenderer.StateSetTextureEnable(true);
+            }
             break;
         case 0x0B71: // GL_DEPTH_TEST
             PlatformRenderer.StateSetDepthTestEnable(true);
@@ -184,7 +206,11 @@ void glEnable(unsigned int cap) {
 void glDisable(unsigned int cap) {
     switch (cap) {
         case 0x0DE1: // GL_TEXTURE_2D
-            PlatformRenderer.StateSetTextureEnable(false);
+            // CORRECCIÓN SPRINT 1: Solo apagar texturas si se pide en la Unidad 0.
+            // Si Minecraft apaga GL_TEXTURE_2D en la Unidad 1 (Lightmap), el terreno no se apaga.
+            if (s_currentActiveTextureUnit == 0) {
+                PlatformRenderer.StateSetTextureEnable(false);
+            }
             break;
         case 0x0B71: // GL_DEPTH_TEST
             PlatformRenderer.StateSetDepthTestEnable(false);

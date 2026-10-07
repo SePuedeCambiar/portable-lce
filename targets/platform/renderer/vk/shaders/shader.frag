@@ -19,11 +19,11 @@ void main() {
         texColor = texture(uTexture, inUV);
     }
 
-    // Descartar píxeles 100% transparentes (hojas, flores)
-    if (pc.uHasTexture != 0 && texColor.a < 0.05) {
+    // CORRECCIÓN: Descarte estándar Alpha Test de Minecraft (0.1)
+    // Evita que los bordes semitransparentes del césped escriban basura en profundidad
+    if (pc.uHasTexture != 0 && texColor.a < 0.1) {
         discard;
     }
 
-    // Combinación preservando el canal Alpha (imprescindible para el cielo y estrellas)
     outColor = texColor * inColor;
 }
