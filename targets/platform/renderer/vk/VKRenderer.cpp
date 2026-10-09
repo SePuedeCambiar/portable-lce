@@ -1103,7 +1103,7 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     VkDescriptorSet currentSet = m_defaultWhiteTexture.descriptorSet;
     int hasTex = 0;
     if (m_textureEnabled && m_boundTextureId > 0) {
-        std::lock_guard<std::mutex> lk(m_textureMtx);
+        std::lock_guard<std::recursive_mutex> lk(m_textureMtx);
         auto it = m_textures.find(m_boundTextureId);
         if (it != m_textures.end() && it->second.descriptorSet != VK_NULL_HANDLE) {
             currentSet = it->second.descriptorSet;
@@ -1511,7 +1511,7 @@ bool VKRenderer::CBuffCall(int index, bool full) {
                           ? m_boundTextureId 
                           : m_terrainAtlasId;
 
-        std::lock_guard<std::mutex> lk(m_textureMtx);
+        std::lock_guard<std::recursive_mutex> lk(m_textureMtx);
         auto texIt = m_textures.find(targetTexId);
         if (texIt != m_textures.end() && texIt->second.descriptorSet != VK_NULL_HANDLE) {
             currentSet = texIt->second.descriptorSet;
@@ -1574,7 +1574,7 @@ int VKRenderer::TextureCreate() {
 }
 
 void VKRenderer::TextureFree(int idx) {
-    std::lock_guard<std::mutex> lk(m_textureMtx);
+    std::lock_guard<std::recursive_mutex> lk(m_textureMtx);
     auto it = m_textures.find(idx);
     if (it != m_textures.end()) {
         if (m_device) {
@@ -1610,7 +1610,7 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
     // CORRECCIÓN: Permitir data == nullptr (Minecraft reserva el atlas vacío antes de llenarlo)
     if (width <= 0 || height <= 0 || level != 0) return;
 
-    std::lock_guard<std::mutex> lk(m_textureMtx);
+    std::lock_guard<std::recursive_mutex> lk(m_textureMtx);
     int texId = (m_boundTextureId > 0) ? m_boundTextureId : s_nextTexId++;
     VkDeviceSize imageSize = (VkDeviceSize)width * height * 4;
 
@@ -1774,7 +1774,7 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
 void VKRenderer::TextureDataUpdate(int xoffset, int yoffset, int width, int height, void* data, int level) {
     if (width <= 0 || height <= 0 || !data) return;
 
-    std::lock_guard<std::mutex> lk(m_textureMtx);
+    std::lock_guard<std::recursive_mutex> lk(m_textureMtx);
     int texId = (m_boundTextureId > 0) ? m_boundTextureId : 1;
     auto it = m_textures.find(texId);
     if (it == m_textures.end()) {
@@ -1849,7 +1849,7 @@ void VKRenderer::TextureSetParam(int param, int value) {
 
         // 2. Si la textura ya existe en GPU, actualizar su sampler en caliente
         if (isClamp && m_boundTextureId > 0 && m_device != VK_NULL_HANDLE) {
-            std::lock_guard<std::mutex> lk(m_textureMtx);
+            std::lock_guard<std::recursive_mutex> lk(m_textureMtx);
             auto it = m_textures.find(m_boundTextureId);
             if (it != m_textures.end() && it->second.sampler != VK_NULL_HANDLE) {
                 vkDestroySampler(m_device, it->second.sampler, nullptr);
