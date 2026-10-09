@@ -42,3 +42,8 @@ void GLRenderer::Tick() {}
 void GLRenderer::Suspend() {}
 bool GLRenderer::Suspended() { return false; }
 void GLRenderer::Resume() {}
+
+void glTexParameteri(unsigned int target, unsigned int pname, int param) {
+    (void)target;
+    PlatformRenderer.TextureSetParam((int)pname, param);
+}

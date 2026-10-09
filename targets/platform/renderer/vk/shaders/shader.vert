@@ -20,11 +20,12 @@ void main() {
 
     outUV = inUV;
 
-    // CORRECCIÓN: Si el vértice no tiene color, usamos uBaseColor directo.
-    // Si tiene color (bioma, luz), lo MULTIPLICAMOS por uBaseColor para preservar el Alpha de la cámara/agua.
+    // CORRECCIÓN: Si el vértice no tiene color propio (cielo), usa uBaseColor.
+    // Si el vértice tiene color (agua, bioma, luz), usa su color nativo SIN multiplicar por pc.uBaseColor,
+    // evitando que el agua se tiña de negro.
     if (inColor == vec4(0.0)) {
         outColor = pc.uBaseColor;
     } else {
-        outColor = inColor.abgr * pc.uBaseColor;
+        outColor = inColor.abgr;
     }
 }

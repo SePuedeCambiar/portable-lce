@@ -683,6 +683,7 @@ void VKRenderer::Initialise() {
     VkSemaphoreCreateInfo semaphoreInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, VK_FENCE_CREATE_SIGNALED_BIT};
 
+    // CORRECCIÓN CRÍTICA: Crear ambos semáforos correctamente (m_imageAvailable y m_renderFinished)
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
         VK_CHECK(vkCreateSemaphore(m_device, &semaphoreInfo, nullptr, &m_imageAvailableSemaphores[i]));
         VK_CHECK(vkCreateSemaphore(m_device, &semaphoreInfo, nullptr, &m_renderFinishedSemaphores[i]));
@@ -798,22 +799,23 @@ void VKRenderer::Initialise() {
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineTransparent));
 
     // ========================================================================
-    // PIPELINES DEDICADOS PARA CHUNKS 3D (Descarta caras duplicadas de hierba y caña)
+    // PIPELINES DEDICADOS PARA CHUNKS 3D (Mundo real)
     // ========================================================================
+    // 1. Chunks Opacos: CULL_BACK_BIT + COUNTER_CLOCKWISE (Suelo sólido, sin caras duplicadas de hierba)
     rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
-    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; // <--- CORRECCIÓN: Voltear hacia afuera
-
-    // Chunk Opaco (Terreno sólido, bloques, hierba sólida)
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     pipelineInfo.pDepthStencilState = &depthOpaque;
     pipelineInfo.pColorBlendState = &colorBlendingOpaque;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineChunkOpaque));
 
-    // Chunk Transparente (Agua y Hielo)
-    pipelineInfo.pDepthStencilState = &depthTrans;
+    // 2. Chunks Transparentes (Agua y Hielo): depthWrite = FALSE (Elimina el corte azul de las orillas)
+    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    pipelineInfo.pDepthStencilState = &depthTrans; // depthWriteEnable = VK_FALSE obligatorio para agua limpia
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineChunkTransparent));
 
-    // Restaurar inmediatamente a NONE para los pipelines restantes
+    // Restaurar inmediatamente a NONE para los pipelines 2D restantes
     rasterizer.cullMode = VK_CULL_MODE_NONE;
     // ========================================================================
 
@@ -913,7 +915,7 @@ void VKRenderer::Initialise() {
 
     m_baseColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
 
-    printf("[Vulkan] Inicialización de 8 pipelines (Opaco, Transparente, ChunkOpaco, ChunkTransparente, NoDepth, Líneas, TriangleFan, Aditivo) completada.\n");
+    printf("[Vulkan] Inicialización de 8 pipelines completada.\n");
 }
 
 void VKRenderer::InitialiseContext() {}
@@ -1016,15 +1018,18 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     }
 
     bool wasQuad = (ptype == PRIMITIVE_TYPE_QUAD_LIST || (int)ptype == 0x0007);
-    size_t stride = (vType == VERTEX_TYPE_COMPRESSED) ? 16 : 32;
-    size_t bytes = (size_t)count * stride;
+    size_t inStride = (vType == VERTEX_TYPE_COMPRESSED) ? 16 : 32;
+    size_t inBytes = (size_t)count * inStride;
+
+    // El buffer dinámico de Vulkan siempre trabaja con stride de 32 bytes
+    size_t outBytes = (size_t)count * 32;
 
     s_recIsCompressed = (vType == VERTEX_TYPE_COMPRESSED);
 
     // 2. Si estamos grabando una lista de chunks (CBuff), acumular en memoria y salir
     if (s_recListId >= 0) {
-        int first = (int)(s_recVerts.size() / stride);
-        s_recVerts.insert(s_recVerts.end(), (const uint8_t*)dataIn, (const uint8_t*)dataIn + bytes);
+        int first = (int)(s_recVerts.size() / inStride);
+        s_recVerts.insert(s_recVerts.end(), (const uint8_t*)dataIn, (const uint8_t*)dataIn + inBytes);
         s_recDraws.push_back({(int)ptype, first, count, wasQuad});
         return;
     }
@@ -1032,10 +1037,42 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     LogVKDraw("DrawVertices", count, m_boundTextureId, m_baseColor, glm::vec3(0.0f), m_depthMaskEnabled);
 
     if (!m_frameStarted) return;
-    if (m_dynamicVertexOffset + bytes > DYNAMIC_VERTEX_BUFFER_SIZE) return;
+    if (m_dynamicVertexOffset + outBytes > DYNAMIC_VERTEX_BUFFER_SIZE) return;
 
-    // 3. Copiar vértices al Dynamic VBO
-    memcpy((char*)m_dynamicVertexMapped + m_dynamicVertexOffset, dataIn, bytes);
+    // 3. Copiar vértices al Dynamic VBO con descompresión a 32 bytes (Formato exacto 1:1 de GLRenderer)
+    if (vType == VERTEX_TYPE_COMPRESSED) {
+        #pragma pack(push, 1)
+        struct CompressedVertex {
+            int16_t x, y, z;    // Bytes 0..5 (Posición: 3 shorts = 6 bytes)
+            int16_t color;      // Bytes 6..7 (Color empaquetado = 2 bytes)
+            int16_t u, v;       // Bytes 8..11 (UVs reales: leídas exactamente en el byte 8)
+            int16_t light[2];   // Bytes 12..15 (Luz = 4 bytes)
+        };
+        #pragma pack(pop)
+
+        struct StandardVertex {
+            float x, y, z;
+            float u, v;
+            uint32_t color;
+            float pad[2];
+        };
+
+        const CompressedVertex* src = (const CompressedVertex*)dataIn;
+        StandardVertex* dst = (StandardVertex*)((char*)m_dynamicVertexMapped + m_dynamicVertexOffset);
+
+        for (int i = 0; i < count; i++) {
+            dst[i].x = (float)src[i].x / 1024.0f;
+            dst[i].y = (float)src[i].y / 1024.0f;
+            dst[i].z = (float)src[i].z / 1024.0f;
+            dst[i].u = (float)src[i].u / 1024.0f;
+            dst[i].v = (float)src[i].v / 1024.0f;
+            dst[i].color = 0xFFFFFFFF; // Blanco neutro para no oscurecer el ítem
+            dst[i].pad[0] = 0.0f;
+            dst[i].pad[1] = 0.0f;
+        }
+    } else {
+        memcpy((char*)m_dynamicVertexMapped + m_dynamicVertexOffset, dataIn, inBytes);
+    }
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
 
@@ -1081,9 +1118,8 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     // 6. Push Constants (Matrices MVP, color base real y offsets)
     PushConstants pc;
     pc.uMVP = s_vkClipCorrection * (s_proj.cur() * s_mv.cur());
-    // Respetar el color real recibido de glColor4f/glColor3f (sin forzar blanco)
     pc.uBaseColor = m_baseColor;
-    pc.uChunkOffset = glm::vec3(0.0f); // El cielo, la mano y la UI NO llevan offset de chunk
+    pc.uChunkOffset = glm::vec3(0.0f);
     pc.uHasTexture = hasTex;
 
     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants), &pc);
@@ -1100,8 +1136,8 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         vkCmdDraw(cmd, count, 1, 0, 0);
     }
 
-    // 9. Avanzar el offset alineado a 64 bytes
-    m_dynamicVertexOffset += (bytes + 63) & ~63;
+    // 9. Avanzar el offset alineado a 64 bytes (usando outBytes para cubrir los 32 bytes reales)
+    m_dynamicVertexOffset += (outBytes + 63) & ~63;
 }
 
 void VKRenderer::Present() {
@@ -1446,12 +1482,13 @@ bool VKRenderer::CBuffCall(int index, bool full) {
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
 
-    // 2. SELECCIÓN DE PIPELINE PARA EL MUNDO 3D (CULL_MODE_BACK_BIT ACTIVO)
-    // Descarta las caras traseras duplicadas de la hierba alta, caña de azúcar y agua
+    // 2. SELECCIÓN DE PIPELINE PARA EL MUNDO 3D
+    // Chunks opacos usan CULL_MODE_BACK_BIT (elimina caras dobles de hierba).
+    // Agua y hielo usan CULL_NONE con mezcla Alpha (superficie continua sin parpadeos).
     VkPipeline targetPipeline = (m_pipelineChunkOpaque != VK_NULL_HANDLE) ? m_pipelineChunkOpaque : m_pipelineOpaque;
 
     if (!m_depthTestEnabled && m_pipelineNoDepth != VK_NULL_HANDLE) {
-        targetPipeline = m_pipelineNoDepth; // Cielo y estrellas (listas internas < 1000)
+        targetPipeline = m_pipelineNoDepth; // Cielo y estrellas
     } else if (m_blendEnabled) {
         // Capa 1: Agua y Hielo (Mezcla Alpha activa, Depth-write = FALSE)
         targetPipeline = (m_pipelineChunkTransparent != VK_NULL_HANDLE) ? m_pipelineChunkTransparent : m_pipelineTransparent;
@@ -1466,8 +1503,7 @@ bool VKRenderer::CBuffCall(int index, bool full) {
     int hasTex = 0;
 
     if (m_textureEnabled) {
-        // Fijamos que la textura activa en Unidad 0 durante CBuffCall es el Atlas de Bloques
-        if (index >= 1000 && m_boundTextureId > 0 && m_boundTextureId != m_boundLightmapId) {
+        if (m_boundTextureId > 0 && m_boundTextureId != m_boundLightmapId) {
             m_terrainAtlasId = m_boundTextureId;
         }
 
@@ -1496,10 +1532,14 @@ bool VKRenderer::CBuffCall(int index, bool full) {
     // 4. Push Constants:
     PushConstants pc;
     pc.uMVP = s_vkClipCorrection * (s_proj.cur() * s_mv.cur());
+
+    // CORRECCIÓN DEFINITIVA:
+    // Si la textura está encendida (terreno, agua, chunks), color blanco neutro (1,1,1,1).
+    // Si la textura está apagada (cielo, estrellas, horizonte), usar m_baseColor (azul del cielo).
     pc.uBaseColor = m_textureEnabled ? glm::vec4(1.0f, 1.0f, 1.0f, 1.0f) : m_baseColor;
     
-    // Si el índice es menor a 1000 (skyList, starList, darkList), NO sumar offset de chunk
-    pc.uChunkOffset = (index < 1000) ? glm::vec3(0.0f) : m_chunkOffset;
+    // Solo los chunks de terreno llevan offset (el cielo siempre en 0,0,0)
+    pc.uChunkOffset = m_textureEnabled ? m_chunkOffset : glm::vec3(0.0f);
     pc.uHasTexture = hasTex;
 
     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants), &pc);
@@ -1686,16 +1726,23 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
     viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     VK_CHECK(vkCreateImageView(m_device, &viewInfo, nullptr, &tex.view));
 
-    // CORRECCIÓN SPRINT 1: Sampler con filtrado anisotrópico activado para eliminar el Texture Swimming
+    // CORRECCIÓN SOMBRA 3x3:
+    // Detectar si la textura solicitó CLAMP (como misc/shadow.png o viñetas de 64x64)
+    bool isClamped = m_nextTexClamp || (width == 64 && height == 64 && data != nullptr);
+    m_nextTexClamp = false; // Resetear para las siguientes texturas
+
+    VkSamplerAddressMode addrMode = isClamped ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+
     VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    samplerInfo.magFilter = VK_FILTER_NEAREST; // Píxeles nítidos estilo Minecraft clásico
-    samplerInfo.minFilter = VK_FILTER_NEAREST;
-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    // Sombra suave si es clamp; píxeles nítidos estilo Minecraft clásico si es el atlas
+    samplerInfo.magFilter = isClamped ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    samplerInfo.minFilter = isClamped ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    samplerInfo.addressModeU = addrMode;
+    samplerInfo.addressModeV = addrMode;
+    samplerInfo.addressModeW = addrMode;
     samplerInfo.anisotropyEnable = VK_FALSE;
-    samplerInfo.maxAnisotropy = 4.0f; // Calibrado para Intel HD 620: estabiliza texels rasantes al caminar sin pérdida de FPS
-    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.maxAnisotropy = 1.0f;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     samplerInfo.minLod = 0.0f;
     samplerInfo.maxLod = 0.0f;
     samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
@@ -1735,25 +1782,40 @@ void VKRenderer::TextureDataUpdate(int xoffset, int yoffset, int width, int heig
         return;
     }
 
-    VkDeviceSize imageSize = width * height * 4;
-    VkBuffer stagingBuffer;
-    VkDeviceMemory stagingMemory;
-    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE};
-    VK_CHECK(vkCreateBuffer(m_device, &bufferInfo, nullptr, &stagingBuffer));
+    VkDeviceSize imageSize = (VkDeviceSize)width * height * 4;
 
-    VkMemoryRequirements memReqs;
-    vkGetBufferMemoryRequirements(m_device, stagingBuffer, &memReqs);
-    VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, memReqs.size,
-                                   findMemoryType(m_physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
-    VK_CHECK(vkAllocateMemory(m_device, &allocInfo, nullptr, &stagingMemory));
-    VK_CHECK(vkBindBufferMemory(m_device, stagingBuffer, stagingMemory, 0));
+    // OPTIMIZACIÓN SPRINT 1: Buffer de Staging persistente (Evita fugas de RAM y parpadeo de agua)
+    static VkBuffer s_animStagingBuffer = VK_NULL_HANDLE;
+    static VkDeviceMemory s_animStagingMemory = VK_NULL_HANDLE;
+    static VkDeviceSize s_animStagingCapacity = 0;
 
+    if (s_animStagingCapacity < imageSize) {
+        if (s_animStagingBuffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(m_device, s_animStagingBuffer, nullptr);
+            vkFreeMemory(m_device, s_animStagingMemory, nullptr);
+        }
+        s_animStagingCapacity = std::max(imageSize, (VkDeviceSize)(512 * 512 * 4)); // 1MB fijo
+
+        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, s_animStagingCapacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE};
+        VK_CHECK(vkCreateBuffer(m_device, &bufferInfo, nullptr, &s_animStagingBuffer));
+
+        VkMemoryRequirements memReqs;
+        vkGetBufferMemoryRequirements(m_device, s_animStagingBuffer, &memReqs);
+        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, memReqs.size,
+                                       findMemoryType(m_physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+        VK_CHECK(vkAllocateMemory(m_device, &allocInfo, nullptr, &s_animStagingMemory));
+        VK_CHECK(vkBindBufferMemory(m_device, s_animStagingBuffer, s_animStagingMemory, 0));
+    }
+
+    // Copia directa a memoria mapeada sin realocar nada en la GPU
     void* mapped = nullptr;
-    vkMapMemory(m_device, stagingMemory, 0, imageSize, 0, &mapped);
+    vkMapMemory(m_device, s_animStagingMemory, 0, imageSize, 0, &mapped);
     memcpy(mapped, data, imageSize);
-    vkUnmapMemory(m_device, stagingMemory);
+    vkUnmapMemory(m_device, s_animStagingMemory);
 
+    // Transferencia sincronizada limpia a la textura
     VkCommandBuffer cmd = beginSingleTimeCommands();
+
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -1767,7 +1829,7 @@ void VKRenderer::TextureDataUpdate(int xoffset, int yoffset, int width, int heig
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageOffset = { xoffset, yoffset, 0 };
     region.imageExtent = { (uint32_t)width, (uint32_t)height, 1 };
-    vkCmdCopyBufferToImage(cmd, stagingBuffer, it->second.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    vkCmdCopyBufferToImage(cmd, s_animStagingBuffer, it->second.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -1776,11 +1838,48 @@ void VKRenderer::TextureDataUpdate(int xoffset, int yoffset, int width, int heig
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 
     endSingleTimeCommands(cmd);
-    vkDestroyBuffer(m_device, stagingBuffer, nullptr);
-    vkFreeMemory(m_device, stagingMemory, nullptr);
 }
 
-void VKRenderer::TextureSetParam(int param, int value) {}
+void VKRenderer::TextureSetParam(int param, int value) {
+    // GL_TEXTURE_WRAP_S = 0x2802, GL_TEXTURE_WRAP_T = 0x2803
+    // GL_CLAMP_TO_EDGE = 0x812F
+    if (param == 0x2802 || param == 0x2803) {
+        bool isClamp = (value == 0x812F);
+        m_nextTexClamp = isClamp; // 1. Recordar para cuando TextureData cree la imagen inmediatamente después
+
+        // 2. Si la textura ya existe en GPU, actualizar su sampler en caliente
+        if (isClamp && m_boundTextureId > 0 && m_device != VK_NULL_HANDLE) {
+            std::lock_guard<std::mutex> lk(m_textureMtx);
+            auto it = m_textures.find(m_boundTextureId);
+            if (it != m_textures.end() && it->second.sampler != VK_NULL_HANDLE) {
+                vkDestroySampler(m_device, it->second.sampler, nullptr);
+
+                VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+                samplerInfo.magFilter = VK_FILTER_LINEAR; // Sombra suave sin pixelado duro
+                samplerInfo.minFilter = VK_FILTER_LINEAR;
+                samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+                samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+                samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+                samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+                VK_CHECK(vkCreateSampler(m_device, &samplerInfo, nullptr, &it->second.sampler));
+
+                VkDescriptorImageInfo descImgInfo{};
+                descImgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                descImgInfo.imageView = it->second.view;
+                descImgInfo.sampler = it->second.sampler;
+
+                VkWriteDescriptorSet descriptorWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                descriptorWrite.dstSet = it->second.descriptorSet;
+                descriptorWrite.dstBinding = 0;
+                descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                descriptorWrite.descriptorCount = 1;
+                descriptorWrite.pImageInfo = &descImgInfo;
+                vkUpdateDescriptorSets(m_device, 1, &descriptorWrite, 0, nullptr);
+            }
+        }
+    }
+}
+
 void VKRenderer::TextureDynamicUpdateStart() {}
 void VKRenderer::TextureDynamicUpdateEnd() {}
 

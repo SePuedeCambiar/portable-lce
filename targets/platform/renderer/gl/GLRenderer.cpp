@@ -1560,4 +1560,14 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
     static PFNGLTEXIMAGE2DPROC real_glTexImage2D = (PFNGLTEXIMAGE2DPROC)dlsym(RTLD_NEXT, "glTexImage2D");
     real_glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
 }
+
+void glTexParameteri(unsigned int target, unsigned int pname, int param) {
+    typedef void (*PFN_glTexParameteri)(unsigned int, unsigned int, int);
+    static PFN_glTexParameteri real_glTexParameteri = (PFN_glTexParameteri)dlsym(RTLD_NEXT, "glTexParameteri");
+    if (real_glTexParameteri) {
+        real_glTexParameteri(target, pname, param);
+    }
+}
+
+
 }

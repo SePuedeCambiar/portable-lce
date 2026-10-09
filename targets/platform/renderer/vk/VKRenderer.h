@@ -167,6 +167,7 @@ public:
 
 private:
     int m_terrainAtlasId = 0;
+    bool m_nextTexClamp = false; // Flag para activar CLAMP_TO_EDGE en sombras y viñetas
 
     VkFormat findSupportedFormat(const std::vector<VkFormat>& candidates, VkImageTiling tiling, VkFormatFeatureFlags features);
     VkFormat findDepthFormat();
@@ -223,7 +224,7 @@ private:
     int m_boundLightmapId = -1;
     int m_activeTextureUnit = 0;
     VKTexture m_defaultWhiteTexture;
-    std::mutex m_textureMtx;
+    std::recursive_mutex m_textureMtx; // Permite llamadas anidadas sin congelar el juego jamás
     std::mutex m_queueMtx;
 
     // Chunks (CBuff)

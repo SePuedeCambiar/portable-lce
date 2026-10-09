@@ -1143,14 +1143,13 @@ void Textures::tick(
             return;
         }
 
-        // 4J - added - tell renderer that we're about to do a block of dynamic
-        // texture updates, so we can unlock the resources after they are done
-        // rather than a series of locks/unlocks
-        // PlatformRenderer.TextureDynamicUpdateStart();
-        terrain->cycleAnimationFrames();
-        items->cycleAnimationFrames();
-        // PlatformRenderer.TextureDynamicUpdateEnd();	// 4J added - see
-        // comment above
+        // ====================================================================
+        // PRUEBA DIAGNÓSTICO: Pausamos temporalmente las animaciones para probar
+        // si el parpadeo del agua se detiene al 100%.
+        // ====================================================================
+        // terrain->cycleAnimationFrames();
+        // items->cycleAnimationFrames();
+        // ====================================================================
     }
 
     // 4J - go over all the memory textures once per frame, and free any that
