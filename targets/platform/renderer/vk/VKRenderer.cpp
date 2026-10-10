@@ -16,6 +16,11 @@
 #include "shaders/vert_spv.h"
 #include "shaders/frag_spv.h"
 
+
+static thread_local bool s_vkDepthMaskEnabled = true;
+static thread_local bool s_vkBlendEnabled = false;
+static thread_local bool s_vkDepthTestEnabled = true;
+
 // ============================================================================
 // FRAME ANATOMY DUMP - VULKAN (MEDICIÓN PERFECTA CON TECLA P)
 // ============================================================================
@@ -523,7 +528,6 @@ void VKRenderer::Initialise() {
         queueCreateInfos.push_back(queueCreateInfo);
     }
 
-    // Activamos capacidades avanzadas de líneas y polígonos soportadas por Intel Mesa
     VkPhysicalDeviceFeatures deviceFeatures{};
     deviceFeatures.samplerAnisotropy = VK_TRUE;
     deviceFeatures.fillModeNonSolid = VK_TRUE;
@@ -683,7 +687,6 @@ void VKRenderer::Initialise() {
     VkSemaphoreCreateInfo semaphoreInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, VK_FENCE_CREATE_SIGNALED_BIT};
 
-    // CORRECCIÓN CRÍTICA: Crear ambos semáforos correctamente (m_imageAvailable y m_renderFinished)
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
         VK_CHECK(vkCreateSemaphore(m_device, &semaphoreInfo, nullptr, &m_imageAvailableSemaphores[i]));
         VK_CHECK(vkCreateSemaphore(m_device, &semaphoreInfo, nullptr, &m_renderFinishedSemaphores[i]));
@@ -734,7 +737,7 @@ void VKRenderer::Initialise() {
     VkPipelineRasterizationStateCreateInfo rasterizer{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
     rasterizer.lineWidth = 1.0f;
-    rasterizer.cullMode = VK_CULL_MODE_NONE; // Por defecto NONE para menús 2D y HUD
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
     rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
 
     VkPipelineMultisampleStateCreateInfo multisampling{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
@@ -743,7 +746,7 @@ void VKRenderer::Initialise() {
     std::vector<VkDynamicState> dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dynamicState{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0, (uint32_t)dynamicStates.size(), dynamicStates.data()};
 
-    // 1. PIPELINE OPACO (Para UI, entidades, fallback 2D - CULL NONE)
+    // 1. PIPELINE OPACO (Para UI, entidades, fallback 2D)
     VkPipelineDepthStencilStateCreateInfo depthOpaque{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthOpaque.depthTestEnable = VK_TRUE;
     depthOpaque.depthWriteEnable = VK_TRUE;
@@ -773,7 +776,7 @@ void VKRenderer::Initialise() {
     rasterizer.cullMode = VK_CULL_MODE_NONE;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineOpaque));
 
-    // 2. PIPELINE TRANSPARENTE (Para UI con alfa, partículas, fallback - CULL NONE)
+    // 2. PIPELINE TRANSPARENTE (Para UI con alfa, partículas, fallback)
     VkPipelineDepthStencilStateCreateInfo depthTrans{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthTrans.depthTestEnable = VK_TRUE;
     depthTrans.depthWriteEnable = VK_FALSE;
@@ -801,21 +804,28 @@ void VKRenderer::Initialise() {
     // ========================================================================
     // PIPELINES DEDICADOS PARA CHUNKS 3D (Mundo real)
     // ========================================================================
-    // 1. Chunks Opacos: CULL_BACK_BIT + COUNTER_CLOCKWISE (Suelo sólido, sin caras duplicadas de hierba)
+    // 1. Chunks Opacos: CULL_BACK_BIT + COUNTER_CLOCKWISE (Suelo sólido)
     rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     pipelineInfo.pDepthStencilState = &depthOpaque;
     pipelineInfo.pColorBlendState = &colorBlendingOpaque;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineChunkOpaque));
 
-    // 2. Chunks Transparentes (Agua y Hielo): depthWrite = FALSE (Elimina el corte azul de las orillas)
-    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+    // 2. Chunks Transparentes (Agua y Hielo): CULL_NONE Y DEPTH BIAS ANTI Z-FIGHTING
+    rasterizer.cullMode = VK_CULL_MODE_NONE; // <-- CORREGIDO: Sin descarte de caras
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    pipelineInfo.pDepthStencilState = &depthTrans; // depthWriteEnable = VK_FALSE obligatorio para agua limpia
+    rasterizer.depthBiasEnable = VK_TRUE;    // <-- CORREGIDO: Activar Depth Bias
+    rasterizer.depthBiasConstantFactor = -1.0f;
+    rasterizer.depthBiasSlopeFactor = -1.0f;
+
+    pipelineInfo.pDepthStencilState = &depthTrans; // depthWriteEnable = VK_FALSE
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineChunkTransparent));
 
-    // Restaurar inmediatamente a NONE para los pipelines 2D restantes
+    // Restaurar inmediatamente el rasterizer para los siguientes pipelines
+    rasterizer.depthBiasEnable = VK_FALSE;
+    rasterizer.depthBiasConstantFactor = 0.0f;
+    rasterizer.depthBiasSlopeFactor = 0.0f;
     rasterizer.cullMode = VK_CULL_MODE_NONE;
     // ========================================================================
 
@@ -1450,7 +1460,7 @@ bool VKRenderer::CBuffCall(int index, bool full) {
 
     int totalVerts = 0;
     for (const auto& dc : cb.draws) totalVerts += dc.count;
-    LogVKDraw("CBuffCall   ", totalVerts, m_boundTextureId, m_baseColor, m_chunkOffset, m_depthMaskEnabled, index);
+    LogVKDraw("CBuffCall   ", totalVerts, m_boundTextureId, m_baseColor, m_chunkOffset, s_vkDepthMaskEnabled, index);
 
     // 1. Subida perezosa de la malla a VRAM si aún no está lista
     if (!cb.vboReady) {
@@ -1482,17 +1492,13 @@ bool VKRenderer::CBuffCall(int index, bool full) {
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
 
-    // 2. SELECCIÓN DE PIPELINE PARA EL MUNDO 3D
-    // Chunks opacos usan CULL_MODE_BACK_BIT (elimina caras dobles de hierba).
-    // Agua y hielo usan CULL_NONE con mezcla Alpha (superficie continua sin parpadeos).
+    // 2. SELECCIÓN DE PIPELINE PARA EL MUNDO 3D (Protegido contra hilos secundarios)
     VkPipeline targetPipeline = (m_pipelineChunkOpaque != VK_NULL_HANDLE) ? m_pipelineChunkOpaque : m_pipelineOpaque;
 
-    if (!m_depthTestEnabled && m_pipelineNoDepth != VK_NULL_HANDLE) {
+    if (!s_vkDepthTestEnabled && m_pipelineNoDepth != VK_NULL_HANDLE) {
         targetPipeline = m_pipelineNoDepth; // Cielo y estrellas
-    } else if (m_blendEnabled) {
-        // Capa 1: Agua y Hielo (Mezcla Alpha activa, Depth-write = FALSE)
-        targetPipeline = (m_pipelineChunkTransparent != VK_NULL_HANDLE) ? m_pipelineChunkTransparent : m_pipelineTransparent;
-    } else if (!m_depthMaskEnabled) {
+    } else if (s_vkBlendEnabled || !s_vkDepthMaskEnabled) {
+        // Capa 1: Agua y Hielo (Garantizado: utiliza el pipeline transparente continuo)
         targetPipeline = (m_pipelineChunkTransparent != VK_NULL_HANDLE) ? m_pipelineChunkTransparent : m_pipelineTransparent;
     }
 
@@ -1533,9 +1539,8 @@ bool VKRenderer::CBuffCall(int index, bool full) {
     PushConstants pc;
     pc.uMVP = s_vkClipCorrection * (s_proj.cur() * s_mv.cur());
 
-    // CORRECCIÓN DEFINITIVA:
-    // Si la textura está encendida (terreno, agua, chunks), color blanco neutro (1,1,1,1).
-    // Si la textura está apagada (cielo, estrellas, horizonte), usar m_baseColor (azul del cielo).
+    // Si la textura está encendida (terreno, agua, chunks), blanco neutro (1,1,1,1).
+    // Si está apagada (cielo, estrellas), color base.
     pc.uBaseColor = m_textureEnabled ? glm::vec4(1.0f, 1.0f, 1.0f, 1.0f) : m_baseColor;
     
     // Solo los chunks de terreno llevan offset (el cielo siempre en 0,0,0)
@@ -1910,16 +1915,24 @@ void* VKRenderer::TextureGetTexture(int idx) { return nullptr; }
 void VKRenderer::StateSetColour(float r, float g, float b, float a) { m_baseColor = {r, g, b, a}; }
 
 void VKRenderer::StateSetDepthMask(bool enable) { 
+    s_vkDepthMaskEnabled = enable;
     m_depthMaskEnabled = enable; 
 }
 
+
 void VKRenderer::StateSetBlendEnable(bool enable) { 
+    s_vkBlendEnabled = enable;
     m_blendEnabled = enable; 
 }
 
+
+
+
 void VKRenderer::StateSetDepthTestEnable(bool enable) { 
+    s_vkDepthTestEnabled = enable;
     m_depthTestEnabled = enable; 
 }
+
 
 void VKRenderer::StateSetBlendFunc(int src, int dst) {
     m_blendSrc = src;
