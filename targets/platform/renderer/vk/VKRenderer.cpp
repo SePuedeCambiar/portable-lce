@@ -17,6 +17,13 @@
 #include "shaders/frag_spv.h"
 
 
+static thread_local bool s_vkCullEnabled = true;
+static thread_local bool s_vkCullFrontFaceCW = false;
+
+
+
+static VkPipeline s_pipelineTransDepth = VK_NULL_HANDLE;
+
 static thread_local bool s_vkDepthMaskEnabled = true;
 static thread_local bool s_vkBlendEnabled = false;
 static thread_local bool s_vkDepthTestEnabled = true;
@@ -746,12 +753,18 @@ void VKRenderer::Initialise() {
     std::vector<VkDynamicState> dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dynamicState{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0, (uint32_t)dynamicStates.size(), dynamicStates.data()};
 
-    // 1. PIPELINE OPACO (Para UI, entidades, fallback 2D)
+    // Estados de profundidad base
     VkPipelineDepthStencilStateCreateInfo depthOpaque{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthOpaque.depthTestEnable = VK_TRUE;
     depthOpaque.depthWriteEnable = VK_TRUE;
     depthOpaque.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
+    VkPipelineDepthStencilStateCreateInfo depthTrans{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    depthTrans.depthTestEnable = VK_TRUE;
+    depthTrans.depthWriteEnable = VK_FALSE;
+    depthTrans.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    // Estados de mezcla base
     VkPipelineColorBlendAttachmentState blendOpaque{};
     blendOpaque.colorWriteMask = 0xF;
     blendOpaque.blendEnable = VK_FALSE;
@@ -759,28 +772,6 @@ void VKRenderer::Initialise() {
     VkPipelineColorBlendStateCreateInfo colorBlendingOpaque{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     colorBlendingOpaque.attachmentCount = 1;
     colorBlendingOpaque.pAttachments = &blendOpaque;
-
-    VkGraphicsPipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    pipelineInfo.stageCount = 2;
-    pipelineInfo.pStages = shaderStages;
-    pipelineInfo.pVertexInputState = &vertexInputInfo;
-    pipelineInfo.pInputAssemblyState = &inputAssembly;
-    pipelineInfo.pViewportState = &viewportState;
-    pipelineInfo.pRasterizationState = &rasterizer;
-    pipelineInfo.pMultisampleState = &multisampling;
-    pipelineInfo.pDepthStencilState = &depthOpaque;
-    pipelineInfo.pColorBlendState = &colorBlendingOpaque;
-    pipelineInfo.pDynamicState = &dynamicState;
-    pipelineInfo.layout = m_pipelineLayout;
-    pipelineInfo.renderPass = m_renderPass;
-    rasterizer.cullMode = VK_CULL_MODE_NONE;
-    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineOpaque));
-
-    // 2. PIPELINE TRANSPARENTE (Para UI con alfa, partículas, fallback)
-    VkPipelineDepthStencilStateCreateInfo depthTrans{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    depthTrans.depthTestEnable = VK_TRUE;
-    depthTrans.depthWriteEnable = VK_FALSE;
-    depthTrans.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
     VkPipelineColorBlendAttachmentState blendTrans{};
     blendTrans.colorWriteMask = 0xF;
@@ -796,29 +787,48 @@ void VKRenderer::Initialise() {
     colorBlendingTrans.attachmentCount = 1;
     colorBlendingTrans.pAttachments = &blendTrans;
 
+    VkGraphicsPipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pipelineInfo.stageCount = 2;
+    pipelineInfo.pStages = shaderStages;
+    pipelineInfo.pVertexInputState = &vertexInputInfo;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterizer;
+    pipelineInfo.pMultisampleState = &multisampling;
+    pipelineInfo.pDepthStencilState = &depthOpaque;
+    pipelineInfo.pColorBlendState = &colorBlendingOpaque;
+    pipelineInfo.pDynamicState = &dynamicState;
+    pipelineInfo.layout = m_pipelineLayout;
+    pipelineInfo.renderPass = m_renderPass;
+
+    // 1. PIPELINE OPACO: CULL_NONE obligatorio para que la interfaz 2D no desaparezca
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineOpaque));
+    // 2. PIPELINE TRANSPARENTE (Agua en pantalla, fuego, partículas con alfa):
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
     pipelineInfo.pDepthStencilState = &depthTrans;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
-    rasterizer.cullMode = VK_CULL_MODE_NONE;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineTransparent));
 
     // ========================================================================
     // PIPELINES DEDICADOS PARA CHUNKS 3D (Mundo real)
     // ========================================================================
-    // 1. Chunks Opacos: CULL_BACK_BIT + COUNTER_CLOCKWISE (Suelo sólido)
+    // 1. Chunks Opacos: COUNTER_CLOCKWISE obligatorio (Mantiene las caras exteriores de árboles y tierra)
     rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     pipelineInfo.pDepthStencilState = &depthOpaque;
     pipelineInfo.pColorBlendState = &colorBlendingOpaque;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineChunkOpaque));
 
-    // 2. Chunks Transparentes (Agua y Hielo): CULL_NONE Y DEPTH BIAS ANTI Z-FIGHTING
-    rasterizer.cullMode = VK_CULL_MODE_NONE; // <-- CORREGIDO: Sin descarte de caras
+    // 2. Chunks Transparentes (Agua y Hielo): CULL_NONE y Depth Bias anti Z-fighting
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rasterizer.depthBiasEnable = VK_TRUE;    // <-- CORREGIDO: Activar Depth Bias
+    rasterizer.depthBiasEnable = VK_TRUE;
     rasterizer.depthBiasConstantFactor = -1.0f;
     rasterizer.depthBiasSlopeFactor = -1.0f;
 
-    pipelineInfo.pDepthStencilState = &depthTrans; // depthWriteEnable = VK_FALSE
+    pipelineInfo.pDepthStencilState = &depthTrans;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineChunkTransparent));
 
@@ -829,12 +839,13 @@ void VKRenderer::Initialise() {
     rasterizer.cullMode = VK_CULL_MODE_NONE;
     // ========================================================================
 
-    // 3. PIPELINE SIN PROFUNDIDAD (Para HUD 2D, menús)
+    // 3. PIPELINE SIN PROFUNDIDAD (Para HUD 2D, menús, textos)
     VkPipelineDepthStencilStateCreateInfo depthNone{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthNone.depthTestEnable = VK_FALSE;
     depthNone.depthWriteEnable = VK_FALSE;
 
     pipelineInfo.pDepthStencilState = &depthNone;
+    pipelineInfo.pColorBlendState = &colorBlendingTrans;
     rasterizer.cullMode = VK_CULL_MODE_NONE;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineNoDepth));
 
@@ -1020,7 +1031,7 @@ void VKRenderer::StartFrame() {
 void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVertexType vType, ePixelShaderType psType) {
     if (count <= 0 || !dataIn) return;
 
-    bool allowDepthWrite = m_depthTestEnabled && m_depthMaskEnabled;
+    bool allowDepthWrite = s_vkDepthTestEnabled && s_vkDepthMaskEnabled;
 
     // 1. Filtro de seguridad de la viñeta
     if (count == 4 && !allowDepthWrite && (m_isVignettePass || m_blendSrc == 0)) {
@@ -1044,19 +1055,19 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         return;
     }
 
-    LogVKDraw("DrawVertices", count, m_boundTextureId, m_baseColor, glm::vec3(0.0f), m_depthMaskEnabled);
+    LogVKDraw("DrawVertices", count, m_boundTextureId, m_baseColor, glm::vec3(0.0f), s_vkDepthMaskEnabled);
 
     if (!m_frameStarted) return;
     if (m_dynamicVertexOffset + outBytes > DYNAMIC_VERTEX_BUFFER_SIZE) return;
 
-    // 3. Copiar vértices al Dynamic VBO con descompresión a 32 bytes (Formato exacto 1:1 de GLRenderer)
+    // 3. Copiar vértices al Dynamic VBO con descompresión a 32 bytes
     if (vType == VERTEX_TYPE_COMPRESSED) {
         #pragma pack(push, 1)
         struct CompressedVertex {
-            int16_t x, y, z;    // Bytes 0..5 (Posición: 3 shorts = 6 bytes)
-            int16_t color;      // Bytes 6..7 (Color empaquetado = 2 bytes)
-            int16_t u, v;       // Bytes 8..11 (UVs reales: leídas exactamente en el byte 8)
-            int16_t light[2];   // Bytes 12..15 (Luz = 4 bytes)
+            int16_t x, y, z;    // Bytes 0..5 (Posición)
+            int16_t color;      // Bytes 6..7 (Color)
+            int16_t u, v;       // Bytes 8..11 (UVs)
+            int16_t light[2];   // Bytes 12..15 (Luz)
         };
         #pragma pack(pop)
 
@@ -1076,7 +1087,7 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
             dst[i].z = (float)src[i].z / 1024.0f;
             dst[i].u = (float)src[i].u / 1024.0f;
             dst[i].v = (float)src[i].v / 1024.0f;
-            dst[i].color = 0xFFFFFFFF; // Blanco neutro para no oscurecer el ítem
+            dst[i].color = 0xFFFFFFFF;
             dst[i].pad[0] = 0.0f;
             dst[i].pad[1] = 0.0f;
         }
@@ -1086,7 +1097,7 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
 
-    // 4. SELECCIÓN DE PIPELINE (Por defecto transparente para UI, menús y partículas)
+    // 4. SELECCIÓN DE PIPELINE PERFECCIONADA
     int ptypeVal = (int)ptype;
     bool isLine = (ptypeVal == 1 || ptypeVal == 3);      // GL_LINES (1) o GL_LINE_STRIP (3)
     bool isFan  = (ptypeVal == 2 || ptypeVal == 6);      // GL_TRIANGLE_FAN (Cúpula del cielo)
@@ -1099,10 +1110,16 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         targetPipeline = m_pipelineLines;             // Recuadro del bloque seleccionado
     } else if (isFan && m_pipelineTriangleFan != VK_NULL_HANDLE) {
         targetPipeline = m_pipelineTriangleFan;       // Cúpula continua del Cielo
-    } else if (!m_depthTestEnabled && m_pipelineNoDepth != VK_NULL_HANDLE) {
-        targetPipeline = m_pipelineNoDepth;           // HUD 2D, menús sin prueba de profundidad
-    } else if (allowDepthWrite && !m_blendEnabled && m_pipelineOpaque != VK_NULL_HANDLE) {
-        targetPipeline = m_pipelineOpaque;            // Geometría 100% sólida
+    } else if (!s_vkDepthTestEnabled && m_pipelineNoDepth != VK_NULL_HANDLE) {
+        targetPipeline = m_pipelineNoDepth;           // Interfaz 2D plana, hotbar, textos
+    } else if (allowDepthWrite && s_vkBlendEnabled && s_pipelineTransDepth != VK_NULL_HANDLE) {
+        // CLAVE DE LA NUCA Y AGUA: Escribe profundidad para que la nuca no tape la cara
+        // y mantiene la mezcla alfa activa para que el agua bajo pantalla no sea negra
+        targetPipeline = s_pipelineTransDepth;        
+    } else if (allowDepthWrite && !s_vkBlendEnabled && m_pipelineOpaque != VK_NULL_HANDLE) {
+        targetPipeline = m_pipelineOpaque;            // Geometría 100% sólida sin mezcla
+    } else {
+        targetPipeline = m_pipelineTransparent;       // Partículas, humo, etc.
     }
 
     if (targetPipeline != VK_NULL_HANDLE) {
@@ -1125,7 +1142,7 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &currentSet, 0, nullptr);
     }
 
-    // 6. Push Constants (Matrices MVP, color base real y offsets)
+    // 6. Push Constants (Formato estable de 96 bytes)
     PushConstants pc;
     pc.uMVP = s_vkClipCorrection * (s_proj.cur() * s_mv.cur());
     pc.uBaseColor = m_baseColor;
@@ -1146,7 +1163,7 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         vkCmdDraw(cmd, count, 1, 0, 0);
     }
 
-    // 9. Avanzar el offset alineado a 64 bytes (usando outBytes para cubrir los 32 bytes reales)
+    // 9. Avanzar el offset alineado a 64 bytes
     m_dynamicVertexOffset += (outBytes + 63) & ~63;
 }
 
@@ -1483,8 +1500,12 @@ bool VKRenderer::CBuffCall(int index, bool full) {
         memcpy(mapped, cb.rawVerts.data(), cb.bufferSize);
         vkUnmapMemory(m_device, cb.vboMemory);
 
-        cb.rawVerts.clear();
-        cb.rawVerts.shrink_to_fit();
+        // SOLO vaciar memoria si es un chunk grande del mundo (> 1000).
+        // Si es una Display List de ítem (listItem), conservamos rawVerts para poder desplazar sus UVs en CPU.
+        if (index > 1000) {
+            cb.rawVerts.clear();
+            cb.rawVerts.shrink_to_fit();
+        }
         cb.vboReady = true;
     }
 
@@ -1498,7 +1519,7 @@ bool VKRenderer::CBuffCall(int index, bool full) {
     if (!s_vkDepthTestEnabled && m_pipelineNoDepth != VK_NULL_HANDLE) {
         targetPipeline = m_pipelineNoDepth; // Cielo y estrellas
     } else if (s_vkBlendEnabled || !s_vkDepthMaskEnabled) {
-        // Capa 1: Agua y Hielo (Garantizado: utiliza el pipeline transparente continuo)
+        // Capa 1: Agua y Hielo
         targetPipeline = (m_pipelineChunkTransparent != VK_NULL_HANDLE) ? m_pipelineChunkTransparent : m_pipelineTransparent;
     }
 
@@ -1535,21 +1556,59 @@ bool VKRenderer::CBuffCall(int index, bool full) {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &currentSet, 0, nullptr);
     }
 
-    // 4. Push Constants:
+    // 4. Push Constants (Formato 100% estable de 96 bytes sin tocar shaders):
     PushConstants pc;
     pc.uMVP = s_vkClipCorrection * (s_proj.cur() * s_mv.cur());
-
-    // Si la textura está encendida (terreno, agua, chunks), blanco neutro (1,1,1,1).
-    // Si está apagada (cielo, estrellas), color base.
     pc.uBaseColor = m_textureEnabled ? glm::vec4(1.0f, 1.0f, 1.0f, 1.0f) : m_baseColor;
-    
-    // Solo los chunks de terreno llevan offset (el cielo siempre en 0,0,0)
     pc.uChunkOffset = m_textureEnabled ? m_chunkOffset : glm::vec3(0.0f);
     pc.uHasTexture = hasTex;
 
     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants), &pc);
 
-    // 5. Enlazar buffers y despachar draws
+    // 5. DESPLAZAMIENTO DEL ÍTEM EN CPU (Si s_tex[0] tiene un offset como el del mapa):
+    float u0 = s_tex[0].cur()[3][0];
+    float v0 = s_tex[0].cur()[3][1];
+
+    if ((u0 != 0.0f || v0 != 0.0f) && !cb.rawVerts.empty()) {
+        size_t totalBytes = cb.rawVerts.size();
+        if (m_dynamicVertexOffset + totalBytes <= DYNAMIC_VERTEX_BUFFER_SIZE) {
+            struct Vertex32 {
+                float x, y, z;
+                float u, v;
+                uint32_t color;
+                float pad[2];
+            };
+
+            const Vertex32* src = (const Vertex32*)cb.rawVerts.data();
+            Vertex32* dst = (Vertex32*)((char*)m_dynamicVertexMapped + m_dynamicVertexOffset);
+            size_t vertCount = totalBytes / 32;
+
+            for (size_t i = 0; i < vertCount; i++) {
+                dst[i] = src[i];
+                dst[i].u += u0; // Traslada las UVs directamente a la casilla del mapa
+                dst[i].v += v0;
+            }
+
+            VkDeviceSize offsets[] = { m_dynamicVertexOffset };
+            vkCmdBindVertexBuffers(cmd, 0, 1, &m_dynamicVertexBuffer, offsets);
+            vkCmdBindIndexBuffer(cmd, m_globalEBO, 0, VK_INDEX_TYPE_UINT32);
+
+            for (const auto& dc : cb.draws) {
+                if (dc.count <= 0) continue;
+                if (dc.wasQuad) {
+                    uint32_t indexCount = (dc.count / 4) * 6;
+                    vkCmdDrawIndexed(cmd, indexCount, 1, 0, dc.first, 0);
+                } else {
+                    vkCmdDraw(cmd, dc.count, 1, dc.first, 0);
+                }
+            }
+
+            m_dynamicVertexOffset += (totalBytes + 63) & ~63;
+            return true;
+        }
+    }
+
+    // 6. Enlazar buffers estáticos para chunks del mundo:
     VkDeviceSize offsets[] = {0};
     vkCmdBindVertexBuffers(cmd, 0, 1, &cb.vbo, offsets);
     vkCmdBindIndexBuffer(cmd, m_globalEBO, 0, VK_INDEX_TYPE_UINT32);
@@ -1945,8 +2004,16 @@ void VKRenderer::StateSetBlendFunc(int src, int dst) {
 void VKRenderer::StateSetBlendFactor(unsigned int colour) {}
 void VKRenderer::StateSetAlphaFunc(int func, float param) {}
 void VKRenderer::StateSetDepthFunc(int func) {}
-void VKRenderer::StateSetFaceCull(bool enable) {}
-void VKRenderer::StateSetFaceCullCW(bool enable) {}
+void VKRenderer::StateSetFaceCull(bool enable) { 
+    s_vkCullEnabled = enable; 
+}
+
+
+
+void VKRenderer::StateSetFaceCullCW(bool enable) { 
+    s_vkCullFrontFaceCW = enable; 
+}
+
 void VKRenderer::StateSetLineWidth(float width) {}
 void VKRenderer::StateSetWriteEnable(bool red, bool green, bool blue, bool alpha) {}
 void VKRenderer::StateSetAlphaTestEnable(bool enable) {}
