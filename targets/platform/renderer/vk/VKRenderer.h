@@ -232,6 +232,7 @@ private:
     VkPipeline m_pipelineOpaque = VK_NULL_HANDLE;
     VkPipeline m_pipelineTransparent = VK_NULL_HANDLE;
     VkPipeline m_pipelineNoDepth = VK_NULL_HANDLE;
+    VkPipeline m_pipelineNoDepthOpaque = VK_NULL_HANDLE; // Pipeline 2D sólido sin mezcla (para el mapa y fondos)
     VkPipeline m_pipelineAdditive = VK_NULL_HANDLE;
 
     // PIPELINES DEDICADOS PARA CHUNKS DEL MUNDO (CULL_BACK_BIT para descartar caras duplicadas)

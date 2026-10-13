@@ -39,16 +39,14 @@ void main() {
         outColor = inColor.abgr;
     }
 
-    // 3. Cálculo de Coordenadas del Lightmap (100% fiel al motor original)
-    vec2 lmRawF = vec2(inLMraw);
+    // 3. Cálculo de Coordenadas del Lightmap (Universal para bloques Y entidades)
+    // Si inLMraw es -512 (menor a -0.5), es una entidad o ítem y toma la luz global pc.uGlobalLM
+    vec2 rawLM = (inLMraw.x < -0.5) ? pc.uGlobalLM : vec2(inLMraw);
 
-    // Si los valores son > 2.0 (como 0..240 enviados por Tesselator), normalizamos a 0.0..1.0 dividiendo por 255.0
-    vec2 normalizedLM = (lmRawF.x > 2.0 || lmRawF.y > 2.0) ? (lmRawF / 255.0) : lmRawF;
-
-    // Si el valor es el centinela -512 (menor a -0.5), se trata de una entidad o ítem sin luz propia:
-    // usamos la luz global enviada por StateSetVertexTextureUV (pc.uGlobalLM)
-    vec2 lm = (lmRawF.x < -0.5) ? pc.uGlobalLM : normalizedLM;
+    // Normalización: si el valor es mayor a 2.0 (ej. 240.0 de antorcha o sol), se divide entre 255.0
+    // Ahora tanto bloques como entidades quedan perfectamente normalizados a 0.0..1.0
+    vec2 normalizedLM = (rawLM.x > 2.0 || rawLM.y > 2.0) ? (rawLM / 255.0) : rawLM;
 
     // Aplicamos la corrección de medio texel (8/256) para muestrear el centro exacto del píxel de luz
-    outUV1 = lm * pc.uLMTransform.xy + pc.uLMTransform.zw;
+    outUV1 = normalizedLM * pc.uLMTransform.xy + pc.uLMTransform.zw;
 }

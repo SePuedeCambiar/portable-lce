@@ -517,7 +517,6 @@ void VKRenderer::cleanupStagingSlots() {
     }
 }
 
-
 void VKRenderer::Initialise() {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) return;
 
@@ -907,11 +906,25 @@ void VKRenderer::Initialise() {
     rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineOpaque));
 
-    // 2. PIPELINE TRANSPARENTE
-    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    // 2. PIPELINE TRANSPARENTE (Nubes y partículas)
+    // CORRECCIÓN NUBES: CULL_MODE_BACK_BIT obligatorio para no ver las caras internas en rayos X
+    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     pipelineInfo.pDepthStencilState = &depthTrans;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineTransparent));
+
+    // 2.1 PIPELINE TRANSPARENTE CON ESCRITURA DE PROFUNDIDAD (Para el Mapa e ítems en mano)
+    // CORRECCIÓN MAPA: depthWrite = TRUE para que no se filtre el mar y sea 100% sólido
+    VkPipelineDepthStencilStateCreateInfo depthTransWrite{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    depthTransWrite.depthTestEnable = VK_TRUE;
+    depthTransWrite.depthWriteEnable = VK_TRUE;
+    depthTransWrite.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    rasterizer.cullMode = VK_CULL_MODE_NONE; // Ítems en mano sin culling agresivo
+    pipelineInfo.pDepthStencilState = &depthTransWrite;
+    pipelineInfo.pColorBlendState = &colorBlendingTrans;
+    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &s_pipelineTransDepth));
 
     // 3. PIPELINES DE CHUNKS 3D (Mundo Opaco)
     rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
@@ -921,7 +934,7 @@ void VKRenderer::Initialise() {
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineChunkOpaque));
 
     // 4. PIPELINE CHUNKS TRANSPARENTES (Agua, Hielo)
-    // CORRECCIÓN CLAVE: CULL_MODE_BACK_BIT para eliminar caras internas y sin depth bias
+    // CORRECCIÓN HIELO: CULL_MODE_BACK_BIT para eliminar capas internas y sin sesgo de profundidad
     rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rasterizer.depthBiasEnable = VK_FALSE;
@@ -936,13 +949,21 @@ void VKRenderer::Initialise() {
     rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
     rasterizer.depthBiasEnable = VK_FALSE;
 
-    // 5. PIPELINE SIN PROFUNDIDAD (HUD 2D, Menús)
+    // ========================================================================
+    // 5. PIPELINES SIN PROFUNDIDAD (HUD 2D, Menús, Mapa)
+    // ========================================================================
     VkPipelineDepthStencilStateCreateInfo depthNone{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthNone.depthTestEnable = VK_FALSE;
     depthNone.depthWriteEnable = VK_FALSE;
     pipelineInfo.pDepthStencilState = &depthNone;
+
+    // A. Con mezcla alfa (textos, chat, viñetas, partículas 2D):
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineNoDepth));
+
+    // B. Sólido sin mezcla alfa (mapa en mano, fondos opacos del menú):
+    pipelineInfo.pColorBlendState = &colorBlendingOpaque;
+    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineNoDepthOpaque));
 
     // 6. PIPELINE PARA LÍNEAS (Recuadro de bloque seleccionado)
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
@@ -1220,8 +1241,15 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         targetPipeline = m_pipelineLines;             // Recuadro del bloque seleccionado
     } else if (isFan && m_pipelineTriangleFan != VK_NULL_HANDLE) {
         targetPipeline = m_pipelineTriangleFan;       // Cúpula del cielo
-    } else if (!s_vkDepthTestEnabled && m_pipelineNoDepth != VK_NULL_HANDLE) {
-        targetPipeline = m_pipelineNoDepth;           // HUD 2D, menús, textos
+    } else if (!s_vkDepthTestEnabled) {
+        // CORRECCIÓN CRÍTICA DE INTERFAZ Y MAPA:
+        // Si la mezcla está apagada, usar el pipeline 2D SÓLIDO (evita que el mapa sea transparente).
+        // Si la mezcla está encendida, usar el pipeline 2D con mezcla alfa (textos, chat, viñetas).
+        if (!s_vkBlendEnabled && m_pipelineNoDepthOpaque != VK_NULL_HANDLE) {
+            targetPipeline = m_pipelineNoDepthOpaque;
+        } else {
+            targetPipeline = m_pipelineNoDepth;
+        }
     } else if (allowDepthWrite && s_vkBlendEnabled && s_pipelineTransDepth != VK_NULL_HANDLE) {
         targetPipeline = s_pipelineTransDepth;        
     } else if (allowDepthWrite && !s_vkBlendEnabled && m_pipelineOpaque != VK_NULL_HANDLE) {
@@ -1426,12 +1454,13 @@ void VKRenderer::Shutdown() {
         if (m_globalEBO)       vkDestroyBuffer(m_device, m_globalEBO, nullptr);
         if (m_globalEBOMemory) vkFreeMemory(m_device, m_globalEBOMemory, nullptr);
 
-        // 6. Destrucción de TODOS los pipelines (incluyendo los de Chunks antes del device)
+        // 6. Destrucción de TODOS los pipelines (incluyendo el 2D sólido y los de Chunks)
         if (m_pipelineOpaque)           vkDestroyPipeline(m_device, m_pipelineOpaque, nullptr);
         if (m_pipelineTransparent)      vkDestroyPipeline(m_device, m_pipelineTransparent, nullptr);
         if (m_pipelineChunkOpaque)      vkDestroyPipeline(m_device, m_pipelineChunkOpaque, nullptr);
         if (m_pipelineChunkTransparent) vkDestroyPipeline(m_device, m_pipelineChunkTransparent, nullptr);
         if (m_pipelineNoDepth)          vkDestroyPipeline(m_device, m_pipelineNoDepth, nullptr);
+        if (m_pipelineNoDepthOpaque)    vkDestroyPipeline(m_device, m_pipelineNoDepthOpaque, nullptr); // <--- Nuevo pipeline 2D sólido
         if (m_pipelineLines)            vkDestroyPipeline(m_device, m_pipelineLines, nullptr);
         if (m_pipelineTriangleFan)      vkDestroyPipeline(m_device, m_pipelineTriangleFan, nullptr);
         if (m_pipelineAdditive)         vkDestroyPipeline(m_device, m_pipelineAdditive, nullptr);
@@ -1471,6 +1500,12 @@ void VKRenderer::Shutdown() {
         SDL_DestroyWindow(m_window);
         m_window = nullptr;
     }
+
+    if (s_pipelineTransDepth) {
+        vkDestroyPipeline(m_device, s_pipelineTransDepth, nullptr);
+        s_pipelineTransDepth = VK_NULL_HANDLE;
+    }
+
     SDL_Quit();
 }
 
@@ -1822,12 +1857,13 @@ void VKRenderer::TextureBind(int idx) {
         m_boundLightmapId = idx;
     } else {
         m_boundTextureId = idx;
-        if (idx != m_boundLightmapId) {
-            m_terrainAtlasId = idx; // Recordar siempre el Atlas del terreno
+        // Solo recordar como Atlas si la textura mide al menos 256x256 (evita que fuentes o iconos lo pisen)
+        auto it = m_textures.find(idx);
+        if (it != m_textures.end() && it->second.width >= 256 && it->second.height >= 256) {
+            m_terrainAtlasId = idx;
         }
     }
 }
-
 
 void VKRenderer::TextureBindVertex(int idx, bool scaleLight) {
     if (idx < 0) {
@@ -2044,6 +2080,12 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
     vkUpdateDescriptorSets(m_device, 1, &descriptorWrite, 0, nullptr);
 
     m_textures[texId] = tex;
+
+    // Guardar el Atlas del terreno si es una textura grande (>= 256) en la Unidad 0
+    if (m_activeTextureUnit == 0 && width >= 256 && height >= 256) {
+        m_terrainAtlasId = texId;
+    }
+    
 }
 
 void VKRenderer::TextureDataUpdate(int xoffset, int yoffset, int width, int height, void* data, int level) {
@@ -2052,16 +2094,17 @@ void VKRenderer::TextureDataUpdate(int xoffset, int yoffset, int width, int heig
     std::lock_guard<std::recursive_mutex> lk(m_textureMtx);
 
     int texId;
-    // REGLA CLARA:
-    // Si xoffset o yoffset son mayores a 0, o la unidad activa es 0:
-    // Es 100% seguro una baldosa animada del Atlas (agua, lava o fuego).
-    // Si está en (0,0) y la unidad es 1, es la actualización del Lightmap de 16x16.
-    if (xoffset > 0 || yoffset > 0 || m_activeTextureUnit == 0) {
-        texId = (m_boundTextureId > 0 && m_boundTextureId != m_boundLightmapId) 
-                ? m_boundTextureId 
-                : m_terrainAtlasId;
-    } else {
+    // REGLA DEFINITIVA:
+    // 1. Si xoffset o yoffset son mayores a 0, son animaciones de agua, lava o fuego:
+    //    SIEMPRE se aplican sobre el Atlas del terreno (m_terrainAtlasId), nunca sobre fuentes o interfaz.
+    // 2. Si está en (0,0) y la unidad activa es 1, es la actualización del Lightmap de 16x16.
+    // 3. De lo contrario, es una actualización normal a la textura actualmente enlazada.
+    if (xoffset > 0 || yoffset > 0) {
+        texId = (m_terrainAtlasId > 0) ? m_terrainAtlasId : m_boundTextureId;
+    } else if (m_activeTextureUnit == 1) {
         texId = (m_boundLightmapId > 0) ? m_boundLightmapId : 1;
+    } else {
+        texId = (m_boundTextureId > 0) ? m_boundTextureId : m_terrainAtlasId;
     }
 
     auto it = m_textures.find(texId);
