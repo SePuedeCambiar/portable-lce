@@ -800,7 +800,7 @@ void VKRenderer::Initialise() {
         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, 
         nullptr, 
         0, 
-        2, setLayouts, // <--- CAMBIO CRÍTICO: 2 Descriptor Sets
+        2, setLayouts,
         1, &pushConstantRange
     };
     VK_CHECK(vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout));
@@ -842,10 +842,11 @@ void VKRenderer::Initialise() {
     VkPipelineRasterizationStateCreateInfo rasterizer{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
     rasterizer.lineWidth = 1.0f;
-    // 2. Chunks Transparentes (Agua y Hielo):
-    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
-    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rasterizer.depthBiasEnable = VK_FALSE; // Desactivar Depth Bias para que el hielo no se encime
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    rasterizer.depthBiasEnable = VK_FALSE;
+    rasterizer.depthBiasConstantFactor = 0.0f;
+    rasterizer.depthBiasSlopeFactor = 0.0f;
     
     VkPipelineMultisampleStateCreateInfo multisampling{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
@@ -912,29 +913,30 @@ void VKRenderer::Initialise() {
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineTransparent));
 
-    // 3. PIPELINES DE CHUNKS 3D (Mundo)
+    // 3. PIPELINES DE CHUNKS 3D (Mundo Opaco)
     rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     pipelineInfo.pDepthStencilState = &depthOpaque;
     pipelineInfo.pColorBlendState = &colorBlendingOpaque;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineChunkOpaque));
 
-    // Chunks Transparentes (Agua, Hielo) con Depth Bias
-    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    // 4. PIPELINE CHUNKS TRANSPARENTES (Agua, Hielo)
+    // CORRECCIÓN CLAVE: CULL_MODE_BACK_BIT para eliminar caras internas y sin depth bias
+    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rasterizer.depthBiasEnable = VK_TRUE;
-    rasterizer.depthBiasConstantFactor = -1.0f;
-    rasterizer.depthBiasSlopeFactor = -1.0f;
+    rasterizer.depthBiasEnable = VK_FALSE;
+    rasterizer.depthBiasConstantFactor = 0.0f;
+    rasterizer.depthBiasSlopeFactor = 0.0f;
     pipelineInfo.pDepthStencilState = &depthTrans;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineChunkTransparent));
 
-    rasterizer.depthBiasEnable = VK_FALSE;
-    rasterizer.depthBiasConstantFactor = 0.0f;
-    rasterizer.depthBiasSlopeFactor = 0.0f;
+    // Restaurar rasterizer neutral
     rasterizer.cullMode = VK_CULL_MODE_NONE;
+    rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    rasterizer.depthBiasEnable = VK_FALSE;
 
-    // 4. PIPELINE SIN PROFUNDIDAD (HUD 2D, Menús)
+    // 5. PIPELINE SIN PROFUNDIDAD (HUD 2D, Menús)
     VkPipelineDepthStencilStateCreateInfo depthNone{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthNone.depthTestEnable = VK_FALSE;
     depthNone.depthWriteEnable = VK_FALSE;
@@ -942,19 +944,19 @@ void VKRenderer::Initialise() {
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineNoDepth));
 
-    // 5. PIPELINE PARA LÍNEAS (Recuadro de bloque seleccionado)
+    // 6. PIPELINE PARA LÍNEAS (Recuadro de bloque seleccionado)
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
     pipelineInfo.pDepthStencilState = &depthTrans;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineLines));
 
-    // 6. PIPELINE PARA TRIANGLE FAN (Cúpula del cielo)
+    // 7. PIPELINE PARA TRIANGLE FAN (Cúpula del cielo)
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
     pipelineInfo.pDepthStencilState = &depthNone;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineTriangleFan));
 
-    // 7. PIPELINE ADITIVO (Sol, Estrellas, Luna)
+    // 8. PIPELINE ADITIVO (Sol, Estrellas, Luna)
     VkPipelineColorBlendAttachmentState blendAdditive{};
     blendAdditive.colorWriteMask = 0xF;
     blendAdditive.blendEnable = VK_TRUE;
@@ -1980,13 +1982,29 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
     viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     VK_CHECK(vkCreateImageView(m_device, &viewInfo, nullptr, &tex.view));
 
-    // 7. CONFIGURACIÓN DEL SAMPLER:
-    // Por defecto, Minecraft usa REPEAT + NEAREST (mosaico y píxeles nítidos).
-    // EXCEPTO el Lightmap (16x16) o texturas que pidieron CLAMP explícitamente (como sombras/viñetas).
-    bool isLightmap = (width == 16 && height == 16);
-    bool isClamped = m_nextTexClamp || isLightmap;
+    // 7. CONFIGURACIÓN INTELIGENTE DEL SAMPLER:
+    // A. Solo es Lightmap si mide 16x16 Y está en la Unidad 1 (evita congelar la tierra de 16x16 del menú)
+    bool isLightmap = (m_activeTextureUnit == 1 && width == 16 && height == 16);
+
+    // B. Detectar si es la sombra (misc/shadow.png): mide 64x64 y todos sus píxeles RGB son 0 (negro puro con alfa variable)
+    bool isShadow = false;
+    if (width == 64 && height == 64 && data != nullptr) {
+        const uint8_t* px = (const uint8_t*)data;
+        bool allBlack = true;
+        for (int i = 0; i < 64 * 64; i++) {
+            if (px[i * 4 + 0] != 0 || px[i * 4 + 1] != 0 || px[i * 4 + 2] != 0) {
+                allBlack = false;
+                break;
+            }
+        }
+        isShadow = allBlack;
+    }
+
+    bool isClamped = m_nextTexClamp || isLightmap || isShadow;
     m_nextTexClamp = false;
 
+    // Sombra y Lightmap = CLAMP_TO_EDGE y LINEAR (suaves sin repetir bordes).
+    // Menú de tierra, bloques, aldeanos y mobs = REPEAT y NEAREST (mosaico y píxeles nítidos).
     VkSamplerAddressMode addrMode = isClamped ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
     VkFilter filter = isClamped ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
 
