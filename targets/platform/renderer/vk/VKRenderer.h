@@ -179,6 +179,25 @@ private:
     VkCommandBuffer beginSingleTimeCommands();
     void endSingleTimeCommands(VkCommandBuffer commandBuffer);
 
+    // ============================================================================
+    // STAGING RING BUFFER PARA TEXTURAS DINÁMICAS (CERO STALLS)
+    // ============================================================================
+    struct StagingSlot {
+        VkBuffer       buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        void*          mapped = nullptr;
+        VkDeviceSize   capacity = 0;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkFence        fence = VK_NULL_HANDLE;
+    };
+
+    static constexpr int NUM_STAGING_SLOTS = 16;
+    StagingSlot m_stagingSlots[NUM_STAGING_SLOTS];
+    int         m_currentStagingSlot = 0;
+
+    void initStagingSlots();
+    void cleanupStagingSlots();
+
     SDL_Window* m_window = nullptr;
     VkInstance m_instance = VK_NULL_HANDLE;
     VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
@@ -223,10 +242,10 @@ private:
     std::unordered_map<int, VKTexture> m_textures;
     int m_boundTextureId = 0;
     int m_boundLightmapId = -1;
-    bool m_useLightmap = false;                                   // <--- NUEVO: Bandera activa del Lightmap
-    glm::vec4 m_lmt = glm::vec4(1.0f, 1.0f, 0.0f, 0.0f);         // <--- NUEVO: Transformación / Offset medio texel
-    glm::vec2 m_globalLM = glm::vec2(240.0f, 240.0f);            // <--- NUEVO: Coordenada de luz global para mobs/items
-    float m_gamma = 1.0f;                                        // <--- NUEVO: Valor gamma dinámico
+    bool m_useLightmap = false;                                   // Bandera activa del Lightmap
+    glm::vec4 m_lmt = glm::vec4(1.0f, 1.0f, 0.0f, 0.0f);         // Transformación / Offset medio texel
+    glm::vec2 m_globalLM = glm::vec2(240.0f, 240.0f);            // Coordenada de luz global para mobs/items
+    float m_gamma = 1.0f;                                        // Valor gamma dinámico
     int m_activeTextureUnit = 0;
     VKTexture m_defaultWhiteTexture;
     std::recursive_mutex m_textureMtx; // Permite llamadas anidadas sin congelar el juego jamás

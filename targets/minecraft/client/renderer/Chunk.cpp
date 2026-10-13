@@ -213,6 +213,7 @@ struct FaceInfo {
     }
 };
 
+
 void Chunk::rebuild() {
     static bool isSolidLUT[256];
     static bool isGreedySafeLUT[256];
@@ -317,12 +318,19 @@ void Chunk::rebuild() {
         }
     }
 
+    // ============================================================================
+    // CONTROL DE CHUNKS VACÍOS (DETIENE EL BUCLE INFINITO DE RECONSTRUCCIÓN)
+    // ============================================================================
     if (empty) {
         for (int currentLayer = 0; currentLayer < 2; currentLayer++) {
             levelRenderer->setGlobalChunkFlag(this->x, this->y, this->z, level, LevelRenderer::CHUNK_FLAG_EMPTY0, currentLayer);
             PlatformRenderer.CBuffClear(lists + currentLayer);
         }
         PlatformRenderer.CBuffClear(lists + 1);
+
+        // Marcar como compilado para que LevelRenderer no lo reconstruya 500 veces por segundo
+        levelRenderer->setGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_COMPILED);
+        levelRenderer->clearGlobalChunkFlag(x, y, z, level, LevelRenderer::CHUNK_FLAG_DIRTY);
         return;
     }
 
@@ -360,6 +368,9 @@ void Chunk::rebuild() {
         for (int face = 0; face < 6; face++) {
             int axis = (face == 0 || face == 1) ? 0 : ((face == 2 || face == 3) ? 1 : 2);
             if (axis == 0) {
+                // ================================================================
+                // EJE Y (CARA INFERIOR 0 Y SUPERIOR 1)
+                // ================================================================
                 int yDir = (face == 1) ? 1 : -1;
                 for (int y = y0; y < y1; y++) {
                     FaceInfo* grid = gridBufferY;
@@ -387,7 +398,6 @@ void Chunk::rebuild() {
                             grid[gridIdx].texture = tileRenderer.getTexture(tile, &region, x0 + x, y, z0 + z, face);
                             grid[gridIdx].lightColor = tileRenderer.getLightColor(tile, &region, x0 + x, ny, z0 + z);
                             
-                            // CORRECCIÓN COLOR EJE Y: Si es pasto y es la cara de abajo (face == 0), tierra neutra.
                             int col = (tileId == 2 && face == 0) ? 0xffffff : tile->getColor(&region, x0 + x, y, z0 + z);
                             grid[gridIdx].tileColor = col;
                             
@@ -429,6 +439,7 @@ void Chunk::rebuild() {
                             float v1 = current.texture ? current.texture->getV1() : 0.0f;
                             t->tex2(current.lightColor);
 
+                            // Emisión limpia con texturas repetidas por bloque (sin estiramiento)
                             for (int cv = 0; cv < height; cv++) {
                                 for (int cu = 0; cu < width; cu++) {
                                     float cx = (float)(x0 + u + cu), cz = (float)(z0 + v + cv), cy = (float)y;
@@ -449,6 +460,9 @@ void Chunk::rebuild() {
                     }
                 }
             } else if (axis == 1) {
+                // ================================================================
+                // EJE Z (CARA NORTE 2 Y SUR 3)
+                // ================================================================
                 int zDir = (face == 3) ? 1 : -1;
                 int heightY = y1 - y0;
                 for (int z = 0; z < 16; z++) {
@@ -476,7 +490,6 @@ void Chunk::rebuild() {
                             grid[gridIdx].texture = tileRenderer.getTexture(tile, &region, x0 + x, worldY, z0 + z, face);
                             grid[gridIdx].lightColor = tileRenderer.getLightColor(tile, &region, x0 + x, worldY, nz);
                             
-                            // CORRECCIÓN COLOR EJE Z: Si es pasto, las caras laterales usan 0xffffff (tierra marrón natural)
                             int col = (tileId == 2) ? 0xffffff : tile->getColor(&region, x0 + x, worldY, z0 + z);
                             grid[gridIdx].tileColor = col;
                             
@@ -518,6 +531,7 @@ void Chunk::rebuild() {
                             float v1 = current.texture ? current.texture->getV1() : 0.0f;
                             t->tex2(current.lightColor);
 
+                            // Emisión limpia con texturas repetidas por bloque (sin estiramiento)
                             for (int cv = 0; cv < height; cv++) {
                                 for (int cu = 0; cu < width; cu++) {
                                     float cx = (float)(x0 + u + cu), cy = (float)(y0 + v + cv), cz = (float)(z0 + z);
@@ -538,6 +552,9 @@ void Chunk::rebuild() {
                     }
                 }
             } else {
+                // ================================================================
+                // EJE X (CARA OESTE 4 Y ESTE 5)
+                // ================================================================
                 int xDir = (face == 5) ? 1 : -1;
                 int heightY = y1 - y0;
                 for (int x = 0; x < 16; x++) {
@@ -565,7 +582,6 @@ void Chunk::rebuild() {
                             grid[gridIdx].texture = tileRenderer.getTexture(tile, &region, x0 + x, worldY, z0 + z, face);
                             grid[gridIdx].lightColor = tileRenderer.getLightColor(tile, &region, nx, worldY, z0 + z);
                             
-                            // CORRECCIÓN COLOR EJE X: Si es pasto, caras laterales en 0xffffff
                             int col = (tileId == 2) ? 0xffffff : tile->getColor(&region, x0 + x, worldY, z0 + z);
                             grid[gridIdx].tileColor = col;
                             
@@ -607,6 +623,7 @@ void Chunk::rebuild() {
                             float v1 = current.texture ? current.texture->getV1() : 0.0f;
                             t->tex2(current.lightColor);
 
+                            // Emisión limpia con texturas repetidas por bloque (sin estiramiento)
                             for (int cv = 0; cv < height; cv++) {
                                 for (int cu = 0; cu < width; cu++) {
                                     float cx = (float)(x0 + x), cy = (float)(y0 + v + cv), cz = (float)(z0 + u + cu);
@@ -629,6 +646,9 @@ void Chunk::rebuild() {
             }
         }
 
+        // ================================================================
+        // BLOQUES COMPLEJOS Y NO-SÓLIDOS (FLORES, ANTORCHAS, ETC.)
+        // ================================================================
         for (int z = z0; z < z1; z++) {
             int zIdx = z - z0;
             for (int x = x0; x < x1; x++) {
