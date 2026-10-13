@@ -76,12 +76,19 @@ static const glm::mat4 s_vkClipCorrection = glm::mat4(
     0.0f,  0.0f, 0.5f, 1.0f
 );
 
+
 struct PushConstants {
-    glm::mat4 uMVP;
-    glm::vec4 uBaseColor;
-    glm::vec3 uChunkOffset;
-    int32_t   uHasTexture;
+    glm::mat4 uMVP;          // Offset 0   (64 bytes)
+    glm::vec4 uBaseColor;    // Offset 64  (16 bytes)
+    glm::vec4 uLMTransform;  // Offset 80  (16 bytes) - Escala y centro de texel
+    glm::vec3 uChunkOffset;  // Offset 96  (12 bytes)
+    int32_t   uHasTexture;   // Offset 108 (4 bytes)
+    glm::vec2 uGlobalLM;     // Offset 112 (8 bytes)  - Luz de mobs/items
+    int32_t   uUseLightmap;  // Offset 120 (4 bytes)  - 1 = Luz activa, 0 = Inactiva
+    float     uInvGamma;     // Offset 124 (4 bytes)  - Corrección gamma
 };
+static_assert(sizeof(PushConstants) == 128, "PushConstants debe ser exactamente de 128 bytes");
+
 
 static const int STACK_DEPTH = 64;
 struct MatrixStack {
@@ -320,13 +327,24 @@ void VKRenderer::createDefaultWhiteTexture() {
 
     VkBuffer stagingBuffer;
     VkDeviceMemory stagingMemory;
-    VkBufferCreateInfo bufInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE};
+    VkBufferCreateInfo bufInfo{
+        VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, 
+        nullptr, 
+        0, 
+        imageSize, 
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 
+        VK_SHARING_MODE_EXCLUSIVE
+    };
     VK_CHECK(vkCreateBuffer(m_device, &bufInfo, nullptr, &stagingBuffer));
 
     VkMemoryRequirements memReqs;
     vkGetBufferMemoryRequirements(m_device, stagingBuffer, &memReqs);
-    VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, memReqs.size,
-                                   findMemoryType(m_physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+    VkMemoryAllocateInfo allocInfo{
+        VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 
+        nullptr, 
+        memReqs.size,
+        findMemoryType(m_physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    };
     VK_CHECK(vkAllocateMemory(m_device, &allocInfo, nullptr, &stagingMemory));
     VK_CHECK(vkBindBufferMemory(m_device, stagingBuffer, stagingMemory, 0));
 
@@ -392,12 +410,13 @@ void VKRenderer::createDefaultWhiteTexture() {
     viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     VK_CHECK(vkCreateImageView(m_device, &viewInfo, nullptr, &m_defaultWhiteTexture.view));
 
+    // AJUSTE: CLAMP_TO_EDGE y LINEAR para que sirva perfectamente como reserva de textura y Lightmap
     VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    samplerInfo.magFilter = VK_FILTER_NEAREST;
-    samplerInfo.minFilter = VK_FILTER_NEAREST;
-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     VK_CHECK(vkCreateSampler(m_device, &samplerInfo, nullptr, &m_defaultWhiteTexture.sampler));
 
     VkDescriptorSetAllocateInfo descAllocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -700,6 +719,9 @@ void VKRenderer::Initialise() {
         VK_CHECK(vkCreateFence(m_device, &fenceInfo, nullptr, &m_inFlightFences[i]));
     }
 
+    // ========================================================================
+    // DESCRIPTOR SET LAYOUT (1 Sampler por Set)
+    // ========================================================================
     VkDescriptorSetLayoutBinding samplerLayoutBinding{};
     samplerLayoutBinding.binding = 0;
     samplerLayoutBinding.descriptorCount = 1;
@@ -715,10 +737,27 @@ void VKRenderer::Initialise() {
     VkDescriptorPoolCreateInfo descPoolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, 8192, 1, &poolSize};
     VK_CHECK(vkCreateDescriptorPool(m_device, &descPoolInfo, nullptr, &m_descriptorPool));
 
-    VkPushConstantRange pushConstantRange{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants)};
-    VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &m_descriptorSetLayout, 1, &pushConstantRange};
+    // ========================================================================
+    // PIPELINE LAYOUT: 2 DESCRIPTOR SETS (Set 0 = Textura, Set 1 = Lightmap)
+    // ========================================================================
+    VkDescriptorSetLayout setLayouts[] = { m_descriptorSetLayout, m_descriptorSetLayout };
+
+    VkPushConstantRange pushConstantRange{
+        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 
+        0, 
+        sizeof(PushConstants)
+    };
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{
+        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, 
+        nullptr, 
+        0, 
+        2, setLayouts, // <--- CAMBIO CRÍTICO: 2 Descriptor Sets
+        1, &pushConstantRange
+    };
     VK_CHECK(vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout));
 
+    // Módulos de Shaders
     VkShaderModule vertModule = createShaderModule(m_device, vert_spv, sizeof(vert_spv));
     VkShaderModule fragModule = createShaderModule(m_device, frag_spv, sizeof(frag_spv));
 
@@ -726,16 +765,27 @@ void VKRenderer::Initialise() {
     VkPipelineShaderStageCreateInfo fragStageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragModule, "main"};
     VkPipelineShaderStageCreateInfo shaderStages[] = {vertStageInfo, fragStageInfo};
 
+    // ========================================================================
+    // VERTEX INPUT: 5 ATRIBUTOS (32 BYTES TOTALES CON LUZ)
+    // ========================================================================
     VkVertexInputBindingDescription bindingDescription{0, 32, VK_VERTEX_INPUT_RATE_VERTEX};
-    std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions{};
+    std::array<VkVertexInputAttributeDescription, 5> attributeDescriptions{};
+    
+    // Attr 0: Posición X, Y, Z (12 bytes)
     attributeDescriptions[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0};
+    // Attr 1: UVs del Atlas (8 bytes)
     attributeDescriptions[1] = {1, 0, VK_FORMAT_R32G32_SFLOAT, 12};
+    // Attr 2: Color / Sombreado de caras (4 bytes)
     attributeDescriptions[2] = {2, 0, VK_FORMAT_R8G8B8A8_UNORM, 20};
+    // Attr 3: Normales 3D (4 bytes)
+    attributeDescriptions[3] = {3, 0, VK_FORMAT_R8G8B8A8_SNORM, 24};
+    // Attr 4: Coordenadas de Luz cruda (4 bytes -> ivec2 en shader)
+    attributeDescriptions[4] = {4, 0, VK_FORMAT_R16G16_SINT, 28};
 
     VkPipelineVertexInputStateCreateInfo vertexInputInfo{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vertexInputInfo.vertexBindingDescriptionCount = 1;
     vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
-    vertexInputInfo.vertexAttributeDescriptionCount = 3;
+    vertexInputInfo.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributeDescriptions.size());
     vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions.data();
 
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, nullptr, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE};
@@ -801,72 +851,60 @@ void VKRenderer::Initialise() {
     pipelineInfo.layout = m_pipelineLayout;
     pipelineInfo.renderPass = m_renderPass;
 
-    // 1. PIPELINE OPACO: CULL_NONE obligatorio para que la interfaz 2D no desaparezca
+    // 1. PIPELINE OPACO (Para UI 2D e interfaces)
     rasterizer.cullMode = VK_CULL_MODE_NONE;
     rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineOpaque));
-    // 2. PIPELINE TRANSPARENTE (Agua en pantalla, fuego, partículas con alfa):
+
+    // 2. PIPELINE TRANSPARENTE
     rasterizer.cullMode = VK_CULL_MODE_NONE;
     pipelineInfo.pDepthStencilState = &depthTrans;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineTransparent));
 
-    // ========================================================================
-    // PIPELINES DEDICADOS PARA CHUNKS 3D (Mundo real)
-    // ========================================================================
-    // 1. Chunks Opacos: COUNTER_CLOCKWISE obligatorio (Mantiene las caras exteriores de árboles y tierra)
+    // 3. PIPELINES DE CHUNKS 3D (Mundo)
     rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     pipelineInfo.pDepthStencilState = &depthOpaque;
     pipelineInfo.pColorBlendState = &colorBlendingOpaque;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineChunkOpaque));
 
-    // 2. Chunks Transparentes (Agua y Hielo): CULL_NONE y Depth Bias anti Z-fighting
+    // Chunks Transparentes (Agua, Hielo) con Depth Bias
     rasterizer.cullMode = VK_CULL_MODE_NONE;
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rasterizer.depthBiasEnable = VK_TRUE;
     rasterizer.depthBiasConstantFactor = -1.0f;
     rasterizer.depthBiasSlopeFactor = -1.0f;
-
     pipelineInfo.pDepthStencilState = &depthTrans;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineChunkTransparent));
 
-    // Restaurar inmediatamente el rasterizer para los siguientes pipelines
     rasterizer.depthBiasEnable = VK_FALSE;
     rasterizer.depthBiasConstantFactor = 0.0f;
     rasterizer.depthBiasSlopeFactor = 0.0f;
     rasterizer.cullMode = VK_CULL_MODE_NONE;
-    // ========================================================================
 
-    // 3. PIPELINE SIN PROFUNDIDAD (Para HUD 2D, menús, textos)
+    // 4. PIPELINE SIN PROFUNDIDAD (HUD 2D, Menús)
     VkPipelineDepthStencilStateCreateInfo depthNone{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthNone.depthTestEnable = VK_FALSE;
     depthNone.depthWriteEnable = VK_FALSE;
-
     pipelineInfo.pDepthStencilState = &depthNone;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
-    rasterizer.cullMode = VK_CULL_MODE_NONE;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineNoDepth));
 
-    // 4. PIPELINE PARA LÍNEAS (Para el recuadro de bloque seleccionado y caña de pescar)
+    // 5. PIPELINE PARA LÍNEAS (Recuadro de bloque seleccionado)
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-    rasterizer.polygonMode = VK_POLYGON_MODE_FILL; 
-    rasterizer.lineWidth = 1.0f;
-    rasterizer.cullMode = VK_CULL_MODE_NONE;
     pipelineInfo.pDepthStencilState = &depthTrans;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineLines));
 
-    // 5. PIPELINE PARA TRIANGLE FAN (Para la cúpula continua y horizonte del Cielo)
+    // 6. PIPELINE PARA TRIANGLE FAN (Cúpula del cielo)
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
-    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
-    rasterizer.cullMode = VK_CULL_MODE_NONE;
     pipelineInfo.pDepthStencilState = &depthNone;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineTriangleFan));
 
-    // 6. PIPELINE ADITIVO (Para el Sol, Estrellas, Luna y Rayos de Beacons)
+    // 7. PIPELINE ADITIVO (Sol, Estrellas, Luna)
     VkPipelineColorBlendAttachmentState blendAdditive{};
     blendAdditive.colorWriteMask = 0xF;
     blendAdditive.blendEnable = VK_TRUE;
@@ -884,14 +922,10 @@ void VKRenderer::Initialise() {
     pipelineInfo.pDepthStencilState = &depthNone;
     pipelineInfo.pColorBlendState = &colorBlendingAdditive;
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
-    rasterizer.cullMode = VK_CULL_MODE_NONE;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineAdditive));
 
     // Restaurar configuración base
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
-    rasterizer.cullMode = VK_CULL_MODE_NONE;
 
     vkDestroyShaderModule(m_device, fragModule, nullptr);
     vkDestroyShaderModule(m_device, vertModule, nullptr);
@@ -934,9 +968,17 @@ void VKRenderer::Initialise() {
 
     createDefaultWhiteTexture();
 
+    // ========================================================================
+    // VALORES INICIALES DE ILUMINACIÓN Y ESTADO
+    // ========================================================================
     m_baseColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
+    m_lmt = glm::vec4(1.0f, 1.0f, 0.0f, 0.0f);
+    m_globalLM = glm::vec2(240.0f, 240.0f);
+    m_boundLightmapId = -1;
+    m_useLightmap = false;
+    m_gamma = 1.0f;
 
-    printf("[Vulkan] Inicialización de 8 pipelines completada.\n");
+    printf("[Vulkan] Inicialización completada con soporte de Lightmap multitextura.\n");
 }
 
 void VKRenderer::InitialiseContext() {}
@@ -1060,36 +1102,49 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     if (!m_frameStarted) return;
     if (m_dynamicVertexOffset + outBytes > DYNAMIC_VERTEX_BUFFER_SIZE) return;
 
-    // 3. Copiar vértices al Dynamic VBO con descompresión a 32 bytes
+    // 3. Copiar vértices al Dynamic VBO con descompresión a 32 bytes completa
     if (vType == VERTEX_TYPE_COMPRESSED) {
         #pragma pack(push, 1)
         struct CompressedVertex {
             int16_t x, y, z;    // Bytes 0..5 (Posición)
-            int16_t color;      // Bytes 6..7 (Color)
-            int16_t u, v;       // Bytes 8..11 (UVs)
-            int16_t light[2];   // Bytes 12..15 (Luz)
+            int16_t color;      // Bytes 6..7 (Color BGR565 - 32768)
+            int16_t u, v;       // Bytes 8..11 (UVs x8192)
+            int16_t light[2];   // Bytes 12..15 (Luz de antorcha y cielo)
         };
         #pragma pack(pop)
 
-        struct StandardVertex {
-            float x, y, z;
-            float u, v;
-            uint32_t color;
-            float pad[2];
+        struct StandardVertex32 {
+            float x, y, z;        // Bytes 0..11
+            float u, v;           // Bytes 12..19
+            uint32_t color;       // Bytes 20..23
+            int8_t normal[4];     // Bytes 24..27
+            int16_t light[2];     // Bytes 28..31
         };
 
         const CompressedVertex* src = (const CompressedVertex*)dataIn;
-        StandardVertex* dst = (StandardVertex*)((char*)m_dynamicVertexMapped + m_dynamicVertexOffset);
+        StandardVertex32* dst = (StandardVertex32*)((char*)m_dynamicVertexMapped + m_dynamicVertexOffset);
 
         for (int i = 0; i < count; i++) {
             dst[i].x = (float)src[i].x / 1024.0f;
             dst[i].y = (float)src[i].y / 1024.0f;
             dst[i].z = (float)src[i].z / 1024.0f;
-            dst[i].u = (float)src[i].u / 1024.0f;
-            dst[i].v = (float)src[i].v / 1024.0f;
-            dst[i].color = 0xFFFFFFFF;
-            dst[i].pad[0] = 0.0f;
-            dst[i].pad[1] = 0.0f;
+            dst[i].u = (float)src[i].u / 8192.0f;
+            dst[i].v = (float)src[i].v / 8192.0f;
+
+            // Desempaquetar BGR565 de 16-bit a RGBA8 Little-Endian
+            int packed = int(src[i].color) + 32768;
+            uint8_t b = uint8_t(((packed & 0x1F) * 255) / 31);
+            uint8_t g = uint8_t((((packed >> 5) & 0x3F) * 255) / 63);
+            uint8_t r = uint8_t((((packed >> 11) & 0x1F) * 255) / 31);
+            dst[i].color = (0xFF << 24) | (b << 16) | (g << 8) | r;
+
+            dst[i].normal[0] = 0;
+            dst[i].normal[1] = 127;
+            dst[i].normal[2] = 0;
+            dst[i].normal[3] = 0;
+
+            dst[i].light[0] = src[i].light[0];
+            dst[i].light[1] = src[i].light[1];
         }
     } else {
         memcpy((char*)m_dynamicVertexMapped + m_dynamicVertexOffset, dataIn, inBytes);
@@ -1097,57 +1152,69 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
 
-    // 4. SELECCIÓN DE PIPELINE PERFECCIONADA
+    // 4. Selección de Pipeline
     int ptypeVal = (int)ptype;
-    bool isLine = (ptypeVal == 1 || ptypeVal == 3);      // GL_LINES (1) o GL_LINE_STRIP (3)
-    bool isFan  = (ptypeVal == 2 || ptypeVal == 6);      // GL_TRIANGLE_FAN (Cúpula del cielo)
+    bool isLine = (ptypeVal == 1 || ptypeVal == 3);      // GL_LINES o GL_LINE_STRIP
+    bool isFan  = (ptypeVal == 2 || ptypeVal == 6);      // GL_TRIANGLE_FAN
 
     VkPipeline targetPipeline = m_pipelineTransparent;
 
     if (m_blendDst == 1 && m_pipelineAdditive != VK_NULL_HANDLE) {
-        targetPipeline = m_pipelineAdditive;          // Sol, estrellas, rayos de baliza
+        targetPipeline = m_pipelineAdditive;          // Sol, estrellas, balizas
     } else if (isLine && m_pipelineLines != VK_NULL_HANDLE) {
         targetPipeline = m_pipelineLines;             // Recuadro del bloque seleccionado
     } else if (isFan && m_pipelineTriangleFan != VK_NULL_HANDLE) {
-        targetPipeline = m_pipelineTriangleFan;       // Cúpula continua del Cielo
+        targetPipeline = m_pipelineTriangleFan;       // Cúpula del cielo
     } else if (!s_vkDepthTestEnabled && m_pipelineNoDepth != VK_NULL_HANDLE) {
-        targetPipeline = m_pipelineNoDepth;           // Interfaz 2D plana, hotbar, textos
+        targetPipeline = m_pipelineNoDepth;           // HUD 2D, menús, textos
     } else if (allowDepthWrite && s_vkBlendEnabled && s_pipelineTransDepth != VK_NULL_HANDLE) {
-        // CLAVE DE LA NUCA Y AGUA: Escribe profundidad para que la nuca no tape la cara
-        // y mantiene la mezcla alfa activa para que el agua bajo pantalla no sea negra
         targetPipeline = s_pipelineTransDepth;        
     } else if (allowDepthWrite && !s_vkBlendEnabled && m_pipelineOpaque != VK_NULL_HANDLE) {
-        targetPipeline = m_pipelineOpaque;            // Geometría 100% sólida sin mezcla
+        targetPipeline = m_pipelineOpaque;            // Geometría sólida
     } else {
-        targetPipeline = m_pipelineTransparent;       // Partículas, humo, etc.
+        targetPipeline = m_pipelineTransparent;       // Partículas, nubes, etc.
     }
 
     if (targetPipeline != VK_NULL_HANDLE) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, targetPipeline);
     }
 
-    // 5. Selección y enlace de texturas
-    VkDescriptorSet currentSet = m_defaultWhiteTexture.descriptorSet;
+    // 5. Selección y enlace de texturas (Set 0 = Difusa, Set 1 = Lightmap)
+    VkDescriptorSet currentDiffuseSet = m_defaultWhiteTexture.descriptorSet;
+    VkDescriptorSet currentLightmapSet = m_defaultWhiteTexture.descriptorSet;
     int hasTex = 0;
+
     if (m_textureEnabled && m_boundTextureId > 0) {
         std::lock_guard<std::recursive_mutex> lk(m_textureMtx);
         auto it = m_textures.find(m_boundTextureId);
         if (it != m_textures.end() && it->second.descriptorSet != VK_NULL_HANDLE) {
-            currentSet = it->second.descriptorSet;
+            currentDiffuseSet = it->second.descriptorSet;
             hasTex = 1;
+        }
+
+        // Si el lightmap está activo para este draw (ej. entidades, mobs, drops)
+        if (m_useLightmap && m_boundLightmapId > 0) {
+            auto lmIt = m_textures.find(m_boundLightmapId);
+            if (lmIt != m_textures.end() && lmIt->second.descriptorSet != VK_NULL_HANDLE) {
+                currentLightmapSet = lmIt->second.descriptorSet;
+            }
         }
     }
 
-    if (currentSet != VK_NULL_HANDLE) {
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &currentSet, 0, nullptr);
-    }
+    // ¡ENLAZAR AMBOS SETS (0 y 1) OBLIGATORIAMENTE!
+    VkDescriptorSet descriptorSets[2] = { currentDiffuseSet, currentLightmapSet };
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 2, descriptorSets, 0, nullptr);
 
-    // 6. Push Constants (Formato estable de 96 bytes)
+    // 6. Push Constants (128 bytes exactos)
     PushConstants pc;
     pc.uMVP = s_vkClipCorrection * (s_proj.cur() * s_mv.cur());
     pc.uBaseColor = m_baseColor;
+    pc.uLMTransform = m_lmt;
     pc.uChunkOffset = glm::vec3(0.0f);
     pc.uHasTexture = hasTex;
+    pc.uGlobalLM = m_globalLM;
+    pc.uUseLightmap = (m_useLightmap && m_boundLightmapId > 0) ? 1 : 0;
+    pc.uInvGamma = (m_gamma > 0.0f) ? (1.0f / m_gamma) : 1.0f;
 
     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants), &pc);
 
@@ -1359,7 +1426,12 @@ void VKRenderer::GetFramebufferSize(int& width, int& height) {
 
 bool VKRenderer::ShouldClose() { return m_shouldClose; }
 void VKRenderer::Close() { m_shouldClose = true; }
-void VKRenderer::UpdateGamma(unsigned short usGamma) {}
+
+
+void VKRenderer::UpdateGamma(unsigned short usGamma) {
+    constexpr unsigned short GAMMA_MAX = 32768;
+    m_gamma = 0.5f + ((float)(usGamma) * (1.0f / GAMMA_MAX));
+}
 
 void VKRenderer::MatrixMode(int type) {
     if (type == 0x1701)      s_matMode = 1;
@@ -1464,6 +1536,7 @@ void VKRenderer::CBuffEnd() {
     s_recListId = -1;
 }
 
+
 bool VKRenderer::CBuffCall(int index, bool full) {
     if (!m_frameStarted) return false;
 
@@ -1513,7 +1586,7 @@ bool VKRenderer::CBuffCall(int index, bool full) {
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
 
-    // 2. SELECCIÓN DE PIPELINE PARA EL MUNDO 3D (Protegido contra hilos secundarios)
+    // 2. SELECCIÓN DE PIPELINE PARA EL MUNDO 3D
     VkPipeline targetPipeline = (m_pipelineChunkOpaque != VK_NULL_HANDLE) ? m_pipelineChunkOpaque : m_pipelineOpaque;
 
     if (!s_vkDepthTestEnabled && m_pipelineNoDepth != VK_NULL_HANDLE) {
@@ -1525,8 +1598,10 @@ bool VKRenderer::CBuffCall(int index, bool full) {
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, targetPipeline);
 
-    // 3. Selección de Textura:
-    VkDescriptorSet currentSet = m_defaultWhiteTexture.descriptorSet;
+    // 3. Selección de Texturas (Set 0 = Difusa, Set 1 = Lightmap):
+    // Inicializamos ambos con m_defaultWhiteTexture para garantizar que JAMÁS sean NULL
+    VkDescriptorSet currentDiffuseSet = m_defaultWhiteTexture.descriptorSet;
+    VkDescriptorSet currentLightmapSet = m_defaultWhiteTexture.descriptorSet;
     int hasTex = 0;
 
     if (m_textureEnabled) {
@@ -1539,29 +1614,43 @@ bool VKRenderer::CBuffCall(int index, bool full) {
                           : m_terrainAtlasId;
 
         std::lock_guard<std::recursive_mutex> lk(m_textureMtx);
+        
+        // Buscar Set 0 (Atlas del terreno)
         auto texIt = m_textures.find(targetTexId);
         if (texIt != m_textures.end() && texIt->second.descriptorSet != VK_NULL_HANDLE) {
-            currentSet = texIt->second.descriptorSet;
+            currentDiffuseSet = texIt->second.descriptorSet;
             hasTex = 1;
         } else if (m_terrainAtlasId > 0) {
             auto atlasIt = m_textures.find(m_terrainAtlasId);
             if (atlasIt != m_textures.end() && atlasIt->second.descriptorSet != VK_NULL_HANDLE) {
-                currentSet = atlasIt->second.descriptorSet;
+                currentDiffuseSet = atlasIt->second.descriptorSet;
                 hasTex = 1;
+            }
+        }
+
+        // Buscar Set 1 (Lightmap 16x16)
+        if (m_useLightmap && m_boundLightmapId > 0) {
+            auto lmIt = m_textures.find(m_boundLightmapId);
+            if (lmIt != m_textures.end() && lmIt->second.descriptorSet != VK_NULL_HANDLE) {
+                currentLightmapSet = lmIt->second.descriptorSet;
             }
         }
     }
 
-    if (currentSet != VK_NULL_HANDLE) {
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &currentSet, 0, nullptr);
-    }
+    // ¡ENLAZAR AMBOS SETS A LA VEZ! (Set 0 = difusa, Set 1 = lightmap)
+    VkDescriptorSet descriptorSets[2] = { currentDiffuseSet, currentLightmapSet };
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 2, descriptorSets, 0, nullptr);
 
-    // 4. Push Constants (Formato 100% estable de 96 bytes sin tocar shaders):
+    // 4. Push Constants (128 bytes con la iluminación y gamma):
     PushConstants pc;
     pc.uMVP = s_vkClipCorrection * (s_proj.cur() * s_mv.cur());
     pc.uBaseColor = m_textureEnabled ? glm::vec4(1.0f, 1.0f, 1.0f, 1.0f) : m_baseColor;
+    pc.uLMTransform = m_lmt;
     pc.uChunkOffset = m_textureEnabled ? m_chunkOffset : glm::vec3(0.0f);
     pc.uHasTexture = hasTex;
+    pc.uGlobalLM = m_globalLM;
+    pc.uUseLightmap = m_useLightmap ? 1 : 0;
+    pc.uInvGamma = (m_gamma > 0.0f) ? (1.0f / m_gamma) : 1.0f;
 
     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants), &pc);
 
@@ -1576,7 +1665,8 @@ bool VKRenderer::CBuffCall(int index, bool full) {
                 float x, y, z;
                 float u, v;
                 uint32_t color;
-                float pad[2];
+                int8_t normal[4];
+                int16_t light[2];
             };
 
             const Vertex32* src = (const Vertex32*)cb.rawVerts.data();
@@ -1664,24 +1754,50 @@ void VKRenderer::TextureBind(int idx) {
 
 
 void VKRenderer::TextureBindVertex(int idx, bool scaleLight) {
+    if (idx < 0) {
+        m_useLightmap = false;
+        m_boundLightmapId = -1;
+        return;
+    }
+    m_useLightmap = true;
     m_boundLightmapId = idx;
+    
+    // Si scaleLight es true, aplica el medio texel (8/256) para centrar la muestra
+    m_lmt = scaleLight
+        ? glm::vec4(1.0f, 1.0f, 8.0f / 256.0f, 8.0f / 256.0f)
+        : glm::vec4(1.0f, 1.0f, 0.0f, 0.0f);
 }
+
+
 
 void VKRenderer::TextureSetTextureLevels(int levels) {}
 int VKRenderer::TextureGetTextureLevels() { return 1; }
 
+
 void VKRenderer::TextureData(int width, int height, void* data, int level, eTextureFormat format) {
-    // CORRECCIÓN: Permitir data == nullptr (Minecraft reserva el atlas vacío antes de llenarlo)
+    // Permitir data == nullptr (Minecraft reserva el atlas vacío antes de llenarlo)
     if (width <= 0 || height <= 0 || level != 0) return;
 
     std::lock_guard<std::recursive_mutex> lk(m_textureMtx);
-    int texId = (m_boundTextureId > 0) ? m_boundTextureId : s_nextTexId++;
+
+    // 1. CORRECCIÓN CRÍTICA DE UNIDADES:
+    // Si la unidad activa es 1, creamos/asignamos el ID al Lightmap.
+    // Si es la unidad 0, a la textura difusa normal (terreno, skin, interfaz).
+    int texId;
+    if (m_activeTextureUnit == 1) {
+        texId = (m_boundLightmapId > 0) ? m_boundLightmapId : s_nextTexId++;
+        m_boundLightmapId = texId;
+    } else {
+        texId = (m_boundTextureId > 0) ? m_boundTextureId : s_nextTexId++;
+        m_boundTextureId = texId;
+    }
+
     VkDeviceSize imageSize = (VkDeviceSize)width * height * 4;
 
     VkBuffer stagingBuffer = VK_NULL_HANDLE;
     VkDeviceMemory stagingBufferMemory = VK_NULL_HANDLE;
 
-    // Solo usar staging buffer si vienen píxeles reales de CPU
+    // 2. Solo crear staging buffer si vienen píxeles de CPU
     if (data != nullptr) {
         VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE};
         VK_CHECK(vkCreateBuffer(m_device, &bufferInfo, nullptr, &stagingBuffer));
@@ -1699,6 +1815,7 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
         vkUnmapMemory(m_device, stagingBufferMemory);
     }
 
+    // 3. Si la textura ya existía con este ID, destruirla limpiamente antes de recrearla
     auto it = m_textures.find(texId);
     if (it != m_textures.end()) {
         vkDeviceWaitIdle(m_device);
@@ -1712,12 +1829,10 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
     tex.width = width;
     tex.height = height;
 
-    printf("[Vulkan Texture] Creada ID: %d | %dx%d (%s)\n", texId, width, height, data ? "Con Datos" : "Lienzo Vacío");
+    printf("[Vulkan Texture] Creada ID: %d (Unit: %d) | %dx%d (%s)\n", 
+           texId, m_activeTextureUnit, width, height, data ? "Con Datos" : "Lienzo Vacío");
 
-    // CORRECCIÓN SPRINT 1: Eliminada la autodetección ciega (width >= 256).
-    // Evita que items, armaduras, menús o los 6 fondos del panorama sobreescriban el atlas.
-    // El atlas real de bloques se identificará automáticamente desde la Unidad 0 en CBuffCall.
-
+    // 4. Creación de la imagen en GPU
     VkImageCreateInfo imgInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     imgInfo.imageType = VK_IMAGE_TYPE_2D;
     imgInfo.extent.width = width;
@@ -1737,11 +1852,12 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
     VkMemoryRequirements memReqs;
     vkGetImageMemoryRequirements(m_device, tex.image, &memReqs);
 
-    VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, memReqs.size,
-                                   findMemoryType(m_physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
-    VK_CHECK(vkAllocateMemory(m_device, &allocInfo, nullptr, &tex.memory));
+    VkMemoryAllocateInfo imgAllocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, memReqs.size,
+                                      findMemoryType(m_physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+    VK_CHECK(vkAllocateMemory(m_device, &imgAllocInfo, nullptr, &tex.memory));
     VK_CHECK(vkBindImageMemory(m_device, tex.image, tex.memory, 0));
 
+    // 5. Transición de Layout y Copia de Datos
     VkCommandBuffer cmd = beginSingleTimeCommands();
 
     if (data != nullptr) {
@@ -1765,7 +1881,6 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
         barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
     } else {
-        // Si no hay datos, hacemos la transición directa a SHADER_READ_ONLY para que TextureDataUpdate escriba en ella
         VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -1783,6 +1898,7 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
         vkFreeMemory(m_device, stagingBufferMemory, nullptr);
     }
 
+    // 6. Image View
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = tex.image;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -1790,17 +1906,18 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
     viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     VK_CHECK(vkCreateImageView(m_device, &viewInfo, nullptr, &tex.view));
 
-    // CORRECCIÓN SOMBRA 3x3:
-    // Detectar si la textura solicitó CLAMP (como misc/shadow.png o viñetas de 64x64)
-    bool isClamped = m_nextTexClamp || (width == 64 && height == 64 && data != nullptr);
-    m_nextTexClamp = false; // Resetear para las siguientes texturas
+    // 7. SAMPLER CONFIG:
+    // El Lightmap es de 16x16 y REQUIERE Linear + Clamp to Edge obligatorio
+    bool isLightmap = (m_activeTextureUnit == 1) || (width == 16 && height == 16);
+    bool isClamped = m_nextTexClamp || isLightmap || (width == 64 && height == 64 && data != nullptr);
+    m_nextTexClamp = false;
 
     VkSamplerAddressMode addrMode = isClamped ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    VkFilter filter = isClamped ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
 
     VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    // Sombra suave si es clamp; píxeles nítidos estilo Minecraft clásico si es el atlas
-    samplerInfo.magFilter = isClamped ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-    samplerInfo.minFilter = isClamped ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    samplerInfo.magFilter = filter;
+    samplerInfo.minFilter = filter;
     samplerInfo.addressModeU = addrMode;
     samplerInfo.addressModeV = addrMode;
     samplerInfo.addressModeW = addrMode;
@@ -1813,6 +1930,7 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
     samplerInfo.unnormalizedCoordinates = VK_FALSE;
     VK_CHECK(vkCreateSampler(m_device, &samplerInfo, nullptr, &tex.sampler));
 
+    // 8. Descriptor Set
     VkDescriptorSetAllocateInfo descAllocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     descAllocInfo.descriptorPool = m_descriptorPool;
     descAllocInfo.descriptorSetCount = 1;
@@ -1839,7 +1957,16 @@ void VKRenderer::TextureDataUpdate(int xoffset, int yoffset, int width, int heig
     if (width <= 0 || height <= 0 || !data) return;
 
     std::lock_guard<std::recursive_mutex> lk(m_textureMtx);
-    int texId = (m_boundTextureId > 0) ? m_boundTextureId : 1;
+
+    // ========================================================================
+    // CORRECCIÓN CRÍTICA DE UNIDAD DE TEXTURA:
+    // Si la unidad activa es 1 (GL_TEXTURE1), actualizamos el Lightmap.
+    // Si la unidad activa es 0 (GL_TEXTURE0), actualizamos el Atlas o Skin.
+    // ========================================================================
+    int texId = (m_activeTextureUnit == 1) 
+                ? ((m_boundLightmapId > 0) ? m_boundLightmapId : 1)
+                : ((m_boundTextureId > 0) ? m_boundTextureId : 1);
+
     auto it = m_textures.find(texId);
     if (it == m_textures.end()) {
         TextureData(width, height, data, level, TEXTURE_FORMAT_RxGyBzAw);
@@ -1848,7 +1975,7 @@ void VKRenderer::TextureDataUpdate(int xoffset, int yoffset, int width, int heig
 
     VkDeviceSize imageSize = (VkDeviceSize)width * height * 4;
 
-    // OPTIMIZACIÓN SPRINT 1: Buffer de Staging persistente (Evita fugas de RAM y parpadeo de agua)
+    // Buffer de Staging persistente (Evita fugas de RAM y parpadeos en animaciones)
     static VkBuffer s_animStagingBuffer = VK_NULL_HANDLE;
     static VkDeviceMemory s_animStagingMemory = VK_NULL_HANDLE;
     static VkDeviceSize s_animStagingCapacity = 0;
@@ -1871,13 +1998,13 @@ void VKRenderer::TextureDataUpdate(int xoffset, int yoffset, int width, int heig
         VK_CHECK(vkBindBufferMemory(m_device, s_animStagingBuffer, s_animStagingMemory, 0));
     }
 
-    // Copia directa a memoria mapeada sin realocar nada en la GPU
+    // Copia directa de píxeles a memoria mapeada
     void* mapped = nullptr;
     vkMapMemory(m_device, s_animStagingMemory, 0, imageSize, 0, &mapped);
     memcpy(mapped, data, imageSize);
     vkUnmapMemory(m_device, s_animStagingMemory);
 
-    // Transferencia sincronizada limpia a la textura
+    // Transferencia sincronizada limpia hacia la textura en GPU
     VkCommandBuffer cmd = beginSingleTimeCommands();
 
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -2025,7 +2152,13 @@ void VKRenderer::StateSetFogFarDistance(float dist) {}
 void VKRenderer::StateSetFogDensity(float density) {}
 void VKRenderer::StateSetFogColour(float red, float green, float blue) {}
 void VKRenderer::StateSetLightingEnable(bool enable) {}
-void VKRenderer::StateSetVertexTextureUV(float u, float v) {}
+
+
+
+void VKRenderer::StateSetVertexTextureUV(float u, float v) {
+    m_globalLM = glm::vec2(u, v);
+}
+
 void VKRenderer::StateSetLightColour(int light, float red, float green, float blue) {}
 void VKRenderer::StateSetLightAmbientColour(float red, float green, float blue) {}
 void VKRenderer::StateSetLightDirection(int light, float x, float y, float z) {}

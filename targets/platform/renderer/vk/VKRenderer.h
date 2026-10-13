@@ -126,6 +126,7 @@ public:
     virtual void StateSetFaceCull(bool enable) override;
     virtual void StateSetFaceCullCW(bool enable) override;
     virtual void StateSetLineWidth(float width) override;
+    
     virtual void StateSetWriteEnable(bool red, bool green, bool blue, bool alpha) override;
     virtual void StateSetDepthTestEnable(bool enable) override;
     virtual void StateSetAlphaTestEnable(bool enable) override;
@@ -222,6 +223,10 @@ private:
     std::unordered_map<int, VKTexture> m_textures;
     int m_boundTextureId = 0;
     int m_boundLightmapId = -1;
+    bool m_useLightmap = false;                                   // <--- NUEVO: Bandera activa del Lightmap
+    glm::vec4 m_lmt = glm::vec4(1.0f, 1.0f, 0.0f, 0.0f);         // <--- NUEVO: Transformación / Offset medio texel
+    glm::vec2 m_globalLM = glm::vec2(240.0f, 240.0f);            // <--- NUEVO: Coordenada de luz global para mobs/items
+    float m_gamma = 1.0f;                                        // <--- NUEVO: Valor gamma dinámico
     int m_activeTextureUnit = 0;
     VKTexture m_defaultWhiteTexture;
     std::recursive_mutex m_textureMtx; // Permite llamadas anidadas sin congelar el juego jamás
