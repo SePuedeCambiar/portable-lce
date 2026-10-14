@@ -1147,8 +1147,8 @@ void Textures::tick(
         // PRUEBA DIAGNÓSTICO: Pausamos temporalmente las animaciones para probar
         // si el parpadeo del agua se detiene al 100%.
         // ====================================================================
-        // terrain->cycleAnimationFrames();
-        // items->cycleAnimationFrames();
+         terrain->cycleAnimationFrames();
+         items->cycleAnimationFrames();
         // ====================================================================
     }
 

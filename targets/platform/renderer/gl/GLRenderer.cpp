@@ -1377,12 +1377,23 @@ void GLRenderer::TextureData(int w, int h, void* d, int lvl, eTextureFormat) {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     }
 }
+
 void GLRenderer::TextureDataUpdate(int xo, int yo, int w, int h, void* d, int lvl) {
+    // Si viene con offset (xo > 0 || yo > 0), es una animación del atlas del terreno:
+    // Aseguramos que la unidad activa sea la 0 antes de subir los píxeles
+    glActiveTexture(GL_TEXTURE0);
     glTexSubImage2D(GL_TEXTURE_2D, lvl, xo, yo, w, h, GL_RGBA, GL_UNSIGNED_BYTE, d);
 }
+
 void GLRenderer::TextureSetParam(int p, int v) {
-    glTexParameteri(GL_TEXTURE_2D, p, v);
+    // Pedirle la función directamente al driver de la GPU a través de SDL
+    typedef void (*PFN_glTexParameteri)(GLenum, GLenum, GLint);
+    static PFN_glTexParameteri real_glTexParameteri = (PFN_glTexParameteri)SDL_GL_GetProcAddress("glTexParameteri");
+    if (real_glTexParameteri) {
+        real_glTexParameteri(GL_TEXTURE_2D, p, v);
+    }
 }
+
 
 template <typename T>
 static int stbLoad(unsigned char* data, int w, int h, T* info, int** out) {
@@ -1561,13 +1572,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
     real_glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
 }
 
-void glTexParameteri(unsigned int target, unsigned int pname, int param) {
-    typedef void (*PFN_glTexParameteri)(unsigned int, unsigned int, int);
-    static PFN_glTexParameteri real_glTexParameteri = (PFN_glTexParameteri)dlsym(RTLD_NEXT, "glTexParameteri");
-    if (real_glTexParameteri) {
-        real_glTexParameteri(target, pname, param);
-    }
-}
+
 
 
 }

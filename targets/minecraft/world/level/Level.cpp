@@ -2135,8 +2135,8 @@ void Level::tickEntities() {
         std::lock_guard<std::recursive_mutex> lock(m_entitiesCS);
 
         for (unsigned int i = 0; i < entities.size();) {
-            const std::shared_ptr<Entity>& e = entities[i]; // REFERENCIA CONSTANTE: Cero atomic_fetch_add/sub
-
+            std::shared_ptr<Entity> e = entities[i];
+            
             if (e->riding != nullptr) {
                 if (e->riding->removed || e->riding->rider.lock() != e) {
                     e->riding->rider = std::weak_ptr<Entity>();

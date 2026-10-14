@@ -471,7 +471,7 @@ void VKRenderer::endSingleTimeCommands(VkCommandBuffer commandBuffer) {
 }
 
 void VKRenderer::initStagingSlots() {
-    VkDeviceSize defaultSize = 256 * 1024; // 256 KB por slot (sobrado para 16x16 o 64x64)
+    VkDeviceSize defaultSize = 4 * 1024 * 1024; // 4 MB por slot (caben atlas enteros de 1024x1024)
 
     VkCommandBufferAllocateInfo cmdAllocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cmdAllocInfo.commandPool = m_commandPool;
@@ -498,9 +498,7 @@ void VKRenderer::initStagingSlots() {
         VK_CHECK(vkAllocateMemory(m_device, &allocInfo, nullptr, &slot.memory));
         VK_CHECK(vkBindBufferMemory(m_device, slot.buffer, slot.memory, 0));
 
-        // Mapeo persistente único: nunca se llama a unmap hasta cerrar el juego
         VK_CHECK(vkMapMemory(m_device, slot.memory, 0, defaultSize, 0, &slot.mapped));
-
         VK_CHECK(vkAllocateCommandBuffers(m_device, &cmdAllocInfo, &slot.cmd));
         VK_CHECK(vkCreateFence(m_device, &fenceInfo, nullptr, &slot.fence));
     }
@@ -2094,11 +2092,6 @@ void VKRenderer::TextureDataUpdate(int xoffset, int yoffset, int width, int heig
     std::lock_guard<std::recursive_mutex> lk(m_textureMtx);
 
     int texId;
-    // REGLA DEFINITIVA:
-    // 1. Si xoffset o yoffset son mayores a 0, son animaciones de agua, lava o fuego:
-    //    SIEMPRE se aplican sobre el Atlas del terreno (m_terrainAtlasId), nunca sobre fuentes o interfaz.
-    // 2. Si está en (0,0) y la unidad activa es 1, es la actualización del Lightmap de 16x16.
-    // 3. De lo contrario, es una actualización normal a la textura actualmente enlazada.
     if (xoffset > 0 || yoffset > 0) {
         texId = (m_terrainAtlasId > 0) ? m_terrainAtlasId : m_boundTextureId;
     } else if (m_activeTextureUnit == 1) {
@@ -2116,21 +2109,71 @@ void VKRenderer::TextureDataUpdate(int xoffset, int yoffset, int width, int heig
 
     // 1. Obtener el siguiente slot del anillo
     int slotIdx = m_currentStagingSlot % NUM_STAGING_SLOTS;
-    m_currentStagingSlot++;
     StagingSlot& slot = m_stagingSlots[slotIdx];
 
-    // 2. Esperar a que la GPU haya terminado con este slot específico (suele ser instantáneo / 0ms)
+    // 2. Esperar a que la GPU haya terminado con este slot
     vkWaitForFences(m_device, 1, &slot.fence, VK_TRUE, UINT64_MAX);
-    vkResetFences(m_device, 1, &slot.fence);
 
-    // 3. Copia directa en memoria RAM (ultra-rápido, sin llamar a vkMapMemory)
-    if (imageSize <= slot.capacity) {
-        memcpy(slot.mapped, data, imageSize);
-    } else {
-        return; // Protección de desbordamiento
+    // 3. SEGURIDAD ANTE TEXTURAS GIGANTES:
+    // Si la textura es mayor a la capacidad del slot, no tocamos la valla y usamos fallback
+    if (imageSize > slot.capacity) {
+        // Fallback síncrono ultra-seguro (nunca congela el juego)
+        VkBuffer stagingBuf;
+        VkDeviceMemory stagingMem;
+
+        VkBufferCreateInfo bufInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE};
+        VK_CHECK(vkCreateBuffer(m_device, &bufInfo, nullptr, &stagingBuf));
+
+        VkMemoryRequirements memReqs;
+        vkGetBufferMemoryRequirements(m_device, stagingBuf, &memReqs);
+        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, memReqs.size,
+                                       findMemoryType(m_physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+        VK_CHECK(vkAllocateMemory(m_device, &allocInfo, nullptr, &stagingMem));
+        VK_CHECK(vkBindBufferMemory(m_device, stagingBuf, stagingMem, 0));
+
+        void* mappedData = nullptr;
+        vkMapMemory(m_device, stagingMem, 0, imageSize, 0, &mappedData);
+        memcpy(mappedData, data, imageSize);
+        vkUnmapMemory(m_device, stagingMem);
+
+        VkCommandBuffer cmd = beginSingleTimeCommands();
+
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.image = it->second.image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageOffset = { xoffset, yoffset, 0 };
+        region.imageExtent = { (uint32_t)width, (uint32_t)height, 1 };
+        vkCmdCopyBufferToImage(cmd, stagingBuf, it->second.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+        endSingleTimeCommands(cmd);
+
+        vkDestroyBuffer(m_device, stagingBuf, nullptr);
+        vkFreeMemory(m_device, stagingMem, nullptr);
+        return;
     }
 
-    // 4. Grabar comandos de transferencia en el command buffer propio del slot
+    // Si cupo normalmente en el slot, avanzamos el índice y reseteamos la valla AHORA QUE ES SEGURO
+    m_currentStagingSlot++;
+    vkResetFences(m_device, 1, &slot.fence);
+
+    // 4. Copia directa a RAM
+    memcpy(slot.mapped, data, imageSize);
+
+    // 5. Grabar comandos de transferencia en el command buffer del slot
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(slot.cmd, &beginInfo);
@@ -2158,7 +2201,7 @@ void VKRenderer::TextureDataUpdate(int xoffset, int yoffset, int width, int heig
 
     vkEndCommandBuffer(slot.cmd);
 
-    // 5. Enviar a la GPU con la valla (FENCE), SIN `vkQueueWaitIdle`
+    // 6. Enviar a la GPU con la valla
     VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &slot.cmd;
@@ -2167,7 +2210,6 @@ void VKRenderer::TextureDataUpdate(int xoffset, int yoffset, int width, int heig
         std::lock_guard<std::mutex> qLk(m_queueMtx);
         vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, slot.fence);
     }
-    // ¡La CPU sale de aquí en 0.001 milisegundos! Cero parones.
 }
 
 void VKRenderer::TextureSetParam(int param, int value) {
