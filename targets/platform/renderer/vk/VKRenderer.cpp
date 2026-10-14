@@ -816,15 +816,10 @@ void VKRenderer::Initialise() {
     VkVertexInputBindingDescription bindingDescription{0, 32, VK_VERTEX_INPUT_RATE_VERTEX};
     std::array<VkVertexInputAttributeDescription, 5> attributeDescriptions{};
     
-    // Attr 0: Posición X, Y, Z (12 bytes)
     attributeDescriptions[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0};
-    // Attr 1: UVs del Atlas (8 bytes)
     attributeDescriptions[1] = {1, 0, VK_FORMAT_R32G32_SFLOAT, 12};
-    // Attr 2: Color / Sombreado de caras (4 bytes)
     attributeDescriptions[2] = {2, 0, VK_FORMAT_R8G8B8A8_UNORM, 20};
-    // Attr 3: Normales 3D (4 bytes)
     attributeDescriptions[3] = {3, 0, VK_FORMAT_R8G8B8A8_SNORM, 24};
-    // Attr 4: Coordenadas de Luz cruda (4 bytes -> ivec2 en shader)
     attributeDescriptions[4] = {4, 0, VK_FORMAT_R16G16_SINT, 28};
 
     VkPipelineVertexInputStateCreateInfo vertexInputInfo{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -851,16 +846,27 @@ void VKRenderer::Initialise() {
     std::vector<VkDynamicState> dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dynamicState{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0, (uint32_t)dynamicStates.size(), dynamicStates.data()};
 
-    // Estados de profundidad base
+    // ========================================================================
+    // ESTADOS DE PROFUNDIDAD
+    // ========================================================================
+    // 1. OPACO GENERAL (Escribe profundidad)
     VkPipelineDepthStencilStateCreateInfo depthOpaque{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthOpaque.depthTestEnable = VK_TRUE;
     depthOpaque.depthWriteEnable = VK_TRUE;
     depthOpaque.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
+    // 2. TRANSPARENTE EFECTOS Y AGUA DE CHUNKS:
+    // depthWrite = FALSE para que el agua NO luche contra la tierra en Y=62.
     VkPipelineDepthStencilStateCreateInfo depthTrans{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthTrans.depthTestEnable = VK_TRUE;
     depthTrans.depthWriteEnable = VK_FALSE;
     depthTrans.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    // 3. TRANSPARENTE CON ESCRITURA (Exclusivo para el Mapa e ítems en mano)
+    VkPipelineDepthStencilStateCreateInfo depthTransWrite{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    depthTransWrite.depthTestEnable = VK_TRUE;
+    depthTransWrite.depthWriteEnable = VK_TRUE;
+    depthTransWrite.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
     // Estados de mezcla base
     VkPipelineColorBlendAttachmentState blendOpaque{};
@@ -905,21 +911,13 @@ void VKRenderer::Initialise() {
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineOpaque));
 
     // 2. PIPELINE TRANSPARENTE (Nubes y partículas)
-    // CORRECCIÓN NUBES: CULL_MODE_BACK_BIT obligatorio para no ver las caras internas en rayos X
-    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
-    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
     pipelineInfo.pDepthStencilState = &depthTrans;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineTransparent));
 
     // 2.1 PIPELINE TRANSPARENTE CON ESCRITURA DE PROFUNDIDAD (Para el Mapa e ítems en mano)
-    // CORRECCIÓN MAPA: depthWrite = TRUE para que no se filtre el mar y sea 100% sólido
-    VkPipelineDepthStencilStateCreateInfo depthTransWrite{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    depthTransWrite.depthTestEnable = VK_TRUE;
-    depthTransWrite.depthWriteEnable = VK_TRUE;
-    depthTransWrite.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    rasterizer.cullMode = VK_CULL_MODE_NONE; // Ítems en mano sin culling agresivo
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
     pipelineInfo.pDepthStencilState = &depthTransWrite;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &s_pipelineTransDepth));
@@ -932,7 +930,7 @@ void VKRenderer::Initialise() {
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineChunkOpaque));
 
     // 4. PIPELINE CHUNKS TRANSPARENTES (Agua, Hielo)
-    // CORRECCIÓN HIELO: CULL_MODE_BACK_BIT para eliminar capas internas y sin sesgo de profundidad
+    // depthWrite = FALSE para que el agua NO se corte contra la orilla en Y=62.
     rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rasterizer.depthBiasEnable = VK_FALSE;
@@ -948,7 +946,7 @@ void VKRenderer::Initialise() {
     rasterizer.depthBiasEnable = VK_FALSE;
 
     // ========================================================================
-    // 5. PIPELINES SIN PROFUNDIDAD (HUD 2D, Menús, Mapa)
+    // 5. PIPELINES SIN PROFUNDIDAD (HUD 2D, Menús)
     // ========================================================================
     VkPipelineDepthStencilStateCreateInfo depthNone{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthNone.depthTestEnable = VK_FALSE;
@@ -959,7 +957,7 @@ void VKRenderer::Initialise() {
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineNoDepth));
 
-    // B. Sólido sin mezcla alfa (mapa en mano, fondos opacos del menú):
+    // B. Sólido sin mezcla alfa (fondos opacos del menú):
     pipelineInfo.pColorBlendState = &colorBlendingOpaque;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineNoDepthOpaque));
 
@@ -995,7 +993,6 @@ void VKRenderer::Initialise() {
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineAdditive));
 
-    // Restaurar configuración base
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
     vkDestroyShaderModule(m_device, fragModule, nullptr);
@@ -1039,9 +1036,6 @@ void VKRenderer::Initialise() {
 
     createDefaultWhiteTexture();
 
-    // ========================================================================
-    // VALORES INICIALES DE ILUMINACIÓN Y ESTADO
-    // ========================================================================
     m_baseColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
     m_lmt = glm::vec4(1.0f, 1.0f, 0.0f, 0.0f);
     m_globalLM = glm::vec2(240.0f, 240.0f);
@@ -1049,7 +1043,6 @@ void VKRenderer::Initialise() {
     m_useLightmap = false;
     m_gamma = 1.0f;
 
-    // INICIALIZAR EL ANILLO DE TRANSFERENCIA ULTRA-RÁPIDO (16 SLOTS)
     initStagingSlots();
 
     printf("[Vulkan] Inicialización completada con soporte de Lightmap multitextura y Staging Ring Buffer.\n");
@@ -1149,9 +1142,9 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
 
     bool allowDepthWrite = s_vkDepthTestEnabled && s_vkDepthMaskEnabled;
 
-    // 1. Filtro de seguridad de la viñeta
+    // 1. Filtro de seguridad de la viñeta (evita pantalla negra si intenta multiplicar por cero)
     if (count == 4 && !allowDepthWrite && (m_isVignettePass || m_blendSrc == 0)) {
-        return; // No tapar la pantalla si la viñeta intenta multiplicar por cero
+        return;
     }
 
     bool wasQuad = (ptype == PRIMITIVE_TYPE_QUAD_LIST || (int)ptype == 0x0007);
@@ -1176,7 +1169,7 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     if (!m_frameStarted) return;
     if (m_dynamicVertexOffset + outBytes > DYNAMIC_VERTEX_BUFFER_SIZE) return;
 
-    // 3. Copiar vértices al Dynamic VBO con descompresión a 32 bytes completa
+    // 3. Copiar vértices al Dynamic VBO con descompresión a 32 bytes
     if (vType == VERTEX_TYPE_COMPRESSED) {
         #pragma pack(push, 1)
         struct CompressedVertex {
@@ -1226,7 +1219,9 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
 
-    // 4. Selección de Pipeline
+    // ========================================================================
+    // 4. Selección Quirúrgica del Pipeline (Alineado 100% con OpenGL)
+    // ========================================================================
     int ptypeVal = (int)ptype;
     bool isLine = (ptypeVal == 1 || ptypeVal == 3);      // GL_LINES o GL_LINE_STRIP
     bool isFan  = (ptypeVal == 2 || ptypeVal == 6);      // GL_TRIANGLE_FAN
@@ -1240,20 +1235,27 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     } else if (isFan && m_pipelineTriangleFan != VK_NULL_HANDLE) {
         targetPipeline = m_pipelineTriangleFan;       // Cúpula del cielo
     } else if (!s_vkDepthTestEnabled) {
-        // CORRECCIÓN CRÍTICA DE INTERFAZ Y MAPA:
-        // Si la mezcla está apagada, usar el pipeline 2D SÓLIDO (evita que el mapa sea transparente).
-        // Si la mezcla está encendida, usar el pipeline 2D con mezcla alfa (textos, chat, viñetas).
+        // UI, HUD y Menús 2D (Sin Depth Test)
         if (!s_vkBlendEnabled && m_pipelineNoDepthOpaque != VK_NULL_HANDLE) {
-            targetPipeline = m_pipelineNoDepthOpaque;
+            targetPipeline = m_pipelineNoDepthOpaque; // Interfaz 2D sólida
         } else {
-            targetPipeline = m_pipelineNoDepth;
+            targetPipeline = m_pipelineNoDepth;       // Textos, chat, viñetas
         }
-    } else if (allowDepthWrite && s_vkBlendEnabled && s_pipelineTransDepth != VK_NULL_HANDLE) {
-        targetPipeline = s_pipelineTransDepth;        
-    } else if (allowDepthWrite && !s_vkBlendEnabled && m_pipelineOpaque != VK_NULL_HANDLE) {
-        targetPipeline = m_pipelineOpaque;            // Geometría sólida
+    } else if (allowDepthWrite) {
+        // GEOMETRÍA 3D CON ESCRITURA EN PROFUNDIDAD (DepthTest = TRUE, DepthMask = TRUE):
+        if (s_vkBlendEnabled && s_pipelineTransDepth != VK_NULL_HANDLE) {
+            // MAPA E ÍTEMS EN MANO: Tienen mezcla para bordes, pero escriben profundidad para no ser transparentes
+            targetPipeline = s_pipelineTransDepth;    
+        } else if (!s_vkBlendEnabled && m_pipelineOpaque != VK_NULL_HANDLE) {
+            targetPipeline = m_pipelineOpaque;        // Bloques y modelos opacos
+        } else {
+            targetPipeline = m_pipelineTransparent;
+        }
     } else {
-        targetPipeline = m_pipelineTransparent;       // Partículas, nubes, etc.
+        // GEOMETRÍA 3D SIN ESCRITURA EN PROFUNDIDAD (DepthMask = FALSE):
+        // Partículas, agua inmediata, niebla y efectos subacuáticos.
+        // ¡Al no escribir profundidad, JAMÁS lucharán ni deformarán la tierra en Y=62!
+        targetPipeline = m_pipelineTransparent;
     }
 
     if (targetPipeline != VK_NULL_HANDLE) {
@@ -1273,7 +1275,7 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
             hasTex = 1;
         }
 
-        // Si el lightmap está activo para este draw (ej. entidades, mobs, drops)
+        // Si el lightmap está activo para este draw (ej. entidades, mobs, mano)
         if (m_useLightmap && m_boundLightmapId > 0) {
             auto lmIt = m_textures.find(m_boundLightmapId);
             if (lmIt != m_textures.end() && lmIt->second.descriptorSet != VK_NULL_HANDLE) {
@@ -1282,11 +1284,11 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         }
     }
 
-    // ¡ENLAZAR AMBOS SETS (0 y 1) OBLIGATORIAMENTE!
+    // Enlazar Set 0 (Textura) y Set 1 (Lightmap)
     VkDescriptorSet descriptorSets[2] = { currentDiffuseSet, currentLightmapSet };
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 2, descriptorSets, 0, nullptr);
 
-    // 6. Push Constants (128 bytes exactos)
+    // 6. Push Constants (128 bytes)
     PushConstants pc;
     pc.uMVP = s_vkClipCorrection * (s_proj.cur() * s_mv.cur());
     pc.uBaseColor = m_baseColor;
