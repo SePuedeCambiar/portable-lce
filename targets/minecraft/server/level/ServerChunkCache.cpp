@@ -807,21 +807,37 @@ bool ServerChunkCache::tick() {
                 // B. Guardado y descarga lógica
                 save(chunk);
                 saveEntities(chunk);
-                chunk->unload(true);
+                chunk->unload(true); // Marca isLoaded = false (evita que el cliente lo procese)
 
-                // C. Remoción instantánea O(1) con Swap-and-Pop
+                // C. Remoción instantánea O(1) de la lista activa de ticks
                 auto it = std::find(m_loadedChunkList.begin(), m_loadedChunkList.end(), chunk);
                 if (it != m_loadedChunkList.end()) {
                     *it = m_loadedChunkList.back();
                     m_loadedChunkList.pop_back();
                 }
 
-                // D. Limpiar del caché activo
+                // D. Comprimir el chunk en RAM (pasa de 80 KB a ~3 KB de datos)
+                chunk->compressBlocks();
+                chunk->compressLighting();
+                chunk->compressData();
+
+                // E. Mover al caché de descargados (m_unloadedCache) para reutilizarlo si el jugador regresa
                 int idx = (chunk->x + XZOFFSET) * XZSIZE + (chunk->z + XZOFFSET);
-                if (m_unloadedCache[idx] != nullptr) {
-                    m_unloadedCache[idx]->unload(true);
+                if (m_unloadedCache != nullptr) {
+                    if (m_unloadedCache[idx] != nullptr && m_unloadedCache[idx] != chunk) {
+                        delete m_unloadedCache[idx];
+                    }
+                    m_unloadedCache[idx] = chunk; // <--- SE CONSERVA COMPRIMIDO EN RAM (3 KB)
                 }
-                cache[idx] = nullptr;
+                cache[idx] = nullptr; // Ya no está activo en el mundo
+
+                // F. Limpiar duplicados pendientes en la cola de descarga
+                m_toDrop.erase(std::remove(m_toDrop.begin(), m_toDrop.end(), chunk), m_toDrop.end());
+
+                // ¡NOTA CRÍTICA: NO llamar a "delete chunk;" aquí!
+                // El chunk queda comprimido en m_unloadedCache[idx]. Si el jugador vuelve,
+                // ServerChunkCache::load lo reutiliza sin hacer malloc/new.
+                // Se liberará definitivamente al salir del mundo en ~ServerChunkCache().
             }
         }
 #endif
