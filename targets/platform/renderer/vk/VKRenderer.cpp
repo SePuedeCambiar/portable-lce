@@ -765,7 +765,7 @@ void VKRenderer::Initialise() {
     }
 
     // ========================================================================
-    // DESCRIPTOR SET LAYOUT (1 Sampler por Set)
+    // 1. DESCRIPTOR SET LAYOUT: SAMPLERS (Set 0 = Textura, Set 1 = Lightmap)
     // ========================================================================
     VkDescriptorSetLayoutBinding samplerLayoutBinding{};
     samplerLayoutBinding.binding = 0;
@@ -778,14 +778,44 @@ void VKRenderer::Initialise() {
     layoutInfo.pBindings = &samplerLayoutBinding;
     VK_CHECK(vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_descriptorSetLayout));
 
-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8192};
-    VkDescriptorPoolCreateInfo descPoolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, 8192, 1, &poolSize};
+    // ========================================================================
+    // 2. DESCRIPTOR SET LAYOUT: SCENE UBO (Set 2 = Niebla y Cámara Global)
+    // ========================================================================
+    VkDescriptorSetLayoutBinding uboLayoutBinding{};
+    uboLayoutBinding.binding = 0;
+    uboLayoutBinding.descriptorCount = 1;
+    uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutCreateInfo uboLayoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    uboLayoutInfo.bindingCount = 1;
+    uboLayoutInfo.pBindings = &uboLayoutBinding;
+    VK_CHECK(vkCreateDescriptorSetLayout(m_device, &uboLayoutInfo, nullptr, &m_sceneUboDescriptorSetLayout));
+
+    // ========================================================================
+    // DESCRIPTOR POOL: SOPORTA SAMPLERS Y UNIFORM BUFFERS
+    // ========================================================================
+    VkDescriptorPoolSize poolSizes[] = {
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8192 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16 }
+    };
+    VkDescriptorPoolCreateInfo descPoolInfo{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, 
+        nullptr, 
+        VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, 
+        8192, 
+        2, poolSizes
+    };
     VK_CHECK(vkCreateDescriptorPool(m_device, &descPoolInfo, nullptr, &m_descriptorPool));
 
     // ========================================================================
-    // PIPELINE LAYOUT: 2 DESCRIPTOR SETS (Set 0 = Textura, Set 1 = Lightmap)
+    // PIPELINE LAYOUT: 3 DESCRIPTOR SETS (Set 0=Tex, Set 1=LM, Set 2=UBO)
     // ========================================================================
-    VkDescriptorSetLayout setLayouts[] = { m_descriptorSetLayout, m_descriptorSetLayout };
+    VkDescriptorSetLayout setLayouts[] = { 
+        m_descriptorSetLayout, 
+        m_descriptorSetLayout, 
+        m_sceneUboDescriptorSetLayout // Vía #2 habilitada para el shader
+    };
 
     VkPushConstantRange pushConstantRange{
         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 
@@ -797,7 +827,7 @@ void VKRenderer::Initialise() {
         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, 
         nullptr, 
         0, 
-        2, setLayouts,
+        3, setLayouts, // Exactamente 3 Sets
         1, &pushConstantRange
     };
     VK_CHECK(vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout));
@@ -849,20 +879,16 @@ void VKRenderer::Initialise() {
     // ========================================================================
     // ESTADOS DE PROFUNDIDAD
     // ========================================================================
-    // 1. OPACO GENERAL (Escribe profundidad)
     VkPipelineDepthStencilStateCreateInfo depthOpaque{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthOpaque.depthTestEnable = VK_TRUE;
     depthOpaque.depthWriteEnable = VK_TRUE;
     depthOpaque.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
-    // 2. TRANSPARENTE EFECTOS Y AGUA DE CHUNKS:
-    // depthWrite = FALSE para que el agua NO luche contra la tierra en Y=62.
     VkPipelineDepthStencilStateCreateInfo depthTrans{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthTrans.depthTestEnable = VK_TRUE;
     depthTrans.depthWriteEnable = VK_FALSE;
     depthTrans.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
-    // 3. TRANSPARENTE CON ESCRITURA (Exclusivo para el Mapa e ítems en mano)
     VkPipelineDepthStencilStateCreateInfo depthTransWrite{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthTransWrite.depthTestEnable = VK_TRUE;
     depthTransWrite.depthWriteEnable = VK_TRUE;
@@ -930,7 +956,6 @@ void VKRenderer::Initialise() {
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineChunkOpaque));
 
     // 4. PIPELINE CHUNKS TRANSPARENTES (Agua, Hielo)
-    // depthWrite = FALSE para que el agua NO se corte contra la orilla en Y=62.
     rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rasterizer.depthBiasEnable = VK_FALSE;
@@ -945,29 +970,25 @@ void VKRenderer::Initialise() {
     rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
     rasterizer.depthBiasEnable = VK_FALSE;
 
-    // ========================================================================
     // 5. PIPELINES SIN PROFUNDIDAD (HUD 2D, Menús)
-    // ========================================================================
     VkPipelineDepthStencilStateCreateInfo depthNone{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthNone.depthTestEnable = VK_FALSE;
     depthNone.depthWriteEnable = VK_FALSE;
     pipelineInfo.pDepthStencilState = &depthNone;
 
-    // A. Con mezcla alfa (textos, chat, viñetas, partículas 2D):
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineNoDepth));
 
-    // B. Sólido sin mezcla alfa (fondos opacos del menú):
     pipelineInfo.pColorBlendState = &colorBlendingOpaque;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineNoDepthOpaque));
 
-    // 6. PIPELINE PARA LÍNEAS (Recuadro de bloque seleccionado)
+    // 6. PIPELINE PARA LÍNEAS
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
     pipelineInfo.pDepthStencilState = &depthTrans;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineLines));
 
-    // 7. PIPELINE PARA TRIANGLE FAN (Cúpula del cielo)
+    // 7. PIPELINE PARA TRIANGLE FAN
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
     pipelineInfo.pDepthStencilState = &depthNone;
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
@@ -1036,6 +1057,46 @@ void VKRenderer::Initialise() {
 
     createDefaultWhiteTexture();
 
+    // ========================================================================
+    // CREAR BUFFER FÍSICO DEL SCENE UBO (144 BYTES) Y ASIGNAR SET 2
+    // ========================================================================
+    VkDeviceSize uboSize = sizeof(SceneUBO);
+    VkBufferCreateInfo uboBufInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, uboSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE};
+    VK_CHECK(vkCreateBuffer(m_device, &uboBufInfo, nullptr, &m_sceneUboBuffer));
+
+    VkMemoryRequirements uboMemReqs;
+    vkGetBufferMemoryRequirements(m_device, m_sceneUboBuffer, &uboMemReqs);
+
+    VkMemoryAllocateInfo uboAllocInfo{
+        VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, uboMemReqs.size,
+        findMemoryType(m_physicalDevice, uboMemReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    };
+    VK_CHECK(vkAllocateMemory(m_device, &uboAllocInfo, nullptr, &m_sceneUboMemory));
+    VK_CHECK(vkBindBufferMemory(m_device, m_sceneUboBuffer, m_sceneUboMemory, 0));
+
+    // Mapeo persistente (Cero stalls en el juego)
+    VK_CHECK(vkMapMemory(m_device, m_sceneUboMemory, 0, uboSize, 0, &m_sceneUboMapped));
+
+    // Asignar y escribir Descriptor Set 2
+    VkDescriptorSetAllocateInfo uboDescAlloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    uboDescAlloc.descriptorPool = m_descriptorPool;
+    uboDescAlloc.descriptorSetCount = 1;
+    uboDescAlloc.pSetLayouts = &m_sceneUboDescriptorSetLayout;
+    VK_CHECK(vkAllocateDescriptorSets(m_device, &uboDescAlloc, &m_sceneUboDescriptorSet));
+
+    VkDescriptorBufferInfo dbi{};
+    dbi.buffer = m_sceneUboBuffer;
+    dbi.offset = 0;
+    dbi.range = uboSize;
+
+    VkWriteDescriptorSet uboWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    uboWrite.dstSet = m_sceneUboDescriptorSet;
+    uboWrite.dstBinding = 0;
+    uboWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    uboWrite.descriptorCount = 1;
+    uboWrite.pBufferInfo = &dbi;
+    vkUpdateDescriptorSets(m_device, 1, &uboWrite, 0, nullptr);
+
     m_baseColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
     m_lmt = glm::vec4(1.0f, 1.0f, 0.0f, 0.0f);
     m_globalLM = glm::vec2(240.0f, 240.0f);
@@ -1045,7 +1106,7 @@ void VKRenderer::Initialise() {
 
     initStagingSlots();
 
-    printf("[Vulkan] Inicialización completada con soporte de Lightmap multitextura y Staging Ring Buffer.\n");
+    printf("[Vulkan] Inicialización completada con soporte de Lightmap multitextura, UBO de Niebla y Staging Ring Buffer.\n");
 }
 
 void VKRenderer::InitialiseContext() {}
@@ -1084,6 +1145,18 @@ void VKRenderer::StartFrame() {
     if (result == VK_ERROR_OUT_OF_DATE_KHR) return;
 
     vkResetFences(m_device, 1, &m_inFlightFences[m_currentFrame]);
+
+    // ========================================================================
+    // 3.1 ACTUALIZACIÓN DEL UBO GLOBAL (NIEBLA Y CÁMARA)
+    // ========================================================================
+    if (m_sceneUboDirty && m_sceneUboMapped) {
+        printf("[UBO SYNC] Enabled: %d | Start(X): %.1f | End(Y): %.1f | Color: (%.2f, %.2f, %.2f)\n",
+               m_sceneData.uFogEnabled, m_sceneData.uFogParams.x, m_sceneData.uFogParams.y,
+               m_sceneData.uFogColor.r, m_sceneData.uFogColor.g, m_sceneData.uFogColor.b);
+
+        memcpy(m_sceneUboMapped, &m_sceneData, sizeof(SceneUBO));
+        m_sceneUboDirty = false;
+    }
 
     // 4. RESET CRÍTICO DE ESTADO PARA EL NUEVO FRAME:
     // Evita que el cielo herede las coordenadas del último chunk del frame anterior
@@ -1254,7 +1327,6 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     } else {
         // GEOMETRÍA 3D SIN ESCRITURA EN PROFUNDIDAD (DepthMask = FALSE):
         // Partículas, agua inmediata, niebla y efectos subacuáticos.
-        // ¡Al no escribir profundidad, JAMÁS lucharán ni deformarán la tierra en Y=62!
         targetPipeline = m_pipelineTransparent;
     }
 
@@ -1262,7 +1334,9 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, targetPipeline);
     }
 
-    // 5. Selección y enlace de texturas (Set 0 = Difusa, Set 1 = Lightmap)
+    // ========================================================================
+    // 5. Selección y enlace de texturas (Set 0 = Difusa, Set 1 = Lightmap, Set 2 = SceneUBO)
+    // ========================================================================
     VkDescriptorSet currentDiffuseSet = m_defaultWhiteTexture.descriptorSet;
     VkDescriptorSet currentLightmapSet = m_defaultWhiteTexture.descriptorSet;
     int hasTex = 0;
@@ -1284,9 +1358,9 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         }
     }
 
-    // Enlazar Set 0 (Textura) y Set 1 (Lightmap)
-    VkDescriptorSet descriptorSets[2] = { currentDiffuseSet, currentLightmapSet };
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 2, descriptorSets, 0, nullptr);
+    // ¡ENLAZAR LOS 3 SETS A LA VEZ!
+    VkDescriptorSet descriptorSets[3] = { currentDiffuseSet, currentLightmapSet, m_sceneUboDescriptorSet };
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 3, descriptorSets, 0, nullptr);
 
     // 6. Push Constants (128 bytes)
     PushConstants pc;
@@ -1745,9 +1819,11 @@ bool VKRenderer::CBuffCall(int index, bool full) {
         }
     }
 
-    // ¡ENLAZAR AMBOS SETS A LA VEZ! (Set 0 = difusa, Set 1 = lightmap)
-    VkDescriptorSet descriptorSets[2] = { currentDiffuseSet, currentLightmapSet };
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 2, descriptorSets, 0, nullptr);
+    // ========================================================================
+    // ¡ENLAZAR LOS 3 SETS A LA VEZ! (Set 0 = Difusa, Set 1 = Lightmap, Set 2 = UBO Niebla)
+    // ========================================================================
+    VkDescriptorSet descriptorSets[3] = { currentDiffuseSet, currentLightmapSet, m_sceneUboDescriptorSet };
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 3, descriptorSets, 0, nullptr);
 
     // 4. Push Constants (128 bytes con la iluminación y gamma):
     PushConstants pc;
@@ -2327,12 +2403,45 @@ void VKRenderer::StateSetLineWidth(float width) {}
 void VKRenderer::StateSetWriteEnable(bool red, bool green, bool blue, bool alpha) {}
 void VKRenderer::StateSetAlphaTestEnable(bool enable) {}
 void VKRenderer::StateSetDepthSlopeAndBias(float slope, float bias) {}
-void VKRenderer::StateSetFogEnable(bool enable) {}
+
+void VKRenderer::StateSetFogEnable(bool enable) {
+    int32_t val = enable ? 1 : 0;
+    if (m_sceneData.uFogEnabled != val) {
+        m_sceneData.uFogEnabled = val;
+        m_sceneUboDirty = true;
+    }
+}
+
 void VKRenderer::StateSetFogMode(int mode) {}
-void VKRenderer::StateSetFogNearDistance(float dist) {}
-void VKRenderer::StateSetFogFarDistance(float dist) {}
+
+
+void VKRenderer::StateSetFogNearDistance(float dist) {
+
+    printf("[FOG TEST] Minecraft me acaba de mandar niebla: %.1f\n", dist);
+    if (m_sceneData.uFogParams.x != dist) {
+        m_sceneData.uFogParams.x = dist;
+        m_sceneUboDirty = true; // "Ey, la niebla cambió, hay que avisar a la GPU"
+    }
+}
+
+
+void VKRenderer::StateSetFogFarDistance(float dist) {
+    if (m_sceneData.uFogParams.y != dist) {
+        m_sceneData.uFogParams.y = dist;
+        m_sceneUboDirty = true;
+    }
+}
 void VKRenderer::StateSetFogDensity(float density) {}
-void VKRenderer::StateSetFogColour(float red, float green, float blue) {}
+
+
+void VKRenderer::StateSetFogColour(float r, float g, float b) {
+    glm::vec4 col = {r, g, b, 1.0f};
+    if (m_sceneData.uFogColor != col) {
+        m_sceneData.uFogColor = col;
+        m_sceneUboDirty = true;
+    }
+}
+
 void VKRenderer::StateSetLightingEnable(bool enable) {}
 
 

@@ -235,8 +235,7 @@ void MultiPlayerLevel::tick() {
             LevelChunk* lc = Level::getChunk(compressCheckX - (ls / 2),
                                              compressCheckZ - (ls / 2));
             
-            // SEGURIDAD: Solo comprimir si el chunk existe, no es vacío y sigue activo
-            if (lc != nullptr && lc != emptyChunk && lc->isLoaded) {
+            if (lc != nullptr) {
                 lc->compressLighting();
                 lc->compressBlocks();
                 lc->compressData();

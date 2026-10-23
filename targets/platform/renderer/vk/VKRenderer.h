@@ -21,6 +21,21 @@ struct VKTexture {
     int height = 0;
 };
 
+// ============================================================================
+// UBO GLOBAL DE ESCENA (CÁMARA, NIEBLA Y TIEMPO - SE ACTUALIZA 1 VEZ POR FRAME)
+// ============================================================================
+struct SceneUBO {
+    glm::mat4 uViewProj;      // Offset 0   (64 bytes) - Matriz de cámara
+    glm::vec4 uFogColor;      // Offset 64  (16 bytes) - Color RGBA de la niebla
+    glm::vec4 uFogParams;     // Offset 80  (16 bytes) - X=Start, Y=End, Z=Density, W=Mode
+    glm::vec4 uSunDirection;  // Offset 96  (16 bytes) - Dirección del Sol
+    glm::vec4 uSkyColor;      // Offset 112 (16 bytes) - Color del cielo
+    int32_t   uFogEnabled;    // Offset 128 (4 bytes)  - 1 = Niebla activa, 0 = Inactiva
+    float     uGameTime;      // Offset 132 (4 bytes)  - Tiempo para animaciones
+    float     _pad[2];        // Offset 136 (8 bytes)  - Relleno para alinear a 144 (std140)
+};
+static_assert(sizeof(SceneUBO) == 144, "SceneUBO debe medir exactamente 144 bytes para cumplir std140");
+
 struct VKChunkDrawCall {
     int prim;
     int first;
@@ -238,6 +253,17 @@ private:
     // PIPELINES DEDICADOS PARA CHUNKS DEL MUNDO (CULL_BACK_BIT para descartar caras duplicadas)
     VkPipeline m_pipelineChunkOpaque = VK_NULL_HANDLE;
     VkPipeline m_pipelineChunkTransparent = VK_NULL_HANDLE;
+
+    // ========================================================================
+    // RECURSOS DEL SCENE UBO (NIEBLA Y CÁMARA GLOBAL)
+    // ========================================================================
+    SceneUBO              m_sceneData{};
+    bool                  m_sceneUboDirty = true;
+    VkBuffer              m_sceneUboBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory        m_sceneUboMemory = VK_NULL_HANDLE;
+    void*                 m_sceneUboMapped = nullptr; // Mapeo persistente de alto rendimiento
+    VkDescriptorSetLayout m_sceneUboDescriptorSetLayout = VK_NULL_HANDLE;
+    VkDescriptorSet       m_sceneUboDescriptorSet = VK_NULL_HANDLE;
 
     // Separación de Unidades de Textura (Unit 0 = Atlas/GUI, Unit 1 = Lightmap)
     std::unordered_map<int, VKTexture> m_textures;

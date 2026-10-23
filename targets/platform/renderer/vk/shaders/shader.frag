@@ -18,6 +18,19 @@ layout(push_constant) uniform PushConstants {
 layout(set = 0, binding = 0) uniform sampler2D uTexture;
 layout(set = 1, binding = 0) uniform sampler2D uLightmap;
 
+// ============================================================================
+// SET 2: DATOS GLOBALES DE ESCENA (NIEBLA Y CÁMARA)
+// ============================================================================
+layout(std140, set = 2, binding = 0) uniform SceneData {
+    mat4  uViewProj;
+    vec4  uFogColor;
+    vec4  uFogParams;     // X = Start, Y = End, Z = Density, W = Mode
+    vec4  uSunDirection;
+    vec4  uSkyColor;
+    int   uFogEnabled;
+    float uGameTime;
+} ubo;
+
 layout(location = 0) out vec4 outColor;
 
 void main() {
@@ -25,10 +38,7 @@ void main() {
     
     if (pc.uHasTexture != 0) {
         // Mapeo con repetición inteligente dentro del Atlas de 256x512
-        // Tamaño estándar de celda de Minecraft: 16 píxeles / 256 = 1.0/16.0 en U, 16 / 512 = 1.0/32.0 en V
         vec2 uv = inUV;
-        
-        // Si las UVs exceden el tamaño de 1 bloque (Greedy Meshing activado), repetimos dentro del mosaico
         texColor = texture(uTexture, uv);
     }
 
@@ -48,6 +58,19 @@ void main() {
     // Corrección Gamma
     if (pc.uInvGamma > 0.0) {
         c.rgb = pow(c.rgb, vec3(pc.uInvGamma));
+    }
+
+    // ========================================================================
+    // CÁLCULO DE NIEBLA DE MINECRAFT
+    // ========================================================================
+    if (ubo.uFogParams.y > ubo.uFogParams.x) {    // En proyecciones de perspectiva, 1.0 / gl_FragCoord.w es la distancia lineal a la cámara
+        float dist = 1.0 / gl_FragCoord.w;
+
+        // Factor lineal: 1.0 = color original, 0.0 = color de niebla puro
+        float fogFactor = clamp((ubo.uFogParams.y - dist) / (ubo.uFogParams.y - ubo.uFogParams.x), 0.0, 1.0);
+
+        // Mezclar el color final con la niebla
+        c.rgb = mix(ubo.uFogColor.rgb, c.rgb, fogFactor);
     }
 
     outColor = c;
