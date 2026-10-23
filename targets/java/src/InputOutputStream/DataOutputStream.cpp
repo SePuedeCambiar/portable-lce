@@ -217,9 +217,9 @@ void DataOutputStream::writeUTF(const std::string& str) {
     int utflen = 0;
     int c, count = 0;
 
-    /* use charAt instead of copying String to char array */
+    // 1. Calcular longitud UTF usando acceso directo por índice (sin excepciones de at())
     for (int i = 0; i < strlen; i++) {
-        c = str.at(i);
+        c = (uint8_t)str[i];
         if ((c >= 0x0001) && (c <= 0x007F)) {
             utflen++;
         } else if (c > 0x07FF) {
@@ -229,27 +229,28 @@ void DataOutputStream::writeUTF(const std::string& str) {
         }
     }
 
-    // if (utflen > 65535)
-    //	throw new UTFDataFormatException(
-    //	"encoded string too long: " + utflen + " bytes");
+    // 2. OPTIMIZACIÓN: Buffer persistente por hilo (CERO asignaciones en el Heap)
+    static thread_local std::vector<uint8_t> s_utfBuffer;
+    if (s_utfBuffer.size() < (size_t)(utflen + 2)) {
+        s_utfBuffer.resize(std::max((size_t)(utflen + 2), (size_t)512));
+    }
 
-    std::vector<uint8_t> bytearr(utflen + 2);
+    uint8_t* bytearr = s_utfBuffer.data();
 
     bytearr[count++] = (uint8_t)((utflen >> 8) & 0xFF);
     bytearr[count++] = (uint8_t)((utflen >> 0) & 0xFF);
 
     int i = 0;
     for (i = 0; i < strlen; i++) {
-        c = str.at(i);
+        c = (uint8_t)str[i];
         if (!((c >= 0x0001) && (c <= 0x007F))) break;
         bytearr[count++] = (uint8_t)c;
     }
 
     for (; i < strlen; i++) {
-        c = str.at(i);
+        c = (uint8_t)str[i];
         if ((c >= 0x0001) && (c <= 0x007F)) {
             bytearr[count++] = (uint8_t)c;
-
         } else if (c > 0x07FF) {
             bytearr[count++] = (uint8_t)(0xE0 | ((c >> 12) & 0x0F));
             bytearr[count++] = (uint8_t)(0x80 | ((c >> 6) & 0x3F));
@@ -259,7 +260,8 @@ void DataOutputStream::writeUTF(const std::string& str) {
             bytearr[count++] = (uint8_t)(0x80 | ((c >> 0) & 0x3F));
         }
     }
-    write(bytearr, 0, utflen + 2);
+
+    write(s_utfBuffer, 0, utflen + 2);
 }
 
 // 4J Added
