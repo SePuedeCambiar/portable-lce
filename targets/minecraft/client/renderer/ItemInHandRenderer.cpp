@@ -576,10 +576,13 @@ void ItemInHandRenderer::render(float a) {
         float s = 2 / 128.0f;
         glScalef(s, s, s);
 
+        // APAGAR LA MEZCLA EXCLUSIVAMENTE PARA EL MAPA:
+        glDisable(GL_BLEND);
+        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+
         minecraft->textures->bindTexture(
             &MAP_BACKGROUND_LOCATION);  // 4J was "/misc/mapbg.png"
         Tesselator* t = Tesselator::getInstance();
-
         //        glNormal3f(0, 0, -1);	// 4J - changed to use tesselator
         t->begin();
         int vo = 7;

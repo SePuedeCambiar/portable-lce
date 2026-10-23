@@ -39,8 +39,8 @@ static bool s_vkWorldDetected = false;
 static void LogVKDraw(const char* type, int count, int tex, glm::vec4 col, glm::vec3 off, bool depthMask, int chunkId = -1) {
     if (!s_vkDumpThisFrame) return;
     s_vkDrawIndex++;
-//    printf("[VK_WORLD_FRAME | Draw #%03d] %s | ChkId:%d | Verts:%d | Tex:%d | DM:%d | Col:(%.2f,%.2f,%.2f,%.2f) | Off:(%.1f,%.1f,%.1f)\n",
-        //   s_vkDrawIndex, type, chunkId, count, tex, (int)depthMask, col.r, col.g, col.b, col.a, off.x, off.y, off.z);
+      printf("[VK_WORLD_FRAME | Draw #%03d] %s | ChkId:%d | Verts:%d | Tex:%d | DM:%d | Col:(%.2f,%.2f,%.2f,%.2f) | Off:(%.1f,%.1f,%.1f)\n",
+           s_vkDrawIndex, type, chunkId, count, tex, (int)depthMask, col.r, col.g, col.b, col.a, off.x, off.y, off.z);
     fflush(stdout);
 }
 
@@ -879,16 +879,19 @@ void VKRenderer::Initialise() {
     // ========================================================================
     // ESTADOS DE PROFUNDIDAD
     // ========================================================================
+    // 1. OPACO GENERAL (Escribe profundidad)
     VkPipelineDepthStencilStateCreateInfo depthOpaque{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthOpaque.depthTestEnable = VK_TRUE;
     depthOpaque.depthWriteEnable = VK_TRUE;
     depthOpaque.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
+    // 2. TRANSPARENTE EFECTOS Y AGUA (Sin escribir profundidad)
     VkPipelineDepthStencilStateCreateInfo depthTrans{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthTrans.depthTestEnable = VK_TRUE;
     depthTrans.depthWriteEnable = VK_FALSE;
     depthTrans.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
+    // 3. TRANSPARENTE CON ESCRITURA (Para el Mapa e ítems en mano)
     VkPipelineDepthStencilStateCreateInfo depthTransWrite{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthTransWrite.depthTestEnable = VK_TRUE;
     depthTransWrite.depthWriteEnable = VK_TRUE;
@@ -942,12 +945,12 @@ void VKRenderer::Initialise() {
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineTransparent));
 
-    // 2.1 PIPELINE TRANSPARENTE CON ESCRITURA DE PROFUNDIDAD (Para el Mapa e ítems en mano)
+    // 2.1 PIPELINE TRANSPARENTE CON ESCRITURA DE PROFUNDIDAD (Para agua, fuego y menús)
     rasterizer.cullMode = VK_CULL_MODE_NONE;
     pipelineInfo.pDepthStencilState = &depthTransWrite;
-    pipelineInfo.pColorBlendState = &colorBlendingTrans;
+    pipelineInfo.pColorBlendState = &colorBlendingTrans; // <--- RESTAURAR MEZCLA TRANSLÚCIDA
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &s_pipelineTransDepth));
-
+    
     // 3. PIPELINES DE CHUNKS 3D (Mundo Opaco)
     rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
@@ -1301,8 +1304,8 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
 
     VkPipeline targetPipeline = m_pipelineTransparent;
 
-    if (m_blendDst == 1 && m_pipelineAdditive != VK_NULL_HANDLE) {
-        targetPipeline = m_pipelineAdditive;          // Sol, estrellas, balizas
+    if (s_vkBlendEnabled && m_blendDst == 1 && m_pipelineAdditive != VK_NULL_HANDLE) {
+        targetPipeline = m_pipelineAdditive;          // Solo aditivo si BLEND está realmente encendido
     } else if (isLine && m_pipelineLines != VK_NULL_HANDLE) {
         targetPipeline = m_pipelineLines;             // Recuadro del bloque seleccionado
     } else if (isFan && m_pipelineTriangleFan != VK_NULL_HANDLE) {
@@ -1317,8 +1320,7 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
     } else if (allowDepthWrite) {
         // GEOMETRÍA 3D CON ESCRITURA EN PROFUNDIDAD (DepthTest = TRUE, DepthMask = TRUE):
         if (s_vkBlendEnabled && s_pipelineTransDepth != VK_NULL_HANDLE) {
-            // MAPA E ÍTEMS EN MANO: Tienen mezcla para bordes, pero escriben profundidad para no ser transparentes
-            targetPipeline = s_pipelineTransDepth;    
+            targetPipeline = s_pipelineTransDepth;    // Mapa e ítems en mano
         } else if (!s_vkBlendEnabled && m_pipelineOpaque != VK_NULL_HANDLE) {
             targetPipeline = m_pipelineOpaque;        // Bloques y modelos opacos
         } else {
@@ -1326,13 +1328,24 @@ void VKRenderer::DrawVertices(ePrimitiveType ptype, int count, void* dataIn, eVe
         }
     } else {
         // GEOMETRÍA 3D SIN ESCRITURA EN PROFUNDIDAD (DepthMask = FALSE):
-        // Partículas, agua inmediata, niebla y efectos subacuáticos.
         targetPipeline = m_pipelineTransparent;
     }
 
-    if (targetPipeline != VK_NULL_HANDLE) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, targetPipeline);
+    // ========================================================================
+    // SALVAVIDAS ANTIBALAS: Garantizar que targetPipeline NUNCA sea 0x0
+    // ========================================================================
+    if (targetPipeline == VK_NULL_HANDLE) {
+        if (m_pipelineTransparent != VK_NULL_HANDLE)        targetPipeline = m_pipelineTransparent;
+        else if (m_pipelineOpaque != VK_NULL_HANDLE)        targetPipeline = m_pipelineOpaque;
+        else if (m_pipelineNoDepthOpaque != VK_NULL_HANDLE) targetPipeline = m_pipelineNoDepthOpaque;
     }
+
+    // Si después de todos los intentos sigue siendo nulo, no dibujar para evitar crash fatal en el driver
+    if (targetPipeline == VK_NULL_HANDLE) {
+        return;
+    }
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, targetPipeline);
 
     // ========================================================================
     // 5. Selección y enlace de texturas (Set 0 = Difusa, Set 1 = Lightmap, Set 2 = SceneUBO)
