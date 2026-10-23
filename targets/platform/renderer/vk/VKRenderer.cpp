@@ -39,8 +39,8 @@ static bool s_vkWorldDetected = false;
 static void LogVKDraw(const char* type, int count, int tex, glm::vec4 col, glm::vec3 off, bool depthMask, int chunkId = -1) {
     if (!s_vkDumpThisFrame) return;
     s_vkDrawIndex++;
-    printf("[VK_WORLD_FRAME | Draw #%03d] %s | ChkId:%d | Verts:%d | Tex:%d | DM:%d | Col:(%.2f,%.2f,%.2f,%.2f) | Off:(%.1f,%.1f,%.1f)\n",
-           s_vkDrawIndex, type, chunkId, count, tex, (int)depthMask, col.r, col.g, col.b, col.a, off.x, off.y, off.z);
+//    printf("[VK_WORLD_FRAME | Draw #%03d] %s | ChkId:%d | Verts:%d | Tex:%d | DM:%d | Col:(%.2f,%.2f,%.2f,%.2f) | Off:(%.1f,%.1f,%.1f)\n",
+        //   s_vkDrawIndex, type, chunkId, count, tex, (int)depthMask, col.r, col.g, col.b, col.a, off.x, off.y, off.z);
     fflush(stdout);
 }
 
@@ -584,7 +584,7 @@ void VKRenderer::Initialise() {
     m_physicalDevice = bestDevice;
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(m_physicalDevice, &props);
-    printf("[Vulkan] GPU Asignada: %s\n", props.deviceName);
+//    printf("[Vulkan] GPU Asignada: %s\n", props.deviceName);
 
     QueueFamilyIndices qIndices = findQueueFamilies(m_physicalDevice, m_surface);
     std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
@@ -1106,7 +1106,7 @@ void VKRenderer::Initialise() {
 
     initStagingSlots();
 
-    printf("[Vulkan] Inicialización completada con soporte de Lightmap multitextura, UBO de Niebla y Staging Ring Buffer.\n");
+//    printf("[Vulkan] Inicialización completada con soporte de Lightmap multitextura, UBO de Niebla y Staging Ring Buffer.\n");
 }
 
 void VKRenderer::InitialiseContext() {}
@@ -1150,9 +1150,9 @@ void VKRenderer::StartFrame() {
     // 3.1 ACTUALIZACIÓN DEL UBO GLOBAL (NIEBLA Y CÁMARA)
     // ========================================================================
     if (m_sceneUboDirty && m_sceneUboMapped) {
-        printf("[UBO SYNC] Enabled: %d | Start(X): %.1f | End(Y): %.1f | Color: (%.2f, %.2f, %.2f)\n",
-               m_sceneData.uFogEnabled, m_sceneData.uFogParams.x, m_sceneData.uFogParams.y,
-               m_sceneData.uFogColor.r, m_sceneData.uFogColor.g, m_sceneData.uFogColor.b);
+    //    printf("[UBO SYNC] Enabled: %d | Start(X): %.1f | End(Y): %.1f | Color: (%.2f, %.2f, %.2f)\n",
+            //   m_sceneData.uFogEnabled, m_sceneData.uFogParams.x, m_sceneData.uFogParams.y,
+            //   m_sceneData.uFogColor.r, m_sceneData.uFogColor.g, m_sceneData.uFogColor.b);
 
         memcpy(m_sceneUboMapped, &m_sceneData, sizeof(SceneUBO));
         m_sceneUboDirty = false;
@@ -1418,7 +1418,7 @@ void VKRenderer::Present() {
 
     // 3. Cierre del dump de telemetría si se capturó este frame
     if (s_vkDumpThisFrame) {
-        printf("==================== FIN DEL FRAME DUMP (VULKAN | Total Draws: %d) ====================\n\n", s_vkDrawIndex);
+        //printf("==================== FIN DEL FRAME DUMP (VULKAN | Total Draws: %d) ====================\n\n", s_vkDrawIndex);
         fflush(stdout);
         s_vkDumpThisFrame = false;
     }
@@ -2017,8 +2017,8 @@ void VKRenderer::TextureData(int width, int height, void* data, int level, eText
     tex.width = width;
     tex.height = height;
 
-    printf("[Vulkan Texture] Creada ID: %d (Unit: %d) | %dx%d (%s)\n", 
-           texId, m_activeTextureUnit, width, height, data ? "Con Datos" : "Lienzo Vacío");
+//    printf("[Vulkan Texture] Creada ID: %d (Unit: %d) | %dx%d (%s)\n", 
+        //   texId, m_activeTextureUnit, width, height, data ? "Con Datos" : "Lienzo Vacío");
 
     // 4. Creación de la imagen en GPU
     VkImageCreateInfo imgInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -2417,7 +2417,7 @@ void VKRenderer::StateSetFogMode(int mode) {}
 
 void VKRenderer::StateSetFogNearDistance(float dist) {
 
-    printf("[FOG TEST] Minecraft me acaba de mandar niebla: %.1f\n", dist);
+//    printf("[FOG TEST] Minecraft me acaba de mandar niebla: %.1f\n", dist);
     if (m_sceneData.uFogParams.x != dist) {
         m_sceneData.uFogParams.x = dist;
         m_sceneUboDirty = true; // "Ey, la niebla cambió, hay que avisar a la GPU"

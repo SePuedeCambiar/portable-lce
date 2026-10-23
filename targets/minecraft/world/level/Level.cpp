@@ -2925,48 +2925,45 @@ void Level::toggleDownfall() {
 }
 
 void Level::buildAndPrepareChunksToPoll() {
-    // 4J - rewritten to add chunks interleaved by player, and to add them from
-    // the centre outwards. We're going to be potentially adding less creatures
-    // than the original so that our count stays consistent with number of
-    // players added, so we want to make sure as best we can that the ones we do
-    // add are near the active players
     int playerCount = (int)players.size();
-    int* xx = new int[playerCount];
-    int* zz = new int[playerCount];
+    if (playerCount == 0) return;
+
+    // OPTIMIZACIÓN 1: Usar memoria de la pila (Stack) en vez de new/delete en el Heap
+    // Minecraft soporta hasta 4 jugadores en pantalla dividida (máximo 8 o 16 en LAN)
+    int stack_xx[16];
+    int stack_zz[16];
+    int* xx = (playerCount <= 16) ? stack_xx : new int[playerCount];
+    int* zz = (playerCount <= 16) ? stack_zz : new int[playerCount];
+
+    // OPTIMIZACIÓN 2: Pre-reservar la memoria una sola vez para que push_back sea gratuito
+    chunksToPoll.clear();
+    chunksToPoll.reserve(playerCount * 361);
+
     for (int i = 0; i < playerCount; i++) {
         std::shared_ptr<Player> player = players[i];
         xx[i] = Mth::floor(player->x / 16);
         zz[i] = Mth::floor(player->z / 16);
-        chunksToPoll.insert(ChunkPos(xx[i], zz[i]));
+        chunksToPoll.push_back(ChunkPos(xx[i], zz[i]));
     }
 
+    // Algoritmo en espiral de 4J: desde el centro hacia afuera
     for (int r = 1; r <= 9; r++) {
         for (int l = 0; l < (r * 2); l++) {
             for (int i = 0; i < playerCount; i++) {
-                chunksToPoll.insert(ChunkPos((xx[i] - r) + l, (zz[i] - r)));
-                chunksToPoll.insert(ChunkPos((xx[i] + r), (zz[i] - r) + l));
-                chunksToPoll.insert(ChunkPos((xx[i] + r) - l, (zz[i] + r)));
-                chunksToPoll.insert(ChunkPos((xx[i] - r), (zz[i] + r) - l));
+                chunksToPoll.push_back(ChunkPos((xx[i] - r) + l, (zz[i] - r)));
+                chunksToPoll.push_back(ChunkPos((xx[i] + r), (zz[i] - r) + l));
+                chunksToPoll.push_back(ChunkPos((xx[i] + r) - l, (zz[i] + r)));
+                chunksToPoll.push_back(ChunkPos((xx[i] - r), (zz[i] + r) - l));
             }
         }
     }
-    delete[] xx;
-    delete[] zz;
+
+    if (playerCount > 16) {
+        delete[] xx;
+        delete[] zz;
+    }
 
     if (delayUntilNextMoodSound > 0) delayUntilNextMoodSound--;
-
-    // 4J Stu - Added 1.2.3, but not sure if we want to do it
-    // util.Timer.push("playerCheckLight");
-    //// randomly check areas around the players
-    // if (!players.isEmpty()) {
-    //	int select = random.nextInt(players.size());
-    //	Player player = players.get(select);
-    //	int px = Mth.floor(player.x) + random.nextInt(11) - 5;
-    //	int py = Mth.floor(player.y) + random.nextInt(11) - 5;
-    //	int pz = Mth.floor(player.z) + random.nextInt(11) - 5;
-    //	checkLight(px, py, pz);
-    // }
-    // util.Timer.pop();
 }
 
 void Level::tickClientSideTiles(int xo, int zo, LevelChunk* lc) {

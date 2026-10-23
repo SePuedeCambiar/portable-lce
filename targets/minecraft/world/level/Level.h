@@ -469,8 +469,7 @@ public:
     void toggleDownfall();
 
 protected:
-    std::unordered_set<ChunkPos, ChunkPosKeyHash, ChunkPosKeyEq> chunksToPoll;
-
+    std::vector<ChunkPos> chunksToPoll;
 private:
     int delayUntilNextMoodSound;
     static constexpr int CHUNK_POLL_RANGE = 9;
