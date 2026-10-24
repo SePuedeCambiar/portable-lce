@@ -671,7 +671,7 @@ int LevelRenderer::renderChunks(int from, int to, int layer, double alpha) {
     glTranslatef((float)-xOff, (float)-yOld, (float)-zOff);
 
     PlatformRenderer.StateSetBlendEnable(layer == 1);
-    PlatformRenderer.StateSetDepthMask(true);
+    PlatformRenderer.StateSetDepthMask(layer == 0); // Agua y hielo NO escriben profundidad
 
     bool first = true;
     int count = 0;

@@ -6088,6 +6088,7 @@ bool TileRenderer::tesselateBlockInWorld(Tile* tt, int x, int y, int z, float r,
         centerBrightness = tt->getBrightness(level, x, y, z);
     }
 
+    // 1. CARA DE ABAJO (DOWN)
     if (noCulling || tt->shouldRenderFace(level, x, y - 1, z, Facing::DOWN)) {
         if (SharedConstants::TEXTURE_LIGHTING) {
             t->tex2(tileShapeY0 > 0 ? centerColor
@@ -6101,21 +6102,7 @@ bool TileRenderer::tesselateBlockInWorld(Tile* tt, int x, int y, int z, float r,
         changed = true;
     }
 
-    if (noCulling || tt->shouldRenderFace(level, x, y + 1, z, Facing::UP)) {
-        if (SharedConstants::TEXTURE_LIGHTING) {
-            t->tex2(tileShapeY1 < 1 ? centerColor
-                                    : getLightColor(tt, level, x, y + 1, z));
-            t->color(r11, g11, b11);
-        } else {
-            float br = tt->getBrightness(level, x, y + 1, z);
-            if (tileShapeY1 != 1 && !tt->material->isLiquid())
-                br = centerBrightness;
-            t->color(r11 * br, g11 * br, b11 * br);
-        }
-        renderFaceUp(tt, x, y, z, getTexture(tt, level, x, y, z, 1));
-        changed = true;
-    }
-
+    // 2. CARA NORTE (LATERAL)
     if (noCulling || tt->shouldRenderFace(level, x, y, z - 1, Facing::NORTH)) {
         if (SharedConstants::TEXTURE_LIGHTING) {
             t->tex2(tileShapeZ0 > 0 ? centerColor
@@ -6137,6 +6124,7 @@ bool TileRenderer::tesselateBlockInWorld(Tile* tt, int x, int y, int z, float r,
         changed = true;
     }
 
+    // 3. CARA SUR (LATERAL)
     if (noCulling || tt->shouldRenderFace(level, x, y, z + 1, Facing::SOUTH)) {
         if (SharedConstants::TEXTURE_LIGHTING) {
             t->tex2(tileShapeZ1 < 1 ? centerColor
@@ -6157,6 +6145,7 @@ bool TileRenderer::tesselateBlockInWorld(Tile* tt, int x, int y, int z, float r,
         changed = true;
     }
 
+    // 4. CARA OESTE (LATERAL)
     if (noCulling || tt->shouldRenderFace(level, x - 1, y, z, Facing::WEST)) {
         if (SharedConstants::TEXTURE_LIGHTING) {
             t->tex2(tileShapeX0 > 0 ? centerColor
@@ -6177,6 +6166,7 @@ bool TileRenderer::tesselateBlockInWorld(Tile* tt, int x, int y, int z, float r,
         changed = true;
     }
 
+    // 5. CARA ESTE (LATERAL)
     if (noCulling || tt->shouldRenderFace(level, x + 1, y, z, Facing::EAST)) {
         if (SharedConstants::TEXTURE_LIGHTING) {
             t->tex2(tileShapeX1 < 1 ? centerColor
@@ -6194,6 +6184,22 @@ bool TileRenderer::tesselateBlockInWorld(Tile* tt, int x, int y, int z, float r,
             t->color(r3 * r, g3 * g, b3 * b);
             renderEast(tt, x, y, z, GrassTile::getSideTextureOverlay());
         }
+        changed = true;
+    }
+
+    // 6. CARA DE ARRIBA (UP - ¡SE DIBUJA AL FINAL PARA TAPAR LOS LATERALES!)
+    if (noCulling || tt->shouldRenderFace(level, x, y + 1, z, Facing::UP)) {
+        if (SharedConstants::TEXTURE_LIGHTING) {
+            t->tex2(tileShapeY1 < 1 ? centerColor
+                                    : getLightColor(tt, level, x, y + 1, z));
+            t->color(r11, g11, b11);
+        } else {
+            float br = tt->getBrightness(level, x, y + 1, z);
+            if (tileShapeY1 != 1 && !tt->material->isLiquid())
+                br = centerBrightness;
+            t->color(r11 * br, g11 * br, b11 * br);
+        }
+        renderFaceUp(tt, x, y, z, getTexture(tt, level, x, y, z, 1));
         changed = true;
     }
 

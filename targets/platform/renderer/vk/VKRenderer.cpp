@@ -961,13 +961,13 @@ void VKRenderer::Initialise() {
     // 4. PIPELINE CHUNKS TRANSPARENTES (Agua, Hielo)
     rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rasterizer.depthBiasEnable = VK_FALSE;
+    rasterizer.depthBiasEnable = VK_FALSE;          // <--- APAGADO
     rasterizer.depthBiasConstantFactor = 0.0f;
     rasterizer.depthBiasSlopeFactor = 0.0f;
-    pipelineInfo.pDepthStencilState = &depthTransWrite; // <--- CAMBIAR A depthTransWrite (depthWrite = TRUE)
+    pipelineInfo.pDepthStencilState = &depthTrans;  // <--- depthWrite = FALSE
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineChunkTransparent));
-    
+
     // Restaurar rasterizer neutral
     rasterizer.cullMode = VK_CULL_MODE_NONE;
     rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
