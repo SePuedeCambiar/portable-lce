@@ -670,14 +670,8 @@ int LevelRenderer::renderChunks(int from, int to, int layer, double alpha) {
     glPushMatrix();
     glTranslatef((float)-xOff, (float)-yOld, (float)-zOff);
 
-    // ========================================================================
-    // CORRECCIÓN CRÍTICA DE CAPAS:
-    // Informar a Vulkan de forma directa:
-    // Si layer == 1 -> Activa Blend (Agua/Hielo) y apaga DepthMask.
-    // Si layer == 0 -> Apaga Blend (Sólido) y activa DepthMask.
-    // ========================================================================
     PlatformRenderer.StateSetBlendEnable(layer == 1);
-    PlatformRenderer.StateSetDepthMask(layer == 0);
+    PlatformRenderer.StateSetDepthMask(true);
 
     bool first = true;
     int count = 0;

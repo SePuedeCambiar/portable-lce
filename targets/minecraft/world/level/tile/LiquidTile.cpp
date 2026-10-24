@@ -116,8 +116,8 @@ bool LiquidTile::shouldRenderFace(LevelSource* level, int x, int y, int z,
                                   int face) {
     Material* m = level->getMaterial(x, y, z);
     if (m == material) return false;
-    if (face == Facing::UP) return true;
-    if (m == Material::ice) return false;
+    if (m == Material::ice) return false; // <--- PRIMERO: Si es hielo, ¡NUNCA dibujar agua debajo!
+    if (face == Facing::UP) return true;  // <--- LUEGO: Si no es hielo ni agua, dibujar la superficie
     return Tile::shouldRenderFace(level, x, y, z, face);
 }
 

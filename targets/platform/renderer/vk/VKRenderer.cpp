@@ -964,10 +964,10 @@ void VKRenderer::Initialise() {
     rasterizer.depthBiasEnable = VK_FALSE;
     rasterizer.depthBiasConstantFactor = 0.0f;
     rasterizer.depthBiasSlopeFactor = 0.0f;
-    pipelineInfo.pDepthStencilState = &depthTrans;
+    pipelineInfo.pDepthStencilState = &depthTransWrite; // <--- CAMBIAR A depthTransWrite (depthWrite = TRUE)
     pipelineInfo.pColorBlendState = &colorBlendingTrans;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineChunkTransparent));
-
+    
     // Restaurar rasterizer neutral
     rasterizer.cullMode = VK_CULL_MODE_NONE;
     rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
